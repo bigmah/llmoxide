@@ -1,0 +1,19 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gguf = { path = "../gguf" }
+tokenizer = { path = "../tokenizer" }
+model = { path = "../model" }
+gpu = { path = "../gpu" }
+chat = { path = "../chat" }
+anyhow.workspace = true
+axum = "0.8"
+tokio = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+futures = "0.3"

@@ -1,0 +1,15 @@
+[package]
+name = "model"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gguf = { path = "../gguf" }
+anyhow.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "validate"
+path = "src/bin/validate.rs"

@@ -1,0 +1,11 @@
+[package]
+name = "llmoxide"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gguf = { path = "../crates/gguf" }
+tokenizer = { path = "../crates/tokenizer" }
+model = { path = "../crates/model" }
+gpu = { path = "../crates/gpu" }
+anyhow.workspace = true

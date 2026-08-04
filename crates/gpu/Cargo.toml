@@ -1,0 +1,26 @@
+[package]
+name = "gpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gguf = { path = "../gguf" }
+model = { path = "../model" }
+anyhow.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+half.workspace = true
+tracing.workspace = true
+
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
+
+[[bin]]
+name = "kernels"
+path = "src/bin/kernels.rs"
+
+[[bin]]
+name = "bisect"
+path = "src/bin/bisect.rs"

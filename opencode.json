@@ -1,0 +1,25 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "llmoxide": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "llmoxide (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8080/v1",
+        "apiKey": "not-needed"
+      },
+      "models": {
+        "gemma4-v2-Q4_K_M": {
+          "name": "Gemma4 12B Q4_K_M (local, wgpu)",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 16384,
+            "output": 4096
+          }
+        }
+      }
+    }
+  },
+  "model": "llmoxide/gemma4-v2-Q4_K_M"
+}

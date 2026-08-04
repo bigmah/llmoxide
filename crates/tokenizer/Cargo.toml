@@ -1,0 +1,12 @@
+[package]
+name = "tokenizer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gguf = { path = "../gguf" }
+anyhow.workspace = true
+
+[[bin]]
+name = "tok"
+path = "src/bin/tok.rs"
