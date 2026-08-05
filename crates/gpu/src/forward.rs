@@ -146,10 +146,7 @@ impl Pipelines {
         });
 
         let build = |name: &str, src: &str, layout: &wgpu::BindGroupLayout, entries: &[&str]| {
-            let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(name),
-                source: wgpu::ShaderSource::Wgsl(src.into()),
-            });
+            let module = gpu.shader(name, src);
             let pl = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(name),
                 bind_group_layouts: &[layout],
@@ -609,7 +606,7 @@ impl GpuModel {
                     }),
                 );
                 plan.push(Dispatch {
-                    pipeline: self.quant.pipeline_for(h.ty)?.clone(),
+                    pipeline: self.quant.pipeline_for(h.ty, t as u32)?.clone(),
                     bind: self.matvec_bind(h.buffer, &self.x, dst, &self.uniforms, &self.tokens),
                     offset: off,
                     groups: (crate::row_groups(out_dim, max_groups), crate::token_groups(t as u32), 1),
@@ -637,7 +634,7 @@ impl GpuModel {
                     }),
                 );
                 plan.push(Dispatch {
-                    pipeline: self.quant.pipeline_for(h.ty)?.clone(),
+                    pipeline: self.quant.pipeline_for(h.ty, t as u32)?.clone(),
                     bind: self.matvec_bind(h.buffer, &self.x, &self.v, &self.uniforms, &self.tokens),
                     offset: off,
                     groups: (crate::row_groups(kv_dim, max_groups), crate::token_groups(t as u32), 1),
@@ -750,7 +747,7 @@ impl GpuModel {
                 }),
             );
             plan.push(Dispatch {
-                pipeline: self.quant.pipeline_for(ho.ty)?.clone(),
+                pipeline: self.quant.pipeline_for(ho.ty, t as u32)?.clone(),
                 bind: self.matvec_bind(ho.buffer, &self.attn, &self.proj, &self.uniforms, &self.tokens),
                 offset: off,
                 groups: (crate::row_groups(d as u32, max_groups), crate::token_groups(t as u32), 1),
@@ -810,7 +807,7 @@ impl GpuModel {
                     }),
                 );
                 plan.push(Dispatch {
-                    pipeline: self.quant.pipeline_for(hw.ty)?.clone(),
+                    pipeline: self.quant.pipeline_for(hw.ty, t as u32)?.clone(),
                     bind: self.matvec_bind(hw.buffer, &self.x, dst, &self.uniforms, &self.tokens),
                     offset: off,
                     groups: (crate::row_groups(cfg.ffn_dim as u32, max_groups), crate::token_groups(t as u32), 1),
@@ -838,7 +835,7 @@ impl GpuModel {
                 }),
             );
             plan.push(Dispatch {
-                pipeline: self.quant.pipeline_for(hd.ty)?.clone(),
+                pipeline: self.quant.pipeline_for(hd.ty, t as u32)?.clone(),
                 bind: self.matvec_bind(hd.buffer, &self.gate, &self.proj, &self.uniforms, &self.tokens),
                 offset: off,
                 groups: (crate::row_groups(d as u32, max_groups), crate::token_groups(t as u32), 1),
@@ -906,7 +903,7 @@ impl GpuModel {
         );
 
         let mut tail_plan = vec![Dispatch {
-            pipeline: self.quant.pipeline_for(out.ty)?.clone(),
+            pipeline: self.quant.pipeline_for(out.ty, 1)?.clone(),
             bind: self.matvec_bind(out.buffer, &self.x, &self.logits, &self.uniforms, &self.tokens),
             offset: off,
             groups: (crate::row_groups(cfg.vocab as u32, max_groups), 1, 1),

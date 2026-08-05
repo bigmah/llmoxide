@@ -31,10 +31,16 @@ impl Gpu {
         // Ask for everything the adapter will give us: the defaults cap storage
         // bindings at 128 MB, far below the 826 MB embedding table.
         let limits = adapter.limits();
-        // Naga does not implement the `subgroups` enable-extension yet, so the
-        // matvec kernels amortize their tree reduction over several rows per
-        // workgroup instead.
-        let subgroups = false;
+        // Naga rejects `enable subgroups;` — it is still on its unimplemented
+        // list — but the builtins themselves compile without the directive and
+        // the Metal backend lowers subgroupAdd to simd_sum. That turns the
+        // matvec row reduction from a five-round barrier tree into one
+        // instruction, so take it whenever the adapter offers it.
+        // `LLMOXIDE_NO_SUBGROUP` forces the barrier fallback, which is
+        // otherwise unreachable on hardware that has subgroups — and so would
+        // never be exercised.
+        let subgroups = adapter.features().contains(wgpu::Features::SUBGROUP)
+            && std::env::var_os("LLMOXIDE_NO_SUBGROUP").is_none();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("llmoxide"),
@@ -48,6 +54,13 @@ impl Gpu {
             })
             .await?;
 
+        // `subgroups` above only says the feature exists. The row reduction is
+        // only correct if a subgroup is exactly ROWS_PER_GROUP-wide and its
+        // lanes are the workgroup's threads in order, and wgpu reports a
+        // supported *range* (4..64 on Apple) rather than the real width — so
+        // ask the hardware before trusting it.
+        let subgroups = subgroups && subgroup_layout_matches(&device, &queue);
+
         Ok(Self {
             adapter_name: adapter.get_info().name,
             device,
@@ -59,6 +72,31 @@ impl Gpu {
 
     pub fn blocking_new() -> anyhow::Result<Self> {
         pollster::block_on(Self::new())
+    }
+
+    /// Compile a compute shader with Naga's loop-termination guards disabled.
+    ///
+    /// Naga otherwise wraps *every* loop in a decrementing 64-bit counter. That
+    /// costs several ALU ops per iteration, and worse, it hides constant trip
+    /// counts from the Metal compiler — so the token tile never unrolls and its
+    /// accumulator lands in scratch memory instead of registers. Every loop in
+    /// these kernels is bounded by a tensor dimension or a compile-time
+    /// constant, so none of them can run away. Bounds checks stay on.
+    pub fn shader(&self, label: &str, source: &str) -> wgpu::ShaderModule {
+        let desc = wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        };
+        // SAFETY: the only requirement is that no loop in `source` is infinite.
+        unsafe {
+            self.device.create_shader_module_trusted(
+                desc,
+                wgpu::ShaderRuntimeChecks {
+                    bounds_checks: true,
+                    force_loop_bounding: false,
+                },
+            )
+        }
     }
 
     pub fn buffer(&self, label: &str, bytes: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -138,6 +176,97 @@ impl Gpu {
     }
 }
 
+/// Run one workgroup and report whether each subgroup is exactly [`LANES`] wide
+/// with `subgroup_invocation_id == local_invocation_index % LANES`. Both hold
+/// on Apple silicon; the matvec reduction is wrong without them, so a device
+/// that disagrees gets the barrier fallback instead.
+fn subgroup_layout_matches(device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+    const PROBE: &str = r#"
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+@compute @workgroup_size(64)
+fn main(
+    @builtin(local_invocation_index) tid: u32,
+    @builtin(subgroup_size) sz: u32,
+    @builtin(subgroup_invocation_id) id: u32,
+) {
+    out[tid] = id;
+    out[64u + tid] = sz;
+}
+"#;
+    let n = 64usize;
+    let bytes = (n * 2 * 4) as u64;
+
+    // A malformed probe must not take the process down with it.
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("subgroup probe"),
+        source: wgpu::ShaderSource::Wgsl(PROBE.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("subgroup probe"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buf.as_entire_binding(),
+        }],
+    });
+
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    enc.copy_buffer_to_buffer(&buf, 0, &staging, 0, bytes);
+    queue.submit([enc.finish()]);
+
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    let mapped = rx.recv().is_ok_and(|r| r.is_ok());
+    let ok = mapped && {
+        let data = bytemuck::cast_slice::<u8, u32>(&slice.get_mapped_range()).to_vec();
+        staging.unmap();
+        let (ids, sizes) = data.split_at(n);
+        sizes.iter().all(|&s| s == LANES)
+            && ids
+                .iter()
+                .enumerate()
+                .all(|(i, &id)| id == i as u32 % LANES)
+    };
+
+    // A validation error means subgroups are not usable here, whatever the
+    // feature bit said.
+    pollster::block_on(device.pop_error_scope()).is_none() && ok
+}
+
 /// Every model weight, resident on the GPU.
 pub struct Weights {
     pub buffers: Vec<wgpu::Buffer>,
@@ -208,22 +337,82 @@ pub struct MatvecParams {
     pub n_tokens: u32,
 }
 
-/// Compute pipelines for the quantized kernels.
+/// Reduce a row's partial products across its lane group. Selected at startup:
+/// the subgroup form is one instruction, the fallback is a barrier tree.
+const REDUCE_SUBGROUP: &str = "\
+// Naga lowers this to Metal's simd_sum. The lane group and the hardware
+// subgroup are the same threads — verified at startup, see Gpu::new.
+fn reduce_row(tid: u32, lane: u32, v: f32) -> f32 {
+    return subgroupAdd(v);
+}";
+
+const REDUCE_BARRIER: &str = "\
+// No usable subgroups: reduce through workgroup memory instead. All ROWS lane
+// groups reduce in lockstep, so the barrier count is per workgroup rather than
+// per row.
+var<workgroup> partial: array<f32, WG>;
+fn reduce_row(tid: u32, lane: u32, v: f32) -> f32 {
+    // Keeps this call from overwriting values the previous one is still
+    // reading; every caller reaches it in uniform control flow.
+    workgroupBarrier();
+    partial[tid] = v;
+    workgroupBarrier();
+    var s = LANES / 2u;
+    loop {
+        if (s == 0u) { break; }
+        if (lane < s) { partial[tid] = partial[tid] + partial[tid + s]; }
+        workgroupBarrier();
+        s = s / 2u;
+    }
+    return partial[tid - lane];
+}";
+
+/// Compute pipelines for the quantized kernels. The `_t` variants take TILE
+/// tokens per dispatch and are used for prefill; the plain ones are the
+/// single-token decode path.
 pub struct QuantKernels {
     pub layout: wgpu::BindGroupLayout,
     pub q4k: wgpu::ComputePipeline,
     pub q6k: wgpu::ComputePipeline,
+    pub q4k_t: wgpu::ComputePipeline,
+    pub q6k_t: wgpu::ComputePipeline,
     pub embed: wgpu::ComputePipeline,
 }
 
+/// The quant shader with its shape constants and row reduction filled in. The
+/// constants have their single source of truth in this module rather than in
+/// the WGSL, since the dispatch grid has to agree with them.
+pub fn quant_shader_source(subgroups: bool) -> String {
+    include_str!("shaders/quant.wgsl")
+        .replace(
+            "// @@REDUCE@@",
+            if subgroups {
+                REDUCE_SUBGROUP
+            } else {
+                REDUCE_BARRIER
+            },
+        )
+        .replace("@@LANES@@", &LANES.to_string())
+        .replace("@@ROWS@@", &ROWS_PER_GROUP.to_string())
+        .replace("@@TILE@@", &token_tile().to_string())
+}
+
+/// Tokens per tiled dispatch. `LLMOXIDE_TILE` overrides the default so the
+/// sweep behind it can be rerun on another GPU without a rebuild; the tile
+/// trades weight traffic against the accumulator's register footprint.
+pub fn token_tile() -> u32 {
+    std::env::var("LLMOXIDE_TILE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| [1, 2, 4, 8, 16, 32].contains(v))
+        .unwrap_or(TOKEN_TILE)
+}
+
+
+
 impl QuantKernels {
     pub fn new(gpu: &Gpu) -> Self {
-        let module = gpu
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("quant"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/quant.wgsl").into()),
-            });
+        let module = gpu.shader("quant", &quant_shader_source(gpu.subgroups));
 
         let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
             binding,
@@ -282,24 +471,38 @@ impl QuantKernels {
         Self {
             q4k: make("matvec_q4k"),
             q6k: make("matvec_q6k"),
+            q4k_t: make("matvec_q4k_t"),
+            q6k_t: make("matvec_q6k_t"),
             embed: make("embed_q6k"),
             layout,
         }
     }
 
-    pub fn pipeline_for(&self, ty: GgmlType) -> anyhow::Result<&wgpu::ComputePipeline> {
-        match ty {
-            GgmlType::Q4K => Ok(&self.q4k),
-            GgmlType::Q6K => Ok(&self.q6k),
-            other => anyhow::bail!("no matvec kernel for {}", other.name()),
+    /// The matvec pipeline for a weight type. `n_tokens == 1` takes the decode
+    /// kernel, whose accumulator is a scalar rather than a tile array.
+    pub fn pipeline_for(
+        &self,
+        ty: GgmlType,
+        n_tokens: u32,
+    ) -> anyhow::Result<&wgpu::ComputePipeline> {
+        match (ty, n_tokens > 1) {
+            (GgmlType::Q4K, false) => Ok(&self.q4k),
+            (GgmlType::Q6K, false) => Ok(&self.q6k),
+            (GgmlType::Q4K, true) => Ok(&self.q4k_t),
+            (GgmlType::Q6K, true) => Ok(&self.q6k_t),
+            (other, _) => anyhow::bail!("no matvec kernel for {}", other.name()),
         }
     }
 }
 
-/// Rows per workgroup — must match ROWS in quant.wgsl.
+/// Threads cooperating on one output row. Must equal the hardware subgroup
+/// width for the subgroup reduction to be selected; see `Gpu::new`.
+pub const LANES: u32 = 32;
+/// Rows per workgroup.
 pub const ROWS_PER_GROUP: u32 = 8;
-/// Tokens per dispatch — must match TILE in quant.wgsl.
-pub const TOKEN_TILE: u32 = 32;
+/// Default tokens per dispatch of the tiled (prefill) kernels. Read through
+/// [`token_tile`], which honours `LLMOXIDE_TILE`.
+pub const TOKEN_TILE: u32 = 2;
 
 /// Rows are strided across the grid because the output projection has 262 144
 /// of them, well past the 65 535-per-dimension dispatch limit.
@@ -309,7 +512,7 @@ pub fn row_groups(out_dim: u32, limit: u32) -> u32 {
 
 /// Dispatches needed along the token axis.
 pub fn token_groups(n_tokens: u32) -> u32 {
-    n_tokens.div_ceil(TOKEN_TILE).max(1)
+    n_tokens.div_ceil(token_tile()).max(1)
 }
 
 #[cfg(test)]
@@ -319,8 +522,8 @@ mod tests {
     #[test]
     fn row_groups_respects_dispatch_limit() {
         assert_eq!(token_groups(1), 1);
-        assert_eq!(token_groups(TOKEN_TILE), 1);
-        assert_eq!(token_groups(TOKEN_TILE + 1), 2);
+        assert_eq!(token_groups(token_tile()), 1);
+        assert_eq!(token_groups(token_tile() + 1), 2);
         assert_eq!(row_groups(3840, 65535), 480);
         assert_eq!(row_groups(262144, 65535), 32768);
         assert_eq!(row_groups(0, 65535), 1);

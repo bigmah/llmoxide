@@ -12,6 +12,11 @@ pollster.workspace = true
 bytemuck.workspace = true
 half.workspace = true
 tracing.workspace = true
+naga = { version = "27", features = ["wgsl-in", "msl-out"] }
+
+[[bin]]
+name = "msl"
+path = "src/bin/msl.rs"
 
 [[bin]]
 name = "probe"

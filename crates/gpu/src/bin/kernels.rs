@@ -126,7 +126,7 @@ fn main() -> anyhow::Result<()> {
                 label: Some(name),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(kernels.pipeline_for(h.ty)?);
+            pass.set_pipeline(kernels.pipeline_for(h.ty, 1)?);
             pass.set_bind_group(0, &bind, &[0]);
             pass.dispatch_workgroups(
                 gpu::row_groups(out_dim as u32, gpu.limits.max_compute_workgroups_per_dimension),

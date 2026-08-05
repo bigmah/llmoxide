@@ -6,6 +6,26 @@
 // are 144 bytes (36 u32) as on disk; Q6_K blocks are repacked at upload from
 // 210 to 224 bytes (56 u32) so every block starts u32-aligned — 210 is not a
 // multiple of 4, and unaligned block strides would cost a shift on every load.
+//
+// Each quant type has two entry points:
+//
+//   matvec_*    decode: one token, a scalar accumulator.
+//   matvec_*_t  prefill: TILE tokens, sharing each weight row across the tile.
+//
+// `@@NAME@@` and `// @@NAME@@` are substituted by `quant_shader_source`.
+//
+// Two rewrites that look like clear wins here are not. Both were measured on
+// an M4 Pro, and both are worth knowing about before trying them again:
+//
+// * Hoisting the unpack above the token loop, so a weight is decoded once per
+//   tile rather than once per token. It loses: the token loop then reads x
+//   with a stride instead of streaming it, and keeping the decoded weights
+//   live costs enough registers to halve occupancy. Prefill got 1.6x slower.
+// * Widening TILE. `acc` is indexed by a loop variable, which neither Naga nor
+//   the Metal compiler promotes to registers, so it lives in per-thread
+//   scratch and its size is what caps occupancy. Going from TILE 32 to 2 made
+//   prefill 2.5x faster despite multiplying weight traffic by 16 — this kernel
+//   is bound by occupancy, not by bandwidth.
 
 struct Params {
     w_base: u32,      // u32 index of the weight tensor in `weights`
@@ -23,25 +43,42 @@ struct Params {
 @group(0) @binding(3) var<uniform> p: Params;
 
 // Each workgroup computes ROWS output rows, LANES threads cooperating on each.
-// Grouping rows this way amortizes the reduction barriers — one row per
-// workgroup spends more time synchronizing than multiplying — and lets the
-// rows share the activation vector while it is hot in cache.
-const LANES: u32 = 32u;
-const ROWS: u32 = 8u;
+// LANES matches the hardware subgroup width so the per-row reduction is a
+// single subgroupAdd; grouping ROWS of them per workgroup keeps occupancy up
+// and lets the rows share the activation vector while it is hot in cache.
+const LANES: u32 = @@LANES@@u;
+const ROWS: u32 = @@ROWS@@u;
 const WG: u32 = LANES * ROWS;
-// Tokens handled per dispatch. Weights are the dominant traffic, so loading a
-// block once and applying it to TILE activations cuts prefill bandwidth by the
-// same factor. Decode passes n_tokens = 1 and simply leaves the rest idle.
-const TILE: u32 = 32u;
-var<workgroup> partial: array<f32, WG>;
+// Tokens per dispatch of the tiled kernels. Small on purpose — see the note
+// on TILE at the top of this file.
+const TILE: u32 = @@TILE@@u;
+
+// @@REDUCE@@
+
+// Reduce one row's lane group and write it. Called unconditionally so the
+// barrier fallback's reduction stays in uniform control flow.
+fn store_row(tid: u32, lane: u32, v: f32, row: u32, tok: u32) {
+    let total = reduce_row(tid, lane, v);
+    if (lane == 0u && row < p.out_dim && tok < p.n_tokens) {
+        y[tok * p.out_dim + row] = total;
+    }
+}
 
 fn byte_at(base: u32, off: u32) -> u32 {
     return (weights[base + (off >> 2u)] >> ((off & 3u) * 8u)) & 0xFFu;
 }
 
-// Q4_K sub-block j (0..8) carries a 6-bit scale and a 6-bit min packed across
-// 12 bytes. Sub-blocks 0..4 hold both plainly; 4..8 borrow their top two bits
-// from the high bits of the first eight bytes.
+fn sc_i8(base: u32, i: u32) -> f32 {
+    let b = i32(byte_at(base, i));
+    return f32(select(b, b - 256, b > 127));
+}
+
+// ---------------------------------------------------------------- Q4_K ----
+//
+// A block holds 256 weights as eight 32-element sub-blocks. Sub-block j (0..8)
+// carries a 6-bit scale and a 6-bit min packed across 12 bytes. Sub-blocks 0..4
+// hold both plainly; 4..8 borrow their top two bits from the high bits of the
+// first eight bytes.
 fn q4k_scale_min(sbase: u32, j: u32) -> vec2<f32> {
     var sc: u32;
     var m: u32;
@@ -56,19 +93,33 @@ fn q4k_scale_min(sbase: u32, j: u32) -> vec2<f32> {
     return vec2<f32>(f32(sc), f32(m));
 }
 
-// Reduce within each row's lane group. All ROWS groups reduce in lockstep, so
-// the barrier count is per workgroup rather than per row.
-fn reduce_lanes(tid: u32, lane: u32, v: f32) -> f32 {
-    partial[tid] = v;
-    workgroupBarrier();
-    var s = LANES / 2u;
-    loop {
-        if (s == 0u) { break; }
-        if (lane < s) { partial[tid] = partial[tid] + partial[tid + s]; }
-        workgroupBarrier();
-        s = s / 2u;
-    }
-    return partial[tid - lane];
+// The dequantized value is `d*scale*q - dmin*min`, an affine function of the
+// 4-bit quant. Folding the block's d/dmin together with the sub-block's scale
+// and min into (a, c) coefficients means the unpack below is one FMA per
+// element and the token loop is a plain dot product — the earlier form carried
+// the min term as a separate running sum of the activations, which every row
+// recomputed identically.
+//
+// Returns (a, c) for the low-nibble sub-block in .xy and the high-nibble one
+// in .zw. One unit of work is that 64-element *pair*: the two sub-blocks share
+// 32 weight bytes, so splitting them across lanes would read those bytes twice.
+fn q4k_affine(blk: u32, half: u32) -> vec4<f32> {
+    let dm = unpack2x16float(weights[blk]);
+    let sm0 = q4k_scale_min(blk + 1u, half * 2u);
+    let sm1 = q4k_scale_min(blk + 1u, half * 2u + 1u);
+    return vec4<f32>(
+        dm.x * sm0.x, -dm.y * sm0.y,
+        dm.x * sm1.x, -dm.y * sm1.y);
+}
+
+fn q4k_lo(packed: u32, ac: vec4<f32>) -> vec4<f32> {
+    let n = vec4<u32>(packed, packed >> 8u, packed >> 16u, packed >> 24u) & vec4<u32>(15u);
+    return vec4<f32>(n) * ac.x + ac.y;
+}
+
+fn q4k_hi(packed: u32, ac: vec4<f32>) -> vec4<f32> {
+    let n = vec4<u32>(packed >> 4u, packed >> 12u, packed >> 20u, packed >> 28u) & vec4<u32>(15u);
+    return vec4<f32>(n) * ac.z + ac.w;
 }
 
 @compute @workgroup_size(WG)
@@ -80,9 +131,6 @@ fn matvec_q4k(
     let tid = lid.x;
     let lane = tid % LANES;
     let row_in_wg = tid / LANES;
-    let tile_base = wg.y * TILE;
-    // Uniform across the workgroup, so loops bounded by it may contain barriers.
-    let tile_n = min(TILE, p.n_tokens - min(tile_base, p.n_tokens));
     let blocks = p.in_dim / 256u;
     let n_pairs = blocks * 4u;        // 64-element sub-block pairs
     let row_stride = blocks * 36u;    // u32 per weight row
@@ -94,9 +142,58 @@ fn matvec_q4k(
         if (row - row_in_wg >= p.out_dim) { break; }
         let row_base = p.w_base + min(row, p.out_dim - 1u) * row_stride;
 
-        // One unit is a 64-element *pair* of sub-blocks sharing 32 weight
-        // bytes: the low nibbles feed sub-block 2h, the high nibbles 2h+1.
-        // Splitting them across lanes would read those bytes twice.
+        var acc = 0.0;
+        var pi = lane;
+        loop {
+            if (pi >= n_pairs) { break; }
+            let b = pi / 4u;
+            let half = pi % 4u;
+            let blk = row_base + b * 36u;
+            let ac = q4k_affine(blk, half);
+            let qs_base = blk + 4u + half * 8u;
+            let off = (b * 256u + half * 64u) / 4u;
+
+            for (var w = 0u; w < 8u; w = w + 1u) {
+                let packed = weights[qs_base + w];
+                let base = off + w;
+                acc = acc
+                    + dot(q4k_lo(packed, ac), x4[base])
+                    + dot(q4k_hi(packed, ac), x4[base + 8u]);
+            }
+            pi = pi + LANES;
+        }
+
+        let total = reduce_row(tid, lane, acc);
+        if (lane == 0u && row < p.out_dim) {
+            y[row] = total;
+        }
+        row = row + nwg.x * ROWS;
+    }
+}
+
+@compute @workgroup_size(WG)
+fn matvec_q4k_t(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let tid = lid.x;
+    let lane = tid % LANES;
+    let row_in_wg = tid / LANES;
+    let tile_base = wg.y * TILE;
+    let blocks = p.in_dim / 256u;
+    let n_pairs = blocks * 4u;
+    let row_stride = blocks * 36u;
+    let x_stride = p.in_dim / 4u;
+    // Uniform across the workgroup, so loops bounded by it may contain the
+    // barrier fallback's reduction.
+    let tile_n = min(TILE, p.n_tokens - min(tile_base, p.n_tokens));
+
+    var row = wg.x * ROWS + row_in_wg;
+    loop {
+        if (row - row_in_wg >= p.out_dim) { break; }
+        let row_base = p.w_base + min(row, p.out_dim - 1u) * row_stride;
+
         var acc: array<f32, TILE>;
         for (var i = 0u; i < tile_n; i = i + 1u) { acc[i] = 0.0; }
 
@@ -106,69 +203,81 @@ fn matvec_q4k(
             let b = pi / 4u;
             let half = pi % 4u;
             let blk = row_base + b * 36u;
-
-            let dm = unpack2x16float(weights[blk]);
-            let sm0 = q4k_scale_min(blk + 1u, half * 2u);
-            let sm1 = q4k_scale_min(blk + 1u, half * 2u + 1u);
+            let ac = q4k_affine(blk, half);
             let qs_base = blk + 4u + half * 8u;
+            let off = (b * 256u + half * 64u) / 4u;
 
-            // Read the quants once, then reuse them for every token in the tile.
-            var wq: array<u32, 8>;
-            for (var w = 0u; w < 8u; w = w + 1u) { wq[w] = weights[qs_base + w]; }
-
-            let off = b * 256u + half * 64u;
+            // Token outermost, so each token's 16 activation reads are
+            // consecutive vec4s. Hoisting the unpack above this loop instead
+            // trades that streaming order — and enough registers to halve
+            // occupancy — for arithmetic that is not the binding constraint
+            // here; measured, it costs more than it saves.
             for (var tt = 0u; tt < tile_n; tt = tt + 1u) {
-                let e0 = (tile_base + tt) * p.in_dim + off;
-                // Four elements at a time: unpacking into vec4 and using dot()
-                // lets the compiler issue vector FMAs. The scalar form is
-                // ALU-bound, not bandwidth-bound, so this is the hot path.
-                var v0 = vec4<f32>(0.0);
-                var v1 = vec4<f32>(0.0);
-                var xs0 = vec4<f32>(0.0);
-                var xs1 = vec4<f32>(0.0);
+                let xb = (tile_base + tt) * x_stride + off;
+                var s = 0.0;
                 for (var w = 0u; w < 8u; w = w + 1u) {
-                    let packed = wq[w];
-                    let lo = vec4<f32>(
-                        f32(packed & 15u),
-                        f32((packed >> 8u) & 15u),
-                        f32((packed >> 16u) & 15u),
-                        f32((packed >> 24u) & 15u));
-                    let hi = vec4<f32>(
-                        f32((packed >> 4u) & 15u),
-                        f32((packed >> 12u) & 15u),
-                        f32((packed >> 20u) & 15u),
-                        f32((packed >> 28u) & 15u));
-                    let base = (e0 + w * 4u) / 4u;
-                    let xa = x4[base];
-                    let xb = x4[base + 8u];
-                    v0 = v0 + lo * xa;
-                    v1 = v1 + hi * xb;
-                    xs0 = xs0 + xa;
-                    xs1 = xs1 + xb;
+                    let packed = weights[qs_base + w];
+                    s = s
+                        + dot(q4k_lo(packed, ac), x4[xb + w])
+                        + dot(q4k_hi(packed, ac), x4[xb + w + 8u]);
                 }
-                let dot0 = v0.x + v0.y + v0.z + v0.w;
-                let dot1 = v1.x + v1.y + v1.z + v1.w;
-                let sum0 = xs0.x + xs0.y + xs0.z + xs0.w;
-                let sum1 = xs1.x + xs1.y + xs1.z + xs1.w;
-                // value = d*scale*q - dmin*min, so the min term factors out of
-                // the sub-block and multiplies the plain sum of activations.
-                acc[tt] = acc[tt] + dm.x * sm0.x * dot0 - dm.y * sm0.y * sum0
-                                  + dm.x * sm1.x * dot1 - dm.y * sm1.y * sum1;
+                acc[tt] = acc[tt] + s;
             }
             pi = pi + LANES;
         }
 
-        // Only reduce the tile slots actually in use; decode passes one token
-        // and must not pay for eight rounds of barriers.
         for (var tt = 0u; tt < tile_n; tt = tt + 1u) {
-            let total = reduce_lanes(tid, lane, acc[tt]);
-            if (lane == 0u && row < p.out_dim) {
-                y[(tile_base + tt) * p.out_dim + row] = total;
-            }
-            workgroupBarrier();
+            store_row(tid, lane, acc[tt], row, tile_base + tt);
         }
         row = row + nwg.x * ROWS;
     }
+}
+
+// ---------------------------------------------------------------- Q6_K ----
+//
+// One unit is eight consecutive `l` values within a (block, half), covering 32
+// outputs across four sub-blocks. Reading whole u32s and hoisting the four
+// sub-block scales cuts the load count ~6x versus per-byte access.
+struct Q6Quad {
+    q0: vec4<f32>,
+    q1: vec4<f32>,
+    q2: vec4<f32>,
+    q3: vec4<f32>,
+};
+
+// Six-bit quants are split: four low bits in `ql`, two high bits in `qh`. Each
+// (lo_a, lo_b, hh) triple yields four sub-block lanes of four values. `s`
+// carries the four sub-block scales already multiplied by the block's d, so
+// the token loop is a plain dot product.
+fn q6k_quad(lo_a: u32, lo_b: u32, hh: u32, s: vec4<f32>) -> Q6Quad {
+    let m8 = vec4<u32>(0xFFu);
+    let a = vec4<u32>(lo_a, lo_a >> 8u, lo_a >> 16u, lo_a >> 24u) & m8;
+    let b = vec4<u32>(lo_b, lo_b >> 8u, lo_b >> 16u, lo_b >> 24u) & m8;
+    let h = vec4<u32>(hh, hh >> 8u, hh >> 16u, hh >> 24u) & m8;
+    let m4 = vec4<u32>(15u);
+    let m2 = vec4<u32>(3u);
+    let sh2 = vec4<u32>(2u);
+    let sh4 = vec4<u32>(4u);
+    let sh6 = vec4<u32>(6u);
+
+    var r: Q6Quad;
+    r.q0 = (vec4<f32>((a & m4) | ((h & m2) << sh4)) - 32.0) * s.x;
+    r.q1 = (vec4<f32>((b & m4) | (((h >> sh2) & m2) << sh4)) - 32.0) * s.y;
+    r.q2 = (vec4<f32>((a >> sh4) | (((h >> sh4) & m2) << sh4)) - 32.0) * s.z;
+    r.q3 = (vec4<f32>((b >> sh4) | (((h >> sh6) & m2) << sh4)) - 32.0) * s.w;
+    return r;
+}
+
+// The four scales a unit needs: `l/16` is constant across its eight l values.
+fn q6k_scales(blk: u32, n: u32, l0: u32) -> vec4<f32> {
+    let sc_base = blk + 48u;
+    let is = n * 8u + l0 / 16u;
+    let d = unpack2x16float(weights[blk + 52u]).x;
+    return vec4<f32>(
+        sc_i8(sc_base, is),
+        sc_i8(sc_base, is + 2u),
+        sc_i8(sc_base, is + 4u),
+        sc_i8(sc_base, is + 6u)) * d;
 }
 
 @compute @workgroup_size(WG)
@@ -180,21 +289,75 @@ fn matvec_q6k(
     let tid = lid.x;
     let lane = tid % LANES;
     let row_in_wg = tid / LANES;
-    let tile_base = wg.y * TILE;
-    // Uniform across the workgroup, so loops bounded by it may contain barriers.
-    let tile_n = min(TILE, p.n_tokens - min(tile_base, p.n_tokens));
     let blocks = p.in_dim / 256u;
     let row_stride = blocks * 56u;    // 224 bytes per repacked block
+    let n_units = blocks * 8u;
 
     var row = wg.x * ROWS + row_in_wg;
     loop {
         if (row - row_in_wg >= p.out_dim) { break; }
         let row_base = p.w_base + min(row, p.out_dim - 1u) * row_stride;
 
-        // One unit is eight consecutive `l` values within a (block, half),
-        // covering 32 outputs. Reading whole u32s and hoisting the four
-        // sub-block scales cuts the load count ~6x versus per-byte access.
-        let n_units = blocks * 8u;
+        var acc = 0.0;
+        var u = lane;
+        loop {
+            if (u >= n_units) { break; }
+            let bi = u / 8u;
+            let rem = u % 8u;
+            let n = rem / 4u;
+            let l0 = (rem % 4u) * 8u;
+
+            let blk = row_base + bi * 56u;
+            let ql_base = blk + n * 16u + l0 / 4u;
+            let qh_base = blk + 32u + n * 8u + l0 / 4u;
+            let s = q6k_scales(blk, n, l0);
+            let off = (bi * 256u + n * 128u + l0) / 4u;
+
+            for (var w = 0u; w < 2u; w = w + 1u) {
+                let q = q6k_quad(
+                    weights[ql_base + w],
+                    weights[ql_base + 8u + w],
+                    weights[qh_base + w],
+                    s);
+                let base = off + w;
+                acc = acc
+                    + dot(q.q0, x4[base])
+                    + dot(q.q1, x4[base + 8u])
+                    + dot(q.q2, x4[base + 16u])
+                    + dot(q.q3, x4[base + 24u]);
+            }
+            u = u + LANES;
+        }
+
+        let total = reduce_row(tid, lane, acc);
+        if (lane == 0u && row < p.out_dim) {
+            y[row] = total;
+        }
+        row = row + nwg.x * ROWS;
+    }
+}
+
+@compute @workgroup_size(WG)
+fn matvec_q6k_t(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let tid = lid.x;
+    let lane = tid % LANES;
+    let row_in_wg = tid / LANES;
+    let tile_base = wg.y * TILE;
+    let blocks = p.in_dim / 256u;
+    let row_stride = blocks * 56u;
+    let n_units = blocks * 8u;
+    let x_stride = p.in_dim / 4u;
+    let tile_n = min(TILE, p.n_tokens - min(tile_base, p.n_tokens));
+
+    var row = wg.x * ROWS + row_in_wg;
+    loop {
+        if (row - row_in_wg >= p.out_dim) { break; }
+        let row_base = p.w_base + min(row, p.out_dim - 1u) * row_stride;
+
         var acc: array<f32, TILE>;
         for (var i = 0u; i < tile_n; i = i + 1u) { acc[i] = 0.0; }
 
@@ -204,81 +367,39 @@ fn matvec_q6k(
             let bi = u / 8u;
             let rem = u % 8u;
             let n = rem / 4u;
-            let quarter = rem % 4u;
-            let l0 = quarter * 8u;
+            let l0 = (rem % 4u) * 8u;
 
             let blk = row_base + bi * 56u;
-            let d = unpack2x16float(weights[blk + 52u]).x;
-            let ql_base = blk + n * 16u;
-            let qh_base = blk + 32u + n * 8u;
-            let sc_base = blk + 48u;
+            let ql_base = blk + n * 16u + l0 / 4u;
+            let qh_base = blk + 32u + n * 8u + l0 / 4u;
+            let s = q6k_scales(blk, n, l0);
+            let off = (bi * 256u + n * 128u + l0) / 4u;
 
-            // `l/16` is constant across the eight l values, so each unit needs
-            // exactly four scales.
-            let is = n * 8u + l0 / 16u;
-            let s0 = sc_i8(sc_base, is);
-            let s1 = sc_i8(sc_base, is + 2u);
-            let s2 = sc_i8(sc_base, is + 4u);
-            let s3 = sc_i8(sc_base, is + 6u);
-
-            // Quants once per unit, reused across the tile.
-            var wl: array<u32, 6>;
-            for (var w = 0u; w < 2u; w = w + 1u) {
-                wl[w] = weights[ql_base + l0 / 4u + w];
-                wl[2u + w] = weights[ql_base + (l0 + 32u) / 4u + w];
-                wl[4u + w] = weights[qh_base + l0 / 4u + w];
-            }
-
-            let off = bi * 256u + n * 128u + l0;
             for (var tt = 0u; tt < tile_n; tt = tt + 1u) {
-                let e = (tile_base + tt) * p.in_dim + off;
-                var sub = 0.0;
+                let xb = (tile_base + tt) * x_stride + off;
+                var sum = 0.0;
                 for (var w = 0u; w < 2u; w = w + 1u) {
-                    let lo_a = wl[w];
-                    let lo_b = wl[2u + w];
-                    let hh = wl[4u + w];
-                    var q0: vec4<f32>;
-                    var q1: vec4<f32>;
-                    var q2: vec4<f32>;
-                    var q3: vec4<f32>;
-                    for (var k = 0u; k < 4u; k = k + 1u) {
-                        let sh = k * 8u;
-                        let a0 = (lo_a >> sh) & 0xFFu;
-                        let b0 = (lo_b >> sh) & 0xFFu;
-                        let h = (hh >> sh) & 0xFFu;
-                        q0[k] = f32(i32((a0 & 15u) | ((h & 3u) << 4u)) - 32);
-                        q1[k] = f32(i32((b0 & 15u) | (((h >> 2u) & 3u) << 4u)) - 32);
-                        q2[k] = f32(i32((a0 >> 4u) | (((h >> 4u) & 3u) << 4u)) - 32);
-                        q3[k] = f32(i32((b0 >> 4u) | (((h >> 6u) & 3u) << 4u)) - 32);
-                    }
-                    let base = (e + w * 4u) / 4u;
-                    sub = sub
-                        + s0 * dot(q0, x4[base])
-                        + s1 * dot(q1, x4[base + 8u])
-                        + s2 * dot(q2, x4[base + 16u])
-                        + s3 * dot(q3, x4[base + 24u]);
+                    let q = q6k_quad(
+                        weights[ql_base + w],
+                        weights[ql_base + 8u + w],
+                        weights[qh_base + w],
+                        s);
+                    sum = sum
+                        + dot(q.q0, x4[xb + w])
+                        + dot(q.q1, x4[xb + w + 8u])
+                        + dot(q.q2, x4[xb + w + 16u])
+                        + dot(q.q3, x4[xb + w + 24u]);
                 }
-                acc[tt] = acc[tt] + d * sub;
+                acc[tt] = acc[tt] + sum;
             }
             u = u + LANES;
         }
 
-        // Only reduce the tile slots actually in use; decode passes one token
-        // and must not pay for eight rounds of barriers.
         for (var tt = 0u; tt < tile_n; tt = tt + 1u) {
-            let total = reduce_lanes(tid, lane, acc[tt]);
-            if (lane == 0u && row < p.out_dim) {
-                y[(tile_base + tt) * p.out_dim + row] = total;
-            }
-            workgroupBarrier();
+            store_row(tid, lane, acc[tt], row, tile_base + tt);
         }
         row = row + nwg.x * ROWS;
     }
-}
-
-fn sc_i8(base: u32, i: u32) -> f32 {
-    let b = i32(byte_at(base, i));
-    return f32(select(b, b - 256, b > 127));
 }
 
 // Gather embedding rows. Q6_K here too, but decoding whole rows rather than

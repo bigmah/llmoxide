@@ -476,6 +476,7 @@ dependencies = [
  "gguf",
  "half",
  "model",
+ "naga",
  "pollster",
  "tracing",
  "wgpu",
