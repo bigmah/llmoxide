@@ -2,6 +2,7 @@
 
 pub mod arena;
 pub mod forward;
+pub mod qwen35;
 
 use std::collections::HashMap;
 
@@ -53,6 +54,13 @@ impl Gpu {
                 ..Default::default()
             })
             .await?;
+
+        // A lost device (e.g. Metal's watchdog killing an over-long command
+        // buffer) otherwise fails *silently*: every readback just turns to
+        // zeros. Make it loud.
+        device.set_device_lost_callback(|reason, msg| {
+            eprintln!("wgpu device lost ({reason:?}): {msg}");
+        });
 
         // `subgroups` above only says the feature exists. The row reduction is
         // only correct if a subgroup is exactly ROWS_PER_GROUP-wide and its
@@ -275,42 +283,74 @@ pub struct Weights {
 }
 
 impl Weights {
-    /// Upload all tensors named by `names`. Buffers are created mapped so the
-    /// 7.4 GB goes out in one copy per buffer rather than through staging.
+    /// Upload all tensors named by `names`.
+    ///
+    /// Buffers are filled and flushed **one at a time**. Mapping every buffer
+    /// at once looks harmless but is not: wgpu backs each mapped-at-creation
+    /// buffer with a staging shadow until the next submit, so a 25 GB model
+    /// briefly wants 50 GB — past Metal's working set, and the writes then
+    /// vanish *silently* (the buffers read back as zeros, no error anywhere).
+    /// Sequential fill + poll caps the transient at one buffer's shadow.
     pub fn upload(
         gpu: &Gpu,
         g: &Gguf,
         names: impl IntoIterator<Item = String>,
     ) -> anyhow::Result<Self> {
         let plan = Plan::build(g, names)?;
-        let mut buffers = Vec::with_capacity(plan.buffer_sizes.len());
 
+        let mut by_buffer: Vec<Vec<&(String, Handle)>> = vec![Vec::new(); plan.buffer_sizes.len()];
+        for entry in &plan.handles {
+            by_buffer[entry.1.buffer].push(entry);
+        }
+
+        let mut buffers = Vec::with_capacity(plan.buffer_sizes.len());
+        let mut spans: Vec<(usize, u64, Vec<u8>)> = Vec::new();
         for (i, &size) in plan.buffer_sizes.iter().enumerate() {
-            buffers.push(gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            let buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&format!("weights{i}")),
                 size: size.max(4),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                // COPY_SRC so upload integrity is checkable (see upload_check).
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: true,
-            }));
-        }
-
-        {
-            // Hold one mapped view per buffer and scatter tensors into it.
-            let mut views: Vec<_> = buffers
-                .iter()
-                .zip(&plan.buffer_sizes)
-                .map(|(b, &size)| b.slice(..size.max(4)).get_mapped_range_mut())
-                .collect();
-
-            for (name, h) in &plan.handles {
-                let t = g.tensor(name)?;
-                let start = h.base_u32 as usize * 4;
-                let len = arena::gpu_bytes(t.ty(), t.elem_count());
-                arena::encode_tensor(&t, &mut views[h.buffer][start..start + len]);
+            });
+            {
+                let mut view = buf.slice(..size.max(4)).get_mapped_range_mut();
+                for (name, h) in &by_buffer[i] {
+                    let t = g.tensor(name)?;
+                    let start = h.base_u32 as usize * 4;
+                    let len = arena::gpu_bytes(t.ty(), t.elem_count());
+                    arena::encode_tensor(&t, &mut view[start..start + len]);
+                }
+                // Remember what the head and tail should read back as.
+                let n = view.len().min(4096);
+                spans.push((i, 0, view[..n].to_vec()));
+                if view.len() > n {
+                    let off = view.len() - n;
+                    spans.push((i, off as u64, view[off..].to_vec()));
+                }
             }
+            buf.unmap();
+            // Push the staging copy through now, releasing the shadow before
+            // the next buffer allocates its own.
+            gpu.queue.submit([]);
+            gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+            buffers.push(buf);
         }
-        for b in &buffers {
-            b.unmap();
+
+        // Read the sampled spans back. Under memory pressure Metal can drop
+        // the staged copies without raising any error — the buffers just read
+        // as zeros — and 60 layers of silent garbage is much worse than
+        // failing the load. Observed on a 25 GB model on a 48 GB machine.
+        for (i, offset, expect) in &spans {
+            let got = read_back(gpu, &buffers[*i], *offset, expect.len());
+            anyhow::ensure!(
+                got == *expect,
+                "weight upload verification failed: buffer {i} at byte {offset} \
+                 read back wrong (likely GPU memory pressure — close other \
+                 applications and retry)"
+            );
         }
 
         Ok(Self {
@@ -326,6 +366,32 @@ impl Weights {
             .copied()
             .ok_or_else(|| anyhow::anyhow!("weight {name:?} not resident"))
     }
+}
+
+/// Synchronous readback of `len` bytes at `offset`, for upload verification.
+fn read_back(gpu: &Gpu, src: &wgpu::Buffer, offset: u64, len: usize) -> Vec<u8> {
+    let staging = gpu.buffer(
+        "verify",
+        len as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+    );
+    let mut enc = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    enc.copy_buffer_to_buffer(src, offset, &staging, 0, len as u64);
+    gpu.queue.submit([enc.finish()]);
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    if rx.recv().map(|r| r.is_err()).unwrap_or(true) {
+        return Vec::new();
+    }
+    let out = slice.get_mapped_range().to_vec();
+    staging.unmap();
+    out
 }
 
 #[repr(C)]
@@ -374,9 +440,14 @@ pub struct QuantKernels {
     pub layout: wgpu::BindGroupLayout,
     pub q4k: wgpu::ComputePipeline,
     pub q6k: wgpu::ComputePipeline,
+    pub q8_0: wgpu::ComputePipeline,
+    pub f32: wgpu::ComputePipeline,
     pub q4k_t: wgpu::ComputePipeline,
     pub q6k_t: wgpu::ComputePipeline,
+    pub q8_0_t: wgpu::ComputePipeline,
+    pub f32_t: wgpu::ComputePipeline,
     pub embed: wgpu::ComputePipeline,
+    pub embed_f32: wgpu::ComputePipeline,
 }
 
 /// The quant shader with its shape constants and row reduction filled in. The
@@ -471,9 +542,14 @@ impl QuantKernels {
         Self {
             q4k: make("matvec_q4k"),
             q6k: make("matvec_q6k"),
+            q8_0: make("matvec_q8_0"),
+            f32: make("matvec_f32"),
             q4k_t: make("matvec_q4k_t"),
             q6k_t: make("matvec_q6k_t"),
+            q8_0_t: make("matvec_q8_0_t"),
+            f32_t: make("matvec_f32_t"),
             embed: make("embed_q6k"),
+            embed_f32: make("embed_f32"),
             layout,
         }
     }
@@ -488,9 +564,22 @@ impl QuantKernels {
         match (ty, n_tokens > 1) {
             (GgmlType::Q4K, false) => Ok(&self.q4k),
             (GgmlType::Q6K, false) => Ok(&self.q6k),
+            (GgmlType::Q8_0, false) => Ok(&self.q8_0),
+            (GgmlType::F32, false) => Ok(&self.f32),
             (GgmlType::Q4K, true) => Ok(&self.q4k_t),
             (GgmlType::Q6K, true) => Ok(&self.q6k_t),
+            (GgmlType::Q8_0, true) => Ok(&self.q8_0_t),
+            (GgmlType::F32, true) => Ok(&self.f32_t),
             (other, _) => anyhow::bail!("no matvec kernel for {}", other.name()),
+        }
+    }
+
+    /// The embedding-gather pipeline for the token_embd type.
+    pub fn embed_for(&self, ty: GgmlType) -> anyhow::Result<&wgpu::ComputePipeline> {
+        match ty {
+            GgmlType::Q6K => Ok(&self.embed),
+            GgmlType::F32 => Ok(&self.embed_f32),
+            other => anyhow::bail!("no embedding kernel for {}", other.name()),
         }
     }
 }

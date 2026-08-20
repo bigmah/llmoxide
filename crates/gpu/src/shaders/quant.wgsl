@@ -402,6 +402,190 @@ fn matvec_q6k_t(
     }
 }
 
+// ---------------------------------------------------------------- Q8_0 ----
+//
+// The simple legacy format: an f16 scale and 32 plain i8 quants per block,
+// repacked at upload to 36 bytes so the scale word and each quant word are
+// u32-aligned. One unit of work is one block: 8 quant words, 8 vec4s of x.
+// Matches the CPU reference exactly: the block's sub-sum is accumulated first
+// and multiplied by d once.
+
+fn i8x4(w: u32) -> vec4<f32> {
+    let v = vec4<u32>(w, w >> 8u, w >> 16u, w >> 24u) << vec4<u32>(24u);
+    return vec4<f32>(bitcast<vec4<i32>>(v) >> vec4<u32>(24u));
+}
+
+@compute @workgroup_size(WG)
+fn matvec_q8_0(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let tid = lid.x;
+    let lane = tid % LANES;
+    let row_in_wg = tid / LANES;
+    let blocks = p.in_dim / 32u;
+    let row_stride = blocks * 9u;
+
+    var row = wg.x * ROWS + row_in_wg;
+    loop {
+        if (row - row_in_wg >= p.out_dim) { break; }
+        let row_base = p.w_base + min(row, p.out_dim - 1u) * row_stride;
+
+        var acc = 0.0;
+        var b = lane;
+        loop {
+            if (b >= blocks) { break; }
+            let blk = row_base + b * 9u;
+            let d = unpack2x16float(weights[blk]).x;
+            let off = b * 8u;
+            var sub = 0.0;
+            for (var w = 0u; w < 8u; w = w + 1u) {
+                sub = sub + dot(i8x4(weights[blk + 1u + w]), x4[off + w]);
+            }
+            acc = acc + d * sub;
+            b = b + LANES;
+        }
+
+        let total = reduce_row(tid, lane, acc);
+        if (lane == 0u && row < p.out_dim) {
+            y[row] = total;
+        }
+        row = row + nwg.x * ROWS;
+    }
+}
+
+@compute @workgroup_size(WG)
+fn matvec_q8_0_t(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let tid = lid.x;
+    let lane = tid % LANES;
+    let row_in_wg = tid / LANES;
+    let tile_base = wg.y * TILE;
+    let blocks = p.in_dim / 32u;
+    let row_stride = blocks * 9u;
+    let x_stride = p.in_dim / 4u;
+    let tile_n = min(TILE, p.n_tokens - min(tile_base, p.n_tokens));
+
+    var row = wg.x * ROWS + row_in_wg;
+    loop {
+        if (row - row_in_wg >= p.out_dim) { break; }
+        let row_base = p.w_base + min(row, p.out_dim - 1u) * row_stride;
+
+        var acc: array<f32, TILE>;
+        for (var i = 0u; i < tile_n; i = i + 1u) { acc[i] = 0.0; }
+
+        var b = lane;
+        loop {
+            if (b >= blocks) { break; }
+            let blk = row_base + b * 9u;
+            let d = unpack2x16float(weights[blk]).x;
+            let off = b * 8u;
+            for (var tt = 0u; tt < tile_n; tt = tt + 1u) {
+                let xb = (tile_base + tt) * x_stride + off;
+                var sub = 0.0;
+                for (var w = 0u; w < 8u; w = w + 1u) {
+                    sub = sub + dot(i8x4(weights[blk + 1u + w]), x4[xb + w]);
+                }
+                acc[tt] = acc[tt] + d * sub;
+            }
+            b = b + LANES;
+        }
+
+        for (var tt = 0u; tt < tile_n; tt = tt + 1u) {
+            store_row(tid, lane, acc[tt], row, tile_base + tt);
+        }
+        row = row + nwg.x * ROWS;
+    }
+}
+
+// ----------------------------------------------------------------- F32 ----
+//
+// Dense f32 weights, for the all-F32 synthetic validation models. Not tuned:
+// real checkpoints quantize everything this would touch.
+
+fn wf32x4(base: u32) -> vec4<f32> {
+    return vec4<f32>(
+        bitcast<f32>(weights[base]),
+        bitcast<f32>(weights[base + 1u]),
+        bitcast<f32>(weights[base + 2u]),
+        bitcast<f32>(weights[base + 3u]));
+}
+
+@compute @workgroup_size(WG)
+fn matvec_f32(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let tid = lid.x;
+    let lane = tid % LANES;
+    let row_in_wg = tid / LANES;
+    let quads = p.in_dim / 4u;
+
+    var row = wg.x * ROWS + row_in_wg;
+    loop {
+        if (row - row_in_wg >= p.out_dim) { break; }
+        let row_base = p.w_base + min(row, p.out_dim - 1u) * p.in_dim;
+
+        var acc = 0.0;
+        var i = lane;
+        loop {
+            if (i >= quads) { break; }
+            acc = acc + dot(wf32x4(row_base + i * 4u), x4[i]);
+            i = i + LANES;
+        }
+
+        let total = reduce_row(tid, lane, acc);
+        if (lane == 0u && row < p.out_dim) {
+            y[row] = total;
+        }
+        row = row + nwg.x * ROWS;
+    }
+}
+
+@compute @workgroup_size(WG)
+fn matvec_f32_t(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let tid = lid.x;
+    let lane = tid % LANES;
+    let row_in_wg = tid / LANES;
+    let tile_base = wg.y * TILE;
+    let quads = p.in_dim / 4u;
+    let x_stride = p.in_dim / 4u;
+    let tile_n = min(TILE, p.n_tokens - min(tile_base, p.n_tokens));
+
+    var row = wg.x * ROWS + row_in_wg;
+    loop {
+        if (row - row_in_wg >= p.out_dim) { break; }
+        let row_base = p.w_base + min(row, p.out_dim - 1u) * p.in_dim;
+
+        var acc: array<f32, TILE>;
+        for (var i = 0u; i < tile_n; i = i + 1u) { acc[i] = 0.0; }
+
+        var i = lane;
+        loop {
+            if (i >= quads) { break; }
+            let w = wf32x4(row_base + i * 4u);
+            for (var tt = 0u; tt < tile_n; tt = tt + 1u) {
+                acc[tt] = acc[tt] + dot(w, x4[(tile_base + tt) * x_stride + i]);
+            }
+            i = i + LANES;
+        }
+
+        for (var tt = 0u; tt < tile_n; tt = tt + 1u) {
+            store_row(tid, lane, acc[tt], row, tile_base + tt);
+        }
+        row = row + nwg.x * ROWS;
+    }
+}
+
 // Gather embedding rows. Q6_K here too, but decoding whole rows rather than
 // contracting them, so it is a separate entry point.
 @group(0) @binding(4) var<storage, read> tokens: array<u32>;
@@ -444,5 +628,24 @@ fn embed_q6k(
         y[e + 64u] = d * sc_i8(sc_base, is + 4u) * f32(i32((lo0 >> 4u) | (((h >> 4u) & 3u) << 4u)) - 32);
         y[e + 96u] = d * sc_i8(sc_base, is + 6u) * f32(i32((lo1 >> 4u) | (((h >> 6u) & 3u) << 4u)) - 32);
         u = u + WG * nwg.x;
+    }
+}
+
+// F32 embedding gather, for the synthetic validation models.
+@compute @workgroup_size(WG)
+fn embed_f32(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let t = wg.y;
+    let row_base = p.w_base + tokens[t] * p.in_dim;
+    let out_base = t * p.in_dim;
+
+    var i = lid.x + wg.x * WG;
+    loop {
+        if (i >= p.in_dim) { break; }
+        y[out_base + i] = bitcast<f32>(weights[row_base + i]);
+        i = i + WG * nwg.x;
     }
 }

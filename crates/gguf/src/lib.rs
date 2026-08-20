@@ -59,6 +59,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum GgmlType {
     F32 = 0,
     F16 = 1,
+    Q8_0 = 8,
     Q4K = 12,
     Q6K = 14,
     BF16 = 30,
@@ -69,6 +70,7 @@ impl GgmlType {
         Ok(match v {
             0 => Self::F32,
             1 => Self::F16,
+            8 => Self::Q8_0,
             12 => Self::Q4K,
             14 => Self::Q6K,
             30 => Self::BF16,
@@ -80,6 +82,7 @@ impl GgmlType {
     pub const fn block_elems(self) -> usize {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
+            Self::Q8_0 => quant::QK8_0,
             Self::Q4K | Self::Q6K => quant::QK_K,
         }
     }
@@ -89,13 +92,14 @@ impl GgmlType {
         match self {
             Self::F32 => 4,
             Self::F16 | Self::BF16 => 2,
+            Self::Q8_0 => quant::Q8_0_BLOCK_BYTES,
             Self::Q4K => quant::Q4K_BLOCK_BYTES,
             Self::Q6K => quant::Q6K_BLOCK_BYTES,
         }
     }
 
     pub const fn is_quantized(self) -> bool {
-        matches!(self, Self::Q4K | Self::Q6K)
+        matches!(self, Self::Q8_0 | Self::Q4K | Self::Q6K)
     }
 
     /// Storage size of `n` elements. `n` must be a multiple of
@@ -108,6 +112,7 @@ impl GgmlType {
         match self {
             Self::F32 => "F32",
             Self::F16 => "F16",
+            Self::Q8_0 => "Q8_0",
             Self::Q4K => "Q4_K",
             Self::Q6K => "Q6_K",
             Self::BF16 => "BF16",

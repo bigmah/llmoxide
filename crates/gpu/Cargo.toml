@@ -29,3 +29,11 @@ path = "src/bin/kernels.rs"
 [[bin]]
 name = "bisect"
 path = "src/bin/bisect.rs"
+
+[[bin]]
+name = "bisect_qwen35"
+path = "src/bin/bisect_qwen35.rs"
+
+[[bin]]
+name = "upload_check"
+path = "src/bin/upload_check.rs"

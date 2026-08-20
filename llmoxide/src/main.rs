@@ -1,11 +1,15 @@
-//! Greedy generation on either backend.
+//! Greedy generation on any supported architecture and backend.
 //!
-//! The CPU path is byte-exact against llama.cpp, so running the same prompt
-//! through both is how the GPU kernels are checked end to end.
+//! The CPU paths are validated tensor-by-tensor against llama.cpp, so running
+//! the same prompt through both is how everything downstream is checked.
 //!
 //!   llmoxide <model.gguf> <prompt> [n] [--cpu]
+//!
+//! Both architectures run on the GPU by default; `--cpu` selects the
+//! reference path.
 
-use model::{cache::KvCache, config::Config, cpu::Cpu, weights::Weights};
+use model::qwen35;
+use model::{cache::KvCache, config::Config, cpu::Cpu, weights::Weights, Arch};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -21,23 +25,57 @@ fn main() -> anyhow::Result<()> {
 
     let t0 = std::time::Instant::now();
     let g = gguf::Gguf::open(model_path)?;
-    let cfg = Config::from_gguf(&g)?;
+    let arch = Arch::detect(&g)?;
     let tok = tokenizer::Tokenizer::from_gguf(&g)?;
     let ids = tok.encode(prompt, true);
     let n_ctx = (ids.len() + n_gen + 8).next_power_of_two().max(2048);
 
-    let mut backend: Box<dyn Backend> = if use_cpu {
-        Box::new(CpuBackend::new(&g, &cfg, n_ctx, ids.len())?)
-    } else {
-        let gpu = gpu::Gpu::blocking_new()?;
-        eprintln!("gpu: {}", gpu.adapter_name);
-        Box::new(gpu::forward::GpuModel::load(
-            gpu,
-            &g,
-            cfg.clone(),
-            n_ctx,
-            ids.len().max(1),
-        )?)
+    let (mut backend, eog): (Box<dyn Backend>, Vec<u32>) = match arch {
+        Arch::Gemma4 => {
+            let cfg = Config::from_gguf(&g)?;
+            let eog = cfg.eog.clone();
+            let b: Box<dyn Backend> = if use_cpu {
+                Box::new(CpuBackend::new(&g, Box::leak(Box::new(cfg)), n_ctx, ids.len())?)
+            } else {
+                let gpu = gpu::Gpu::blocking_new()?;
+                eprintln!("gpu: {}", gpu.adapter_name);
+                Box::new(gpu::forward::GpuModel::load(
+                    gpu,
+                    &g,
+                    cfg,
+                    n_ctx,
+                    ids.len().max(1),
+                )?)
+            };
+            (b, eog)
+        }
+        Arch::Qwen35 => {
+            let cfg = qwen35::Config::from_gguf(&g)?;
+            eprintln!("{}", cfg.summary());
+            let eog = cfg.eog.clone();
+            let b: Box<dyn Backend> = if use_cpu {
+                // The CPU path re-reads every weight per token; ask the OS to
+                // fault the mapping in up front rather than one page at a time.
+                g.prefault();
+                Box::new(Qwen35Backend::new(
+                    &g,
+                    Box::leak(Box::new(cfg)),
+                    n_ctx,
+                    ids.len(),
+                )?)
+            } else {
+                let gpu = gpu::Gpu::blocking_new()?;
+                eprintln!("gpu: {}", gpu.adapter_name);
+                Box::new(gpu::qwen35::Qwen35Gpu::load(
+                    gpu,
+                    &g,
+                    cfg,
+                    n_ctx,
+                    ids.len().max(1),
+                )?)
+            };
+            (b, eog)
+        }
     };
     eprintln!("loaded in {:?}; prompt {} tokens", t0.elapsed(), ids.len());
 
@@ -55,7 +93,7 @@ fn main() -> anyhow::Result<()> {
     let t2 = std::time::Instant::now();
     for _ in 0..n_gen {
         let next = argmax(&logits);
-        if cfg.eog.contains(&next) {
+        if eog.contains(&next) {
             break;
         }
         out.push(next);
@@ -92,6 +130,12 @@ impl Backend for gpu::forward::GpuModel {
     }
 }
 
+impl Backend for gpu::qwen35::Qwen35Gpu {
+    fn forward(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+        gpu::qwen35::Qwen35Gpu::forward(self, tokens)
+    }
+}
+
 /// Owns the mmap-backed weights alongside the executor so the borrow stays
 /// valid for the lifetime of the run.
 struct CpuBackend<'a> {
@@ -117,6 +161,32 @@ impl<'a> CpuBackend<'a> {
 impl Backend for CpuBackend<'_> {
     fn forward(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
         Ok(self.cpu.forward(tokens, &mut self.cache))
+    }
+}
+
+struct Qwen35Backend<'a> {
+    cpu: qwen35::Cpu<'a>,
+    state: qwen35::State,
+}
+
+impl<'a> Qwen35Backend<'a> {
+    fn new(
+        g: &'a gguf::Gguf,
+        cfg: &'a qwen35::Config,
+        n_ctx: usize,
+        batch: usize,
+    ) -> anyhow::Result<Self> {
+        let weights: &'a qwen35::Weights<'a> = Box::leak(Box::new(qwen35::Weights::load(g, cfg)?));
+        Ok(Self {
+            cpu: qwen35::Cpu::new(cfg, weights, batch.max(1)),
+            state: qwen35::State::new(cfg, n_ctx),
+        })
+    }
+}
+
+impl Backend for Qwen35Backend<'_> {
+    fn forward(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+        Ok(self.cpu.forward(tokens, &mut self.state))
     }
 }
 

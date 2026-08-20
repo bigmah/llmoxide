@@ -11,14 +11,19 @@ use crate::GgmlType;
 
 /// Elements per k-quant super-block.
 pub const QK_K: usize = 256;
+/// Elements per Q8_0 block — the small legacy block size, not the k-quant one.
+pub const QK8_0: usize = 32;
 
 /// `d` (f16) + `dmin` (f16) + 12 packed 6-bit scale/min pairs + 128 nibble bytes.
 pub const Q4K_BLOCK_BYTES: usize = 2 + 2 + 12 + QK_K / 2;
 /// 128 low-nibble bytes + 64 high-bit bytes + 16 i8 scales + `d` (f16).
 pub const Q6K_BLOCK_BYTES: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
+/// `d` (f16) + 32 plain i8 quants.
+pub const Q8_0_BLOCK_BYTES: usize = 2 + QK8_0;
 
 const _: () = assert!(Q4K_BLOCK_BYTES == 144);
 const _: () = assert!(Q6K_BLOCK_BYTES == 210);
+const _: () = assert!(Q8_0_BLOCK_BYTES == 34);
 
 #[inline(always)]
 fn f16_at(b: &[u8], i: usize) -> f32 {
@@ -108,6 +113,19 @@ pub fn dequant_q6k_block(blk: &[u8], out: &mut [f32]) {
     }
 }
 
+/// Decode one 32-element Q8_0 block: an f16 scale times plain i8 quants.
+#[inline]
+pub fn dequant_q8_0_block(blk: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(blk.len(), Q8_0_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK8_0);
+
+    let d = f16_at(blk, 0);
+    let qs: &[i8] = bytemuck::cast_slice(&blk[2..]);
+    for (o, &q) in out.iter_mut().zip(qs) {
+        *o = d * q as f32;
+    }
+}
+
 /// Dequantize a contiguous run of `out.len()` elements of the given type.
 pub fn dequant(ty: GgmlType, data: &[u8], out: &mut [f32]) {
     match ty {
@@ -141,6 +159,15 @@ pub fn dequant(ty: GgmlType, data: &[u8], out: &mut [f32]) {
                 .zip(out.chunks_exact_mut(QK_K))
             {
                 dequant_q6k_block(blk, o);
+            }
+        }
+        GgmlType::Q8_0 => {
+            debug_assert_eq!(out.len() % QK8_0, 0);
+            for (blk, o) in data
+                .chunks_exact(Q8_0_BLOCK_BYTES)
+                .zip(out.chunks_exact_mut(QK8_0))
+            {
+                dequant_q8_0_block(blk, o);
             }
         }
     }
@@ -216,6 +243,17 @@ pub fn dot_row(ty: GgmlType, row: &[u8], x: &[f32]) -> f32 {
             }
             acc
         }
+        GgmlType::Q8_0 => {
+            let mut acc = 0f32;
+            for (bi, blk) in row.chunks_exact(Q8_0_BLOCK_BYTES).enumerate() {
+                let d = f16_at(blk, 0);
+                let qs: &[i8] = bytemuck::cast_slice(&blk[2..]);
+                let xb = &x[bi * QK8_0..bi * QK8_0 + QK8_0];
+                let sub: f32 = qs.iter().zip(xb).map(|(&q, &b)| q as f32 * b).sum();
+                acc += d * sub;
+            }
+            acc
+        }
         GgmlType::F32 => {
             let w: &[f32] = bytemuck::cast_slice(row);
             w.iter().zip(x).map(|(a, b)| a * b).sum()
@@ -276,6 +314,37 @@ mod tests {
     #[test]
     fn q4k_dot_matches_dequant() {
         check_dot_matches_dequant(GgmlType::Q4K, Q4K_BLOCK_BYTES);
+    }
+
+    #[test]
+    fn q8_0_dot_matches_dequant() {
+        let mut raw = vec![0u8; Q8_0_BLOCK_BYTES * 3];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = ((i * 41 + 7) % 253) as u8;
+        }
+        for b in 0..3 {
+            let off = b * Q8_0_BLOCK_BYTES;
+            raw[off..off + 2].copy_from_slice(&f16::from_f32(0.0123).to_le_bytes());
+        }
+        let n = QK8_0 * 3;
+        let x: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.07).collect();
+        let mut deq = vec![0f32; n];
+        dequant(GgmlType::Q8_0, &raw, &mut deq);
+        let expect: f32 = deq.iter().zip(&x).map(|(a, b)| a * b).sum();
+        let got = dot_row(GgmlType::Q8_0, &raw, &x);
+        assert!((got - expect).abs() < expect.abs() * 1e-4 + 1e-3);
+    }
+
+    #[test]
+    fn q8_0_decodes_signed_bytes() {
+        let mut blk = vec![0u8; Q8_0_BLOCK_BYTES];
+        blk[0..2].copy_from_slice(&f16::from_f32(0.5).to_le_bytes());
+        blk[2] = 0x80; // -128 as i8
+        blk[3] = 127;
+        let mut out = vec![0f32; QK8_0];
+        dequant_q8_0_block(&blk, &mut out);
+        assert_eq!(out[0], -64.0);
+        assert_eq!(out[1], 63.5);
     }
 
     #[test]

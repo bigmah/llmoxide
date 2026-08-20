@@ -7,6 +7,7 @@
 //! through the typed encoder in [`dsl`].
 
 pub mod dsl;
+pub mod qwen;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

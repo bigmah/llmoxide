@@ -131,6 +131,50 @@ pub fn rope_neox(head: &mut [f32], pos: usize, base: f32, factors: &[f32]) {
     }
 }
 
+/// Batched `Y = W X` that stays parallel for a single column.
+///
+/// [`matmat`] parallelizes over tokens, which is right for prefill and
+/// catastrophic for decode: a one-token batch runs on one core. Decode is the
+/// qwen35 CPU path's steady state, so it matters there.
+pub fn matmul(y: &mut [f32], w: &TensorView<'_>, x: &[f32], n: usize) {
+    if n == 1 {
+        matvec(y, w, x);
+    } else {
+        matmat(y, w, x, n);
+    }
+}
+
+/// `x * sigmoid(x)`, the SwiGLU activation (ggml `SILU`).
+#[inline]
+pub fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+#[inline]
+pub fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// `ln(1 + e^x)`, with ggml's large-`x` shortcut to avoid overflow.
+#[inline]
+pub fn softplus(x: f32) -> f32 {
+    if x > 20.0 {
+        x
+    } else {
+        (1.0 + x.exp()).ln()
+    }
+}
+
+/// Scale `x` to unit L2 norm, in place. Matches ggml's `l2_norm`: `eps` floors
+/// the *norm* (`1/max(‖x‖, eps)`), it is not added under the square root.
+pub fn l2_norm(x: &mut [f32], eps: f32) {
+    let norm = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let scale = 1.0 / norm.max(eps);
+    for v in x.iter_mut() {
+        *v *= scale;
+    }
+}
+
 /// `cap * tanh(x / cap)`, applied elementwise to the final logits.
 pub fn soft_cap(x: &mut [f32], cap: f32) {
     let inv = 1.0 / cap;

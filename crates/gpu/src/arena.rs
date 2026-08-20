@@ -16,6 +16,9 @@ use gguf::{GgmlType, Gguf, TensorView};
 pub const Q6K_GPU_BLOCK_BYTES: usize = 224;
 /// Q4_K blocks are already 36 u32 and need no repacking.
 pub const Q4K_GPU_BLOCK_BYTES: usize = 144;
+/// Q8_0 blocks are 34 bytes on disk (f16 scale + 32 i8); repacked to 36 so the
+/// scale word and every quant word are u32-aligned.
+pub const Q8_0_GPU_BLOCK_BYTES: usize = 36;
 
 /// Keep a margin under the adapter's binding limit; the packer is greedy and
 /// only checks before appending.
@@ -42,6 +45,7 @@ pub fn gpu_bytes(ty: GgmlType, n: usize) -> usize {
         GgmlType::Q6K => n / gguf::quant::QK_K * Q6K_GPU_BLOCK_BYTES,
         GgmlType::F32 => n * 4,
         GgmlType::F16 | GgmlType::BF16 => n * 2,
+        GgmlType::Q8_0 => n / gguf::quant::QK8_0 * Q8_0_GPU_BLOCK_BYTES,
     }
 }
 
@@ -58,6 +62,19 @@ pub fn encode_tensor(t: &TensorView<'_>, dst: &mut [u8]) {
             {
                 out[..gguf::quant::Q6K_BLOCK_BYTES].copy_from_slice(src);
                 out[gguf::quant::Q6K_BLOCK_BYTES..].fill(0);
+            }
+        }
+        GgmlType::Q8_0 => {
+            // 34 -> 36 bytes: the f16 scale keeps its word to itself so the 32
+            // quants that follow start on a u32 boundary.
+            for (src, out) in t
+                .data
+                .chunks_exact(gguf::quant::Q8_0_BLOCK_BYTES)
+                .zip(dst.chunks_exact_mut(Q8_0_GPU_BLOCK_BYTES))
+            {
+                out[..2].copy_from_slice(&src[..2]);
+                out[2..4].fill(0);
+                out[4..].copy_from_slice(&src[2..]);
             }
         }
         _ => dst[..t.data.len()].copy_from_slice(t.data),

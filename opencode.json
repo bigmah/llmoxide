@@ -5,7 +5,7 @@
       "npm": "@ai-sdk/openai-compatible",
       "name": "llmoxide (local)",
       "options": {
-        "baseURL": "http://127.0.0.1:8080/v1",
+        "baseURL": "http://127.0.0.1:8081/v1",
         "apiKey": "not-needed"
       },
       "models": {
@@ -17,9 +17,27 @@
             "context": 16384,
             "output": 4096
           }
+        },
+        "Qwen3.8-27B-Q6_K": {
+          "name": "Qwen3.5 27B Q6_K (local, wgpu)",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 16384,
+            "output": 4096
+          }
+        },
+        "Qwen3.8-27B-Uncensored-Cyber-Q6_K": {
+          "name": "Qwen3.5 27B Uncensored Q6_K (local, wgpu)",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 16384,
+            "output": 4096
+          }
         }
       }
     }
   },
-  "model": "llmoxide/gemma4-v2-Q4_K_M"
+  "model": "llmoxide/Qwen3.8-27B-Q6_K"
 }

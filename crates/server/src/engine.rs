@@ -4,11 +4,16 @@
 //! front of one GPU context beats the complexity of batching. Generation runs
 //! on a dedicated thread because `GpuModel` owns wgpu resources that are not
 //! `Sync`, and it streams events back over a channel.
+//!
+//! Both architectures run on the wgpu backend; `LLMOXIDE_CPU=1` selects the
+//! validated qwen35 CPU reference path instead. Each architecture brings its
+//! own chat format; the generation loop between them is shared.
 
 use std::sync::mpsc;
 
 use chat::{Message, Special, Tool};
 use model::sample::{Sampler, Sampling};
+use model::{qwen35, Arch};
 use tokenizer::Tokenizer;
 
 pub struct GenerateRequest {
@@ -52,11 +57,74 @@ impl FinishReason {
     }
 }
 
+/// Which model is loaded, with its execution backend.
+enum Backend {
+    Gemma4Gpu(gpu::forward::GpuModel),
+    Qwen35Gpu(gpu::qwen35::Qwen35Gpu),
+    /// The qwen35 CPU reference path (`LLMOXIDE_CPU=1`). Weights borrow the
+    /// mmap'd file, so both are leaked to `'static` — one model per process.
+    Qwen35Cpu {
+        cpu: qwen35::Cpu<'static>,
+        state: qwen35::State,
+        n_ctx: usize,
+        max_batch: usize,
+        eog: Vec<u32>,
+    },
+}
+
+impl Backend {
+    fn context_len(&self) -> usize {
+        match self {
+            Self::Gemma4Gpu(m) => m.context_len(),
+            Self::Qwen35Gpu(m) => m.context_len(),
+            Self::Qwen35Cpu { n_ctx, .. } => *n_ctx,
+        }
+    }
+
+    fn max_batch(&self) -> usize {
+        match self {
+            Self::Gemma4Gpu(m) => m.max_batch(),
+            Self::Qwen35Gpu(m) => m.max_batch(),
+            Self::Qwen35Cpu { max_batch, .. } => *max_batch,
+        }
+    }
+
+    fn eog(&self) -> &[u32] {
+        match self {
+            Self::Gemma4Gpu(m) => &m.config().eog,
+            Self::Qwen35Gpu(m) => &m.config().eog,
+            Self::Qwen35Cpu { eog, .. } => eog,
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Gemma4Gpu(m) => m.reset(),
+            Self::Qwen35Gpu(m) => m.reset(),
+            Self::Qwen35Cpu { state, .. } => state.clear(),
+        }
+    }
+
+    fn forward(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+        match self {
+            Self::Gemma4Gpu(m) => m.forward(tokens),
+            Self::Qwen35Gpu(m) => m.forward(tokens),
+            Self::Qwen35Cpu { cpu, state, .. } => Ok(cpu.forward(tokens, state)),
+        }
+    }
+}
+
+/// Each architecture speaks its own chat dialect.
+enum ChatFormat {
+    Gemma4(Special),
+    Qwen35(chat::qwen::Special),
+}
+
 pub struct Engine {
-    model: gpu::forward::GpuModel,
+    backend: Backend,
     tok: Tokenizer,
-    special: Special,
-    /// The exact token sequence currently in the KV cache.
+    chat: ChatFormat,
+    /// The exact token sequence currently in the KV cache / recurrent state.
     cached: Vec<u32>,
     pub default_sampling: Sampling,
 }
@@ -64,19 +132,54 @@ pub struct Engine {
 impl Engine {
     pub fn load(path: &str, n_ctx: usize, max_batch: usize) -> anyhow::Result<Self> {
         let g = gguf::Gguf::open(path)?;
-        let cfg = model::Config::from_gguf(&g)?;
         let tok = Tokenizer::from_gguf(&g)?;
-        let special = Special::new(&tok)?;
         let default_sampling = Sampling::from_gguf(&g);
 
-        let device = gpu::Gpu::blocking_new()?;
-        tracing::info!(adapter = %device.adapter_name, "gpu");
-        let model = gpu::forward::GpuModel::load(device, &g, cfg, n_ctx, max_batch)?;
+        let (backend, chat) = match Arch::detect(&g)? {
+            Arch::Gemma4 => {
+                let cfg = model::Config::from_gguf(&g)?;
+                let chat = ChatFormat::Gemma4(Special::new(&tok)?);
+                let device = gpu::Gpu::blocking_new()?;
+                tracing::info!(adapter = %device.adapter_name, "gpu");
+                let m = gpu::forward::GpuModel::load(device, &g, cfg, n_ctx, max_batch)?;
+                (Backend::Gemma4Gpu(m), chat)
+            }
+            Arch::Qwen35 => {
+                let chat = ChatFormat::Qwen35(chat::qwen::Special::new(&tok)?);
+                if std::env::var_os("LLMOXIDE_CPU").is_some() {
+                    let g: &'static gguf::Gguf = Box::leak(Box::new(g));
+                    g.prefault();
+                    let cfg: &'static qwen35::Config =
+                        Box::leak(Box::new(qwen35::Config::from_gguf(g)?));
+                    tracing::info!("{} (CPU reference path)", cfg.summary());
+                    let w: &'static qwen35::Weights<'static> =
+                        Box::leak(Box::new(qwen35::Weights::load(g, cfg)?));
+                    let eog = cfg.eog.clone();
+                    (
+                        Backend::Qwen35Cpu {
+                            cpu: qwen35::Cpu::new(cfg, w, max_batch),
+                            state: qwen35::State::new(cfg, n_ctx),
+                            n_ctx,
+                            max_batch,
+                            eog,
+                        },
+                        chat,
+                    )
+                } else {
+                    let cfg = qwen35::Config::from_gguf(&g)?;
+                    let device = gpu::Gpu::blocking_new()?;
+                    tracing::info!(adapter = %device.adapter_name, "gpu");
+                    tracing::info!("{}", cfg.summary());
+                    let m = gpu::qwen35::Qwen35Gpu::load(device, &g, cfg, n_ctx, max_batch)?;
+                    (Backend::Qwen35Gpu(m), chat)
+                }
+            }
+        };
 
         Ok(Self {
-            model,
+            backend,
             tok,
-            special,
+            chat,
             cached: Vec::new(),
             default_sampling,
         })
@@ -86,12 +189,8 @@ impl Engine {
         &self.tok
     }
 
-    pub fn config(&self) -> &model::Config {
-        self.model.config()
-    }
-
     pub fn context_len(&self) -> usize {
-        self.model.context_len()
+        self.backend.context_len()
     }
 
     /// How much of `prompt` the cache can serve.
@@ -122,14 +221,23 @@ impl Engine {
     }
 
     fn run(&mut self, req: GenerateRequest, out: &mpsc::Sender<Event>) -> anyhow::Result<()> {
-        let prompt = chat::build_prompt(
-            &self.tok,
-            &self.special,
-            &req.messages,
-            &req.tools,
-            req.enable_thinking,
-        );
-        let n_ctx = self.model.context_len();
+        let prompt = match &self.chat {
+            ChatFormat::Gemma4(sp) => chat::build_prompt(
+                &self.tok,
+                sp,
+                &req.messages,
+                &req.tools,
+                req.enable_thinking,
+            ),
+            ChatFormat::Qwen35(sp) => chat::qwen::build_prompt(
+                &self.tok,
+                sp,
+                &req.messages,
+                &req.tools,
+                req.enable_thinking,
+            ),
+        };
+        let n_ctx = self.context_len();
         anyhow::ensure!(
             prompt.len() + 8 < n_ctx,
             "prompt is {} tokens but the context is {n_ctx}",
@@ -138,7 +246,7 @@ impl Engine {
 
         let reuse = self.reusable_prefix(&prompt);
         if reuse == 0 {
-            self.model.reset();
+            self.backend.reset();
             self.cached.clear();
         }
         tracing::info!(
@@ -154,16 +262,16 @@ impl Engine {
 
         // Prefill the uncached tail in chunks the scratch buffers can hold.
         let mut logits = Vec::new();
-        let batch = self.model.max_batch();
+        let batch = self.backend.max_batch();
         let mut i = reuse;
         while i < prompt.len() {
             let end = (i + batch).min(prompt.len());
-            logits = self.model.forward(&prompt[i..end])?;
+            logits = self.backend.forward(&prompt[i..end])?;
             i = end;
         }
         self.cached = prompt;
 
-        let eog = self.config().eog.clone();
+        let eog = self.backend.eog().to_vec();
         let max_new = req
             .max_tokens
             .min(n_ctx.saturating_sub(self.cached.len()).saturating_sub(1));
@@ -195,10 +303,17 @@ impl Engine {
             }
 
             self.cached.push(next);
-            logits = self.model.forward(&[next])?;
+            logits = self.backend.forward(&[next])?;
         }
 
-        let mut completion = chat::parse_completion(&self.tok, &self.special, &generated);
+        let mut completion = match &self.chat {
+            ChatFormat::Gemma4(sp) => chat::parse_completion(&self.tok, sp, &generated),
+            // With thinking on, the generation prompt leaves a `<think>` block
+            // open, so the stream starts inside reasoning.
+            ChatFormat::Qwen35(sp) => {
+                chat::qwen::parse_completion(&self.tok, sp, &generated, req.enable_thinking)
+            }
+        };
 
         // Drop calls to tools the request never declared. The model will
         // occasionally invent one — asked about a directory with only
@@ -207,22 +322,25 @@ impl Engine {
         // either error out or, worse, run something unintended.
         let declared: Vec<&str> = req.tools.iter().map(|t| t.function.name.as_str()).collect();
 
-        // The model also emits the call DSL unwrapped sometimes, in which case
-        // it lands in the content. Promote those to real calls when the tool
-        // was declared, and excise them either way — raw DSL in the visible
-        // reply is never what the client wants.
-        let bare = chat::dsl::find_bare_calls(&completion.content);
-        if !bare.is_empty() {
-            let mut text = completion.content.clone();
-            for (range, call) in bare.into_iter().rev() {
-                text.replace_range(range, "");
-                if declared.contains(&call.name.as_str()) {
-                    completion.tool_calls.push(call);
-                } else {
-                    tracing::warn!(tool = %call.name, "discarding bare call to undeclared tool");
+        // gemma4 also emits its call DSL unwrapped sometimes, in which case it
+        // lands in the content. Promote those to real calls when the tool was
+        // declared, and excise them either way — raw DSL in the visible reply
+        // is never what the client wants. (qwen35's tool markers are control
+        // tokens, so its calls cannot land in content this way.)
+        if matches!(self.chat, ChatFormat::Gemma4(_)) {
+            let bare = chat::dsl::find_bare_calls(&completion.content);
+            if !bare.is_empty() {
+                let mut text = completion.content.clone();
+                for (range, call) in bare.into_iter().rev() {
+                    text.replace_range(range, "");
+                    if declared.contains(&call.name.as_str()) {
+                        completion.tool_calls.push(call);
+                    } else {
+                        tracing::warn!(tool = %call.name, "discarding bare call to undeclared tool");
+                    }
                 }
+                completion.content = text.trim().to_string();
             }
-            completion.content = text.trim().to_string();
         }
         completion.tool_calls.retain(|c| {
             let ok = declared.contains(&c.name.as_str());

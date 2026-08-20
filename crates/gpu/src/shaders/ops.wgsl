@@ -112,6 +112,110 @@ fn geglu(
     }
 }
 
+// out = silu(out) * b, the SwiGLU FFN activation (qwen35).
+@compute @workgroup_size(WG)
+fn swiglu(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let n = op.n_rows * op.dim;
+    let stride = nwg.x * WG;
+    var i = gid.x;
+    loop {
+        if (i >= n) { break; }
+        let x = out[i];
+        out[i] = x / (1.0 + exp(-x)) * b[i];
+        i = i + stride;
+    }
+}
+
+// out = out * silu(b) — the delta-net output gate.
+@compute @workgroup_size(WG)
+fn mul_silu(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let n = op.n_rows * op.dim;
+    let stride = nwg.x * WG;
+    var i = gid.x;
+    loop {
+        if (i >= n) { break; }
+        let x = b[i];
+        out[i] = out[i] * (x / (1.0 + exp(-x)));
+        i = i + stride;
+    }
+}
+
+// out = out * sigmoid(b) — qwen35's per-head attention output gate.
+@compute @workgroup_size(WG)
+fn mul_sigmoid(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let n = op.n_rows * op.dim;
+    let stride = nwg.x * WG;
+    var i = gid.x;
+    loop {
+        if (i >= n) { break; }
+        out[i] = out[i] / (1.0 + exp(-b[i]));
+        i = i + stride;
+    }
+}
+
+// Copy one half of a fused per-head [query | gate] projection out of `a`.
+//   n_rows = n_tokens * n_heads, dim = head_dim
+//   u0 = source offset within the pair: 0 for the query half, dim for the gate
+@compute @workgroup_size(WG)
+fn split_half(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let n = op.n_rows * op.dim;
+    let stride = nwg.x * WG;
+    var i = gid.x;
+    loop {
+        if (i >= n) { break; }
+        let row = i / op.dim;
+        let d = i % op.dim;
+        out[i] = a[row * 2u * op.dim + op.u0 + d];
+        i = i + stride;
+    }
+}
+
+// NeoX rotation over only the first off0 dims of each dim-wide head row; the
+// rest are NoPE (qwen35: 64 of 256, base 1e7).
+//   n_rows = n_tokens * heads, dim = head stride
+//   off0 = n_rot, u0 = heads per token, u1 = base position, f0 = rope base
+@compute @workgroup_size(WG)
+fn rope_partial(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    var row = wg.x;
+    loop {
+    if (row >= op.n_rows) { break; }
+    let half = op.off0 / 2u;
+    let base = row * op.dim;
+    let pos = f32(op.u1 + row / op.u0);
+    let theta_scale = pow(op.f0, -2.0 / f32(op.off0));
+
+    var i = lid.x;
+    loop {
+        if (i >= half) { break; }
+        let angle = pos * pow(theta_scale, f32(i));
+        let cs = cos(angle);
+        let sn = sin(angle);
+        let x0 = out[base + i];
+        let x1 = out[base + i + half];
+        out[base + i] = x0 * cs - x1 * sn;
+        out[base + i + half] = x0 * sn + x1 * cs;
+        i = i + WG;
+    }
+    row = row + nwg.x;
+    }
+}
+
 // out = (out + b) * f0 — the residual add fused with layer_output_scale.
 @compute @workgroup_size(WG)
 fn add_scale(

@@ -1,6 +1,6 @@
-//! Gemma4 tokenizer: byte-pair encoding over a 262 144-entry vocabulary.
+//! Rank-ordered byte-pair encoding, in the two dialects our checkpoints use.
 //!
-//! Determined empirically from the checkpoint rather than assumed:
+//! **gemma4** ([`Style::MetaSpace`]), determined empirically from the file:
 //!
 //! * `tokenizer.ggml.scores` is uniformly `-1000`, so it carries no signal —
 //!   this is rank-ordered BPE, not a unigram/SentencePiece model.
@@ -9,13 +9,58 @@
 //! * There is no pre-tokenizer regex. Digits fall out as single tokens simply
 //!   because no multi-digit ASCII merges exist in the table.
 //! * Characters outside the vocabulary decompose into `<0xNN>` byte tokens.
+//!
+//! **qwen35** ([`Style::ByteLevel`], `tokenizer.ggml.model = "gpt2"`):
+//!
+//! * Text is first split by the `qwen35` pre-tokenizer ([`pre`]); merges never
+//!   cross pieces, which is also what keeps control-token spellings inert.
+//! * Each piece's *bytes* map to stand-in characters (GPT-2's byte encoder:
+//!   space is `Ġ`, newline `Ċ`), so every input is coverable without an
+//!   unknown token and the vocabulary needs no `<0xNN>` fallbacks.
+//!
+//! The merge loop itself is shared: both dialects are rank-ordered BPE.
 
 use std::collections::HashMap;
 
 use gguf::Gguf;
 
+pub mod pre;
+pub mod unicode;
+
 /// SentencePiece meta-space; stands in for U+0020 inside tokens.
 const META_SPACE: char = '\u{2581}';
+
+/// How raw text becomes the symbols BPE merges over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Style {
+    /// SentencePiece-surface BPE: spaces to `▁`, `<0xNN>` byte fallback.
+    MetaSpace,
+    /// GPT-2 byte-level BPE behind the qwen35 pre-tokenizer.
+    ByteLevel,
+}
+
+/// GPT-2's byte-to-character bijection. Printable Latin-1 bytes stand for
+/// themselves; the 68 others (controls, space, DEL..NBSP, soft hyphen) take
+/// consecutive codepoints from U+0100, so every byte has a visible spelling.
+pub fn byte_to_char(b: u8) -> char {
+    match b {
+        0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF => b as char,
+        0x00..=0x20 => char::from_u32(0x100 + b as u32).unwrap(),
+        0x7F..=0xA0 => char::from_u32(0x121 + (b - 0x7F) as u32).unwrap(),
+        0xAD => '\u{143}',
+    }
+}
+
+/// Inverse of [`byte_to_char`]; `None` for characters outside the image.
+pub fn char_to_byte(c: char) -> Option<u8> {
+    match c as u32 {
+        u @ (0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF) => Some(u as u8),
+        u @ 0x100..=0x120 => Some((u - 0x100) as u8),
+        u @ 0x121..=0x142 => Some(0x7F + (u - 0x121) as u8),
+        0x143 => Some(0xAD),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
@@ -53,6 +98,7 @@ pub struct Tokenizer {
     merges: HashMap<(u32, u32), (u32, u32)>,
     /// `<0x00>`..`<0xFF>` ids for byte fallback, if the vocab provides them.
     byte_tokens: Option<Box<[u32; 256]>>,
+    pub style: Style,
     pub bos: u32,
     pub eos: u32,
     pub unk: u32,
@@ -62,6 +108,23 @@ pub struct Tokenizer {
 
 impl Tokenizer {
     pub fn from_gguf(g: &Gguf) -> anyhow::Result<Self> {
+        // `model` names the algorithm family; `pre` names the exact splitter.
+        // Only splitters we have validated against llama.cpp are accepted —
+        // running a byte-level vocab through the wrong split does not fail, it
+        // just tokenizes subtly differently everywhere.
+        let style = match g.str("tokenizer.ggml.model").unwrap_or("llama") {
+            "gpt2" => {
+                let pre = g.str("tokenizer.ggml.pre").unwrap_or("");
+                anyhow::ensure!(
+                    pre == "qwen35",
+                    "byte-level vocab with unsupported pre-tokenizer {pre:?} \
+                     (only \"qwen35\" is implemented)"
+                );
+                Style::ByteLevel
+            }
+            _ => Style::MetaSpace,
+        };
+
         let tokens: Vec<String> = g.string_array("tokenizer.ggml.tokens")?.to_vec();
         let kinds: Vec<TokenKind> = g
             .u32_array("tokenizer.ggml.token_type")
@@ -108,13 +171,19 @@ impl Tokenizer {
             ids,
             merges,
             byte_tokens,
+            style,
             bos: g.u64("tokenizer.ggml.bos_token_id").unwrap_or(2) as u32,
             eos: g.u64("tokenizer.ggml.eos_token_id").unwrap_or(1) as u32,
             unk: g.u64("tokenizer.ggml.unknown_token_id").unwrap_or(3) as u32,
+            // When the key is absent llama.cpp defaults by vocab family:
+            // SentencePiece vocabs prepend BOS, byte-level (gpt2) ones don't.
+            // Getting this wrong is silent and *almost* harmless — one stray
+            // `<|endoftext|>` up front — until the model reads the whole
+            // prompt as a document fragment and ends its turn early.
             add_bos: g
                 .get("tokenizer.ggml.add_bos_token")
                 .and_then(gguf::Value::as_bool)
-                .unwrap_or(true),
+                .unwrap_or(style == Style::MetaSpace),
             add_space_prefix: g
                 .get("tokenizer.ggml.add_space_prefix")
                 .and_then(gguf::Value::as_bool)
@@ -160,7 +229,20 @@ impl Tokenizer {
         if text.is_empty() {
             return;
         }
+        match self.style {
+            Style::MetaSpace => self.encode_metaspace(text, out),
+            // Merges never cross pre-tokenizer pieces, so each piece is an
+            // independent BPE problem.
+            Style::ByteLevel => {
+                for piece in pre::split_qwen35(text) {
+                    let syms = piece.bytes().map(|b| self.seed_sym(byte_to_char(b)));
+                    self.merge_and_emit(syms.collect(), out);
+                }
+            }
+        }
+    }
 
+    fn encode_metaspace(&self, text: &str, out: &mut Vec<u32>) {
         // Normalize to the SentencePiece meta-space representation.
         let mut norm = String::with_capacity(text.len() + META_SPACE.len_utf8());
         if self.add_space_prefix {
@@ -172,20 +254,23 @@ impl Tokenizer {
 
         // Seed one symbol per character. A character absent from the vocab can
         // never participate in a merge, so it is parked for byte fallback.
-        let mut syms: Vec<Sym> = norm
-            .chars()
-            .map(|c| {
-                let mut buf = [0u8; 4];
-                let s = c.encode_utf8(&mut buf);
-                Sym {
-                    id: self.ids.get(s).copied(),
-                    text: s.to_string(),
-                    prev: usize::MAX,
-                    next: usize::MAX,
-                    alive: true,
-                }
-            })
-            .collect();
+        let syms: Vec<Sym> = norm.chars().map(|c| self.seed_sym(c)).collect();
+        self.merge_and_emit(syms, out);
+    }
+
+    fn seed_sym(&self, c: char) -> Sym {
+        let mut buf = [0u8; 4];
+        let s = c.encode_utf8(&mut buf);
+        Sym {
+            id: self.ids.get(s).copied(),
+            text: s.to_string(),
+            prev: usize::MAX,
+            next: usize::MAX,
+            alive: true,
+        }
+    }
+
+    fn merge_and_emit(&self, mut syms: Vec<Sym>, out: &mut Vec<u32>) {
         let n = syms.len();
         if n == 0 {
             return;
@@ -234,7 +319,12 @@ impl Tokenizer {
             let s = &syms[i];
             match s.id {
                 Some(id) => out.push(id),
-                None => self.push_byte_fallback(&s.text, out),
+                // Byte-level seeds are always in the vocab (all 256 stand-in
+                // characters exist), so fallback only arises for meta-space.
+                None => match self.style {
+                    Style::MetaSpace => self.push_byte_fallback(&s.text, out),
+                    Style::ByteLevel => out.push(self.unk),
+                },
             }
             i = s.next;
         }
@@ -340,6 +430,13 @@ impl<'a> Decoder<'a> {
             return String::new();
         }
         let text = self.tok.token_text(id);
+
+        // Byte-level spellings decode character-by-character to raw bytes;
+        // partial UTF-8 sequences wait in `pending` like everything else.
+        if self.tok.style == Style::ByteLevel {
+            self.pending.extend(text.chars().filter_map(char_to_byte));
+            return self.take_valid();
+        }
 
         if kind == TokenKind::Byte {
             // Spelled "<0xNN>"; recover the raw byte.
