@@ -49,6 +49,12 @@ impl LayerCache {
         &self.v[s..s + self.kv_dim]
     }
 
+    /// Overwrite this layer's keys and values in full.
+    pub fn wipe(&mut self) {
+        secret::zero_slice(&mut self.k);
+        secret::zero_slice(&mut self.v);
+    }
+
     pub fn store(&mut self, pos: usize, k: &[f32], v: &[f32]) {
         let s = self.slot(pos) * self.kv_dim;
         self.k[s..s + self.kv_dim].copy_from_slice(k);
@@ -88,6 +94,20 @@ impl KvCache {
 
     pub fn clear(&mut self) {
         self.len = 0;
+    }
+
+    /// Overwrite the cache, not just rewind it.
+    ///
+    /// [`Self::clear`] resets the write position and leaves the keys and values
+    /// of the previous conversation in place — correct for inference, since
+    /// nothing reads past `len`, but they are still there to be read by anything
+    /// else. The wipe is unconditional across the full allocation: a shorter
+    /// follow-up conversation must not leave the tail of a longer one exposed.
+    pub fn wipe(&mut self) {
+        self.len = 0;
+        for l in &mut self.layers {
+            l.wipe();
+        }
     }
 
     /// Drop everything from `pos` onward, e.g. when a prefix is reused.

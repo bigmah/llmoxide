@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 gguf = { path = "../gguf" }
+secret = { path = "../secret" }
 anyhow.workspace = true
 rayon.workspace = true
 serde.workspace = true

@@ -9,6 +9,7 @@ tokenizer = { path = "../tokenizer" }
 model = { path = "../model" }
 gpu = { path = "../gpu" }
 chat = { path = "../chat" }
+secret = { path = "../secret" }
 anyhow.workspace = true
 axum = "0.8"
 tokio = { workspace = true }
@@ -17,3 +18,7 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 futures = "0.3"
+
+[[bin]]
+name = "llmoxide-private"
+path = "src/bin/llmoxide-private.rs"

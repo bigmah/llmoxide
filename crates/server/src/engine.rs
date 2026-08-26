@@ -97,11 +97,13 @@ impl Backend {
         }
     }
 
-    fn reset(&mut self) {
+    /// Overwrite the cache rather than rewinding it. See the `wipe` methods on
+    /// each backend for what `reset` leaves behind.
+    fn wipe(&mut self) {
         match self {
-            Self::Gemma4Gpu(m) => m.reset(),
-            Self::Qwen35Gpu(m) => m.reset(),
-            Self::Qwen35Cpu { state, .. } => state.clear(),
+            Self::Gemma4Gpu(m) => m.wipe(),
+            Self::Qwen35Gpu(m) => m.wipe(),
+            Self::Qwen35Cpu { state, .. } => state.wipe(),
         }
     }
 
@@ -125,7 +127,14 @@ pub struct Engine {
     tok: Tokenizer,
     chat: ChatFormat,
     /// The exact token sequence currently in the KV cache / recurrent state.
-    cached: Vec<u32>,
+    ///
+    /// This is the single most sensitive allocation in the process: not a
+    /// derived activation but the conversation itself, decodable back to
+    /// plaintext with the tokenizer that is sitting right next to it, and kept
+    /// alive between turns on purpose so prefix reuse works. Locked into RAM so
+    /// it cannot reach swap or a hibernation image, and zeroed on wipe and on
+    /// drop.
+    cached: secret::SecretVec<u32>,
     pub default_sampling: Sampling,
 }
 
@@ -180,9 +189,20 @@ impl Engine {
             backend,
             tok,
             chat,
-            cached: Vec::new(),
+            cached: secret::SecretVec::new(),
             default_sampling,
         })
+    }
+
+    /// Forget the current conversation: overwrite the resident token ids and
+    /// every buffer derived from them.
+    ///
+    /// Cheap enough to call between turns — it clears device buffers and locked
+    /// pages, not the weights, so the model stays resident and the next prompt
+    /// only pays a full prefill.
+    pub fn wipe(&mut self) {
+        self.backend.wipe();
+        self.cached.wipe();
     }
 
     pub fn tokenizer(&self) -> &Tokenizer {
@@ -246,8 +266,11 @@ impl Engine {
 
         let reuse = self.reusable_prefix(&prompt);
         if reuse == 0 {
-            self.backend.reset();
-            self.cached.clear();
+            // Nothing of the resident conversation is reachable from here on,
+            // so overwrite it now rather than leaving it to be shadowed by
+            // whatever the new one happens to write.
+            self.backend.wipe();
+            self.cached.wipe();
         }
         tracing::info!(
             prompt = prompt.len(),
@@ -269,7 +292,7 @@ impl Engine {
             logits = self.backend.forward(&prompt[i..end])?;
             i = end;
         }
-        self.cached = prompt;
+        self.cached.replace(&prompt);
 
         let eog = self.backend.eog().to_vec();
         let max_new = req
@@ -278,7 +301,9 @@ impl Engine {
         let mut sampler = Sampler::new(req.sampling);
         let mut generated: Vec<u32> = Vec::new();
         let mut decoder = tokenizer::Decoder::new(&self.tok);
-        let mut text = String::new();
+        // Accumulates the whole response for stop-string matching. Locked, so a
+        // long generation cannot be paged out mid-answer.
+        let mut text = secret::SecretString::new();
         let mut reason = FinishReason::Length;
 
         for _ in 0..max_new {

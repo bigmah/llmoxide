@@ -361,6 +361,86 @@ impl GpuModel {
         self.pos = 0;
     }
 
+    /// Count the non-zero words in every buffer [`Self::wipe`] is responsible
+    /// for, so a wipe can be verified rather than trusted.
+    ///
+    /// Slow — it reads the whole KV cache back over PCIe-equivalent bandwidth —
+    /// and only meant for `wipe_check`.
+    pub fn residue(&self) -> Vec<(String, usize, usize)> {
+        let mut out = Vec::new();
+        let mut count = |name: &str, b: &wgpu::Buffer| {
+            let n = (b.size() / 4) as usize;
+            let data = self.gpu.read_f32(b, n);
+            let nz = data.iter().filter(|v| v.to_bits() != 0).count();
+            out.push((name.to_string(), nz, n));
+        };
+        count("h", &self.h);
+        count("x", &self.x);
+        count("q", &self.q);
+        count("k", &self.k);
+        count("v", &self.v);
+        count("attn", &self.attn);
+        count("proj", &self.proj);
+        count("gate", &self.gate);
+        count("up", &self.up);
+        count("scores", &self.scores);
+        count("logits", &self.logits);
+        count("tokens", &self.tokens);
+        for (i, c) in self.cache.iter().enumerate() {
+            count(&format!("cache.{i}.k"), &c.k);
+            count(&format!("cache.{i}.v"), &c.v);
+        }
+        out
+    }
+
+    /// Overwrite every buffer that can hold prompt- or response-derived data.
+    ///
+    /// [`Self::reset`] only rewinds the position: the KV cache still physically
+    /// holds the previous conversation's keys and values until later tokens
+    /// happen to land on those slots, and freeing a wgpu buffer does not zero
+    /// it either — on unified memory that is host RAM handed back with the
+    /// contents intact. So the clears are explicit, and the poll makes sure
+    /// they have actually executed before this returns rather than sitting in
+    /// a queue the caller is about to abandon.
+    ///
+    /// Weights are not touched; they are not secret and re-uploading 7 GB to
+    /// carry on the session would defeat the point.
+    pub fn wipe(&mut self) {
+        self.pos = 0;
+        // The cached plan holds bind groups and per-slot uniform bytes for the
+        // conversation just wiped; drop it rather than reason about what is in
+        // it. The next token rebuilds it.
+        self.decode = None;
+
+        let mut enc = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wipe") });
+        for b in [
+            &self.h,
+            &self.x,
+            &self.q,
+            &self.k,
+            &self.v,
+            &self.attn,
+            &self.proj,
+            &self.gate,
+            &self.up,
+            &self.scores,
+            &self.logits,
+            &self.tokens,
+            &self.uniforms,
+        ] {
+            enc.clear_buffer(b, 0, None);
+        }
+        for c in &self.cache {
+            enc.clear_buffer(&c.k, 0, None);
+            enc.clear_buffer(&c.v, 0, None);
+        }
+        self.gpu.queue.submit([enc.finish()]);
+        self.gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    }
+
 }
 
 /// One uniform slot. Decode reuses a cached dispatch plan across tokens, so

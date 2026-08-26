@@ -72,6 +72,25 @@ impl State {
         }
     }
 
+    /// Overwrite every layer's state, attention KV included.
+    ///
+    /// [`Self::clear`] zeroes the recurrent buffers because the recurrence is
+    /// cumulative and would otherwise be wrong; it deliberately leaves the
+    /// attention caches alone, since nothing reads past `len`. This clears
+    /// both, for when the goal is that the conversation stops existing.
+    pub fn wipe(&mut self) {
+        self.len = 0;
+        for l in &mut self.layers {
+            match l {
+                LayerState::Linear { conv, s } => {
+                    secret::zero_slice(conv);
+                    secret::zero_slice(s);
+                }
+                LayerState::Attn(c) => c.wipe(),
+            }
+        }
+    }
+
     pub fn bytes(&self) -> usize {
         self.layers
             .iter()

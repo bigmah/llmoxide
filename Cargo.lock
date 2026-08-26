@@ -478,6 +478,7 @@ dependencies = [
  "model",
  "naga",
  "pollster",
+ "tokenizer",
  "tracing",
  "wgpu",
 ]
@@ -866,6 +867,7 @@ dependencies = [
  "anyhow",
  "gguf",
  "rayon",
+ "secret",
  "serde",
  "serde_json",
 ]
@@ -1135,6 +1137,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "secret"
+version = "0.1.0"
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1211,6 +1217,7 @@ dependencies = [
  "gguf",
  "gpu",
  "model",
+ "secret",
  "serde",
  "serde_json",
  "tokenizer",

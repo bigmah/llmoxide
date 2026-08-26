@@ -11,6 +11,7 @@ wgpu.workspace = true
 pollster.workspace = true
 bytemuck.workspace = true
 half.workspace = true
+tokenizer = { path = "../tokenizer" }
 tracing.workspace = true
 naga = { version = "27", features = ["wgsl-in", "msl-out"] }
 
@@ -37,3 +38,7 @@ path = "src/bin/bisect_qwen35.rs"
 [[bin]]
 name = "upload_check"
 path = "src/bin/upload_check.rs"
+
+[[bin]]
+name = "wipe_check"
+path = "src/bin/wipe_check.rs"

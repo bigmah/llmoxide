@@ -17,7 +17,8 @@ crates/tokenizer  gemma4 BPE (262144 tokens) + qwen35 byte-level BPE (248320)
 crates/model      architecture configs, CPU reference forward passes, sampling
 crates/gpu        wgpu device, weight arena, WGSL kernels, both GPU forwards
 crates/chat       prompt assembly: gemma4's tool DSL + qwen35's ChatML/XML
-crates/server     axum OpenAI-compatible API, dispatching on architecture
+crates/secret     locked, self-zeroing memory; the zeroing global allocator
+crates/server     axum OpenAI-compatible API, private REPL, wipe
 ```
 
 ## Running
@@ -80,6 +81,7 @@ Tools that reproduce this:
 ./target/release/bisect_qwen35  <model> [ids]                  # per-checkpoint GPU vs CPU
 ./target/release/validate_qwen35 <model> <refs.json> <ids>     # vs llama-eval-callback
 ./target/release/upload_check   <model>                        # weight arena readback
+./target/release/wipe_check     <model> [prompt]               # wipe leaves no residue
 ```
 
 `bisect` reports the *first* diverging checkpoint, which is how the NaN in
@@ -188,6 +190,87 @@ assistant turns reproduce the empty thought channel the generation prompt
 emits — otherwise every turn diverges from the cache at the first assistant
 message and re-prefills the whole conversation.
 
+## Private mode
+
+`llmoxide-private` is a session that leaves nothing behind. It exists because
+the engine writing nothing to disk is not the same as a session being
+unrecoverable afterwards — the parts that persist are the resident prompt ids
+kept for prefix reuse, the device buffers holding everything derived from them,
+and the heap copies prompt text passes through in between. `reset` touches none
+of them.
+
+```sh
+./target/release/llmoxide-private models/Qwen3.8-27B-Q6_K.gguf
+```
+
+```
+»  what is the capital of France?
+Paris
+»  /wipe
+wiped: conversation, device buffers, locked pages.
+```
+
+Four things differ from `llmoxide` and `llmoxide-serve`:
+
+- **Prompts are typed, never passed as arguments.** `llmoxide model "..."` puts
+  the prompt verbatim into `~/.zsh_history`; reading stdin skips the shell.
+- **No client, so no client-side archive.** opencode keeps every message in
+  plaintext in `~/.local/share/opencode/opencode.db`. This mode has no storage
+  of any kind.
+- **The heap is zeroed as it is freed.** `secret::ZeroizingAlloc` is installed
+  as the global allocator, so the copies no wipe could chase — the chat
+  template's strings, decoded pieces, per-token logit vectors — never outlive
+  their allocation. `realloc` deliberately falls through to alloc+copy+dealloc
+  rather than the system's, which would hand back a growing `String`'s old block
+  with the plaintext intact.
+- **The prompt ids and the response are `mlock`ed.** This matters more than the
+  wipe: zeroing a page *after* it has reached swap or `/var/vm/sleepimage` does
+  not unwrite it. Locked pages never go there in the first place.
+
+`secret::harden()` also drops `RLIMIT_CORE` to zero and sets `PT_DENY_ATTACH`,
+closing the two ways this memory is read without touching disk at all.
+
+`llmoxide-serve` gets the same treatment where it can: `POST /v1/wipe`
+overwrites the resident conversation (queued behind any in-flight generation, so
+it cannot land mid-stream), and the parse-failure path no longer logs the request
+body — it was the one place in the server where prompt text could become
+durable. Removing the body log was not enough on its own: `serde_json` quotes
+the offending value inside its own error message, so `ApiError` now carries a
+detailed message for the client and a sanitized one — category, line, column —
+for the log.
+
+The engine also wipes rather than resets whenever a prompt misses the cache,
+which it previously did with a `reset` that left the old conversation in the
+buffers. That costs a buffer clear per cache miss, tens of milliseconds against
+a prefill measured in seconds.
+
+### Verifying it
+
+`wipe` is exactly the kind of claim that looks true and isn't: `reset` appears
+to clear the KV cache and does not, and a `clear_buffer` that was queued but
+never submitted is indistinguishable from the host side. So it is checked, not
+asserted:
+
+```sh
+./target/release/wipe_check <model.gguf> [prompt]   # exits non-zero on any residue
+```
+
+It prefills a prompt, confirms the device buffers are full of it, wipes, and
+reads every buffer back. On gemma4: **4 019 403 non-zero words across 108
+buffers (711 MB) before, 0 after.** It refuses to pass vacuously if nothing was
+resident to begin with.
+
+### What this does not cover
+
+- **Terminal scrollback.** `/wipe` asks the emulator to clear it, which
+  Terminal.app and iTerm2 honour, but that is a request, not a guarantee.
+- **That inference happened.** The GGUF's access time, twenty minutes of GPU at
+  full tilt, and the process-launch record in the unified log all persist. What
+  was asked can be made unrecoverable; that something was asked cannot.
+- **Root on a live machine**, which can read process memory regardless.
+- **A `SIGKILL` before the wipe runs** — though `mlock` covers the disk side of
+  that case, and the kernel zeroes freed physical pages before reissuing them.
+
 ## API
 
 `GET /v1/models`, `POST /v1/chat/completions` (streaming and not), `GET /health`.
@@ -234,3 +317,5 @@ behaviours shared by both:
   multimodal path is implemented.
 - The context is capped at `LLMOXIDE_CTX`, well below the models' 262144,
   since attention scratch scales with it.
+- Private mode covers this process, not the machine: see "What this does not
+  cover" above.

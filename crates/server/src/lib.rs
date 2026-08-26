@@ -22,11 +22,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, Mutex};
 
-/// A queued generation: the request plus where to stream events.
-struct Job {
-    req: GenerateRequest,
-    tx: mpsc::Sender<Event>,
-    ready: oneshot::Sender<()>,
+/// Work for the engine thread. The engine is not `Sync`, so everything that
+/// touches it — generation and wiping alike — arrives down this one channel.
+enum Job {
+    /// A queued generation: the request plus where to stream events.
+    Generate {
+        req: GenerateRequest,
+        tx: mpsc::Sender<Event>,
+        ready: oneshot::Sender<()>,
+    },
+    /// Overwrite the resident conversation. Acknowledged only once the wipe has
+    /// actually run, so a client can rely on the response meaning it is done.
+    Wipe(oneshot::Sender<()>),
 }
 
 #[derive(Clone)]
@@ -50,8 +57,16 @@ impl AppState {
             .name("llmoxide-engine".into())
             .spawn(move || {
                 while let Some(job) = rx.blocking_recv() {
-                    let _ = job.ready.send(());
-                    engine.generate(job.req, &job.tx);
+                    match job {
+                        Job::Generate { req, tx, ready } => {
+                            let _ = ready.send(());
+                            engine.generate(req, &tx);
+                        }
+                        Job::Wipe(done) => {
+                            engine.wipe();
+                            let _ = done.send(());
+                        }
+                    }
                 }
             })
             .expect("spawn engine thread");
@@ -70,6 +85,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/wipe", post(wipe))
         .route("/health", get(|| async { "ok" }))
         .fallback(unmatched)
         .layer(axum::middleware::from_fn(log_request))
@@ -94,6 +110,19 @@ async fn unmatched(req: axum::extract::Request) -> impl IntoResponse {
         StatusCode::NOT_FOUND,
         Json(json!({"error": {"message": format!("no route for {} {}", req.method(), req.uri())}})),
     )
+}
+
+/// Forget the resident conversation.
+///
+/// Queued behind any in-flight generation like everything else, so a wipe
+/// cannot land halfway through a stream and leave the cache describing a
+/// conversation the engine is still extending.
+async fn wipe(State(s): State<AppState>) -> Json<Value> {
+    let (done, wait) = oneshot::channel();
+    let _ = s.jobs.send(Job::Wipe(done));
+    let ok = wait.await.is_ok();
+    tracing::info!(ok, "wiped");
+    Json(json!({"wiped": ok}))
 }
 
 async fn list_models(State(s): State<AppState>) -> Json<Value> {
@@ -211,7 +240,7 @@ fn build_job(s: &AppState, req: ChatRequest) -> (GenerateRequest, bool) {
 async fn submit(s: &AppState, req: GenerateRequest) -> mpsc::Receiver<Event> {
     let (tx, rx) = mpsc::channel();
     let (ready, started) = oneshot::channel();
-    let _ = s.jobs.send(Job { req, tx, ready });
+    let _ = s.jobs.send(Job::Generate { req, tx, ready });
     let _ = started.await;
     rx
 }
@@ -223,8 +252,25 @@ async fn chat_completions(
     // Parse by hand so a schema mismatch reports the offending payload instead
     // of axum rejecting it with an opaque 422.
     let req: ChatRequest = serde_json::from_slice(&body).map_err(|e| {
-        tracing::error!(error = %e, body = %String::from_utf8_lossy(&body), "bad request");
-        ApiError(format!("could not parse request: {e}"))
+        // Neither the body nor serde's message reaches the log: the message
+        // quotes the offending value, so it carries prompt text of its own.
+        // Position and category are enough to debug a schema mismatch.
+        tracing::error!(
+            line = e.line(),
+            column = e.column(),
+            kind = ?e.classify(),
+            bytes = body.len(),
+            "bad request"
+        );
+        ApiError::split(
+            format!("could not parse request: {e}"),
+            format!(
+                "could not parse request: {:?} at line {} column {}",
+                e.classify(),
+                e.line(),
+                e.column()
+            ),
+        )
     })?;
     tracing::info!(
         messages = req.messages.len(),
@@ -274,13 +320,13 @@ async fn complete(s: AppState, job: GenerateRequest) -> Result<Value, ApiError> 
         (prompt_tokens, completion_tokens, done, err)
     })
     .await
-    .map_err(|e| ApiError(e.to_string()))?;
+    .map_err(|e| ApiError::new(e.to_string()))?;
 
     let (prompt_tokens, completion_tokens, done, err) = collected;
     if let Some(e) = err {
-        return Err(ApiError(e));
+        return Err(ApiError::new(e));
     }
-    let (completion, reason) = done.ok_or_else(|| ApiError("generation produced no result".into()))?;
+    let (completion, reason) = done.ok_or_else(|| ApiError::new("generation produced no result"))?;
 
     let calls = api_tool_calls(&completion.tool_calls);
     let mut message = json!({ "role": "assistant", "content": completion.content });
@@ -390,14 +436,44 @@ async fn stream_completion(s: AppState, job: GenerateRequest) -> impl IntoRespon
     Sse::new(stream)
 }
 
-pub struct ApiError(String);
+/// An error with two faces: what the client is told, and what gets logged.
+///
+/// They have to differ. A `serde_json` parse error quotes the offending value
+/// back at you — `invalid type: string "..."` — so logging the message that goes
+/// to the client would write a fragment of the prompt into the log, which is the
+/// exact leak that not logging the body was supposed to close. The client
+/// already has its own payload, so it gets the detailed message; the log gets
+/// the shape of the failure and nothing from inside it.
+pub struct ApiError {
+    client: String,
+    log: String,
+}
+
+impl ApiError {
+    /// Same text both ways, for errors generated here rather than from input.
+    fn new(msg: impl Into<String>) -> Self {
+        let msg = msg.into();
+        Self {
+            client: msg.clone(),
+            log: msg,
+        }
+    }
+
+    /// A detailed message for the client, a sanitized one for the log.
+    fn split(client: impl Into<String>, log: impl Into<String>) -> Self {
+        Self {
+            client: client.into(),
+            log: log.into(),
+        }
+    }
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        tracing::error!(error = %self.0, "request failed");
+        tracing::error!(error = %self.log, "request failed");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": { "message": self.0, "type": "server_error" } })),
+            Json(json!({ "error": { "message": self.client, "type": "server_error" } })),
         )
             .into_response()
     }

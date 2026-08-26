@@ -483,6 +483,106 @@ impl Qwen35Gpu {
         }
         self.gpu.queue.submit([enc.finish()]);
     }
+
+    /// Count the non-zero words in every buffer [`Self::wipe`] is responsible
+    /// for, so a wipe can be verified rather than trusted. See `wipe_check`.
+    pub fn residue(&self) -> Vec<(String, usize, usize)> {
+        let mut out = Vec::new();
+        let mut count = |name: &str, b: &wgpu::Buffer| {
+            let n = (b.size() / 4) as usize;
+            let data = self.gpu.read_f32(b, n);
+            let nz = data.iter().filter(|v| v.to_bits() != 0).count();
+            out.push((name.to_string(), nz, n));
+        };
+        count("h", &self.h);
+        count("x", &self.x);
+        count("fused", &self.fused);
+        count("conv", &self.conv);
+        count("conv_scratch", &self.conv_scratch);
+        count("z", &self.z);
+        count("alpha", &self.alpha);
+        count("beta", &self.beta);
+        count("q", &self.q);
+        count("gate_a", &self.gate_a);
+        count("k", &self.k);
+        count("v", &self.v);
+        count("attn", &self.attn);
+        count("proj", &self.proj);
+        count("gate", &self.gate);
+        count("up", &self.up);
+        count("scores", &self.scores);
+        count("logits", &self.logits);
+        count("tokens", &self.tokens);
+        for (i, l) in self.state.iter().enumerate() {
+            match l {
+                LayerState::Linear { conv, s } => {
+                    count(&format!("state.{i}.conv"), conv);
+                    count(&format!("state.{i}.s"), s);
+                }
+                LayerState::Attn { k, v } => {
+                    count(&format!("state.{i}.k"), k);
+                    count(&format!("state.{i}.v"), v);
+                }
+            }
+        }
+        out
+    }
+
+    /// Overwrite every buffer that can hold prompt- or response-derived data.
+    ///
+    /// [`Self::reset`] zeroes the recurrent state because the recurrence would
+    /// otherwise be *wrong*, not because of any privacy concern — and it leaves
+    /// the attention layers' KV cache and every activation buffer holding the
+    /// last conversation. This clears all of them, and polls so the clears have
+    /// run before returning. Weights stay resident.
+    pub fn wipe(&mut self) {
+        self.pos = 0;
+        self.decode = None;
+
+        let mut enc = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wipe") });
+        for b in [
+            &self.h,
+            &self.x,
+            &self.fused,
+            &self.conv,
+            &self.conv_scratch,
+            &self.z,
+            &self.alpha,
+            &self.beta,
+            &self.q,
+            &self.gate_a,
+            &self.k,
+            &self.v,
+            &self.attn,
+            &self.proj,
+            &self.gate,
+            &self.up,
+            &self.scores,
+            &self.logits,
+            &self.tokens,
+            &self.sink,
+            &self.uniforms,
+        ] {
+            enc.clear_buffer(b, 0, None);
+        }
+        for l in &self.state {
+            match l {
+                LayerState::Linear { conv, s } => {
+                    enc.clear_buffer(conv, 0, None);
+                    enc.clear_buffer(s, 0, None);
+                }
+                LayerState::Attn { k, v } => {
+                    enc.clear_buffer(k, 0, None);
+                    enc.clear_buffer(v, 0, None);
+                }
+            }
+        }
+        self.gpu.queue.submit([enc.finish()]);
+        self.gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    }
 }
 
 /// One uniform slot; position-dependent values are materialized per call so
