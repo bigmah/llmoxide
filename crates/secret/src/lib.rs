@@ -287,23 +287,34 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for ZeroizingAlloc<A> {
 // Process hardening
 // ---------------------------------------------------------------------------
 
-/// Close the two routes that read this process's memory without touching disk.
+/// A crash cannot write a core file containing the prompt.
 ///
-/// * `RLIMIT_CORE = 0` — a crash cannot write a core file containing the
-///   prompt. (macOS defaults to this, but it is inherited from the shell and
-///   a `ulimit -c unlimited` upstream would silently undo it.)
-/// * `PT_DENY_ATTACH` — no debugger can attach and read memory out of a live
-///   session. Root can still do so through other means; this raises the bar,
-///   it does not close the door.
-pub fn harden() {
+/// macOS defaults to this, but the limit is inherited from the shell, so a
+/// `ulimit -c unlimited` anywhere upstream would silently undo it. Costs
+/// nothing and has no downside, so every entry point calls it.
+pub fn no_core_dumps() {
     let rl = Rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    unsafe {
-        setrlimit(RLIMIT_CORE, &rl);
-        ptrace(PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0);
-    }
+    unsafe { setrlimit(RLIMIT_CORE, &rl) };
+}
+
+/// No debugger can attach and read memory out of a live session.
+///
+/// Kept separate from [`no_core_dumps`] because it is not free: it also blocks
+/// profilers and `lldb`, which this repo's performance work actually uses. Worth
+/// it for a private session, not worth it by default on a server you profile.
+/// Root can still read the process by other means; this raises the bar rather
+/// than closing the door.
+pub fn no_debugger() {
+    unsafe { ptrace(PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) };
+}
+
+/// Both of the above.
+pub fn harden() {
+    no_core_dumps();
+    no_debugger();
 }
 
 #[cfg(test)]

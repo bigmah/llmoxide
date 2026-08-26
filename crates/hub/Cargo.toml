@@ -1,0 +1,14 @@
+[package]
+name = "hub"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gguf = { path = "../gguf" }
+anyhow.workspace = true
+ureq = "3.4"
+sha2 = "0.11"
+
+[[bin]]
+name = "llmoxide-fetch"
+path = "src/bin/llmoxide-fetch.rs"

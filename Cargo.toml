@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/gguf", "crates/tokenizer", "crates/model", "crates/gpu", "crates/chat", "crates/secret", "crates/server", "llmoxide"]
+members = ["crates/gguf", "crates/tokenizer", "crates/model", "crates/gpu", "crates/chat", "crates/secret", "crates/hub", "crates/server", "llmoxide"]
 
 [workspace.package]
 version = "0.1.0"
