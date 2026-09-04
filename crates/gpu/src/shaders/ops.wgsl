@@ -343,3 +343,26 @@ fn write_cache(
         i = i + stride;
     }
 }
+
+// Gather one strided block of rows: out[r*dim + c] = a[u1 + r*u0 + c].
+//   n_rows, dim — output shape
+//   u0          — source stride between consecutive rows
+//   u1          — offset of the first row in `a`
+// Used to lift one layer's slice out of the per-layer-embedding table, whose
+// rows are `n_layers * n_embd_per_layer` wide.
+@compute @workgroup_size(WG)
+fn copy_rows(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let n = op.n_rows * op.dim;
+    let stride = nwg.x * WG;
+    var i = gid.x;
+    loop {
+        if (i >= n) { break; }
+        let r = i / op.dim;
+        let c = i - r * op.dim;
+        out[i] = a[op.u1 + r * op.u0 + c];
+        i = i + stride;
+    }
+}

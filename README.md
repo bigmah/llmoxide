@@ -27,22 +27,43 @@ wiped: conversation, device buffers, locked pages.
 
 ## Models
 
-Two checkpoints, both of which this repo is validated against tensor-by-tensor.
-Both run on the GPU; the CPU forward passes stay in the tree as the reference
-every kernel is checked against, not as a fallback.
+Three checkpoints, each validated against tensor-by-tensor. All run on the GPU;
+the CPU forward passes stay in the tree as the reference every kernel is checked
+against, not as a fallback.
 
 | alias | file | arch | size | sha256 |
 |---|---|---|---|---|
 | `gemma4` | `gemma4-v2-Q4_K_M.gguf` | gemma4, 12B, 48 layers | 7.38 GB | `0b9506ca…` |
+| `gemma4-e4b` | `gemma-4-E4B-it-Q8_0.gguf` | gemma4, E4B, 42 layers | 8.03 GB | `34be82b1…` |
 | `qwen35` | `Qwen3.8-27B-OBLITERATED-Q6_K.gguf` | qwen35, 27B hybrid, 64 layers | 22.43 GB | `3535d4a1…` |
 
 From [`yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF`](https://huggingface.co/yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF)
 and [`OBLITERATUS/Qwen3.8-27B-OBLITERATED`](https://huggingface.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED)
-respectively. `qwen35` is the interesting one architecturally: a hybrid stack
-where three quarters of the layers are gated delta-net rather than attention.
+respectively, and `gemma4-e4b` from
+[`ggml-org/gemma-4-E4B-it-GGUF`](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF).
+`qwen35` is the interesting one architecturally: a hybrid stack where three
+quarters of the layers are gated delta-net rather than attention.
+
+One chat-format trap comes with it. The two checkpoints disagree on how to turn
+*off* reasoning: the 12B's template suppresses it by making the generation prompt
+open and immediately close an empty `thought` channel, and E4B's template has no
+such suppressor. Emitting the 12B's form to E4B does not disable thinking — the
+model finds the channel already closed, never opens another, and writes its
+reasoning into the visible answer. `Special::closes_empty_thought` reads which
+convention a checkpoint uses off its embedded template rather than assuming.
+
+`gemma4-e4b` is the same architecture as the 12B only in name. The E-series
+keeps a narrow 2560-wide residual stream and spends its parameters on a
+*per-layer embedding* table instead — a 256-wide vector looked up per token per
+layer, gated into the stream at the end of every block. That is what "E4B"
+means: 4.5B effective parameters out of 8B on disk. It also shares KV across
+the top of the stack, so layers 24–41 project Q only and attend into the cache
+of layer 22 (sliding) or 23 (global), and it writes `head_count_kv` as a scalar
+where the 12B writes a 48-entry array. Config reads all of this out of the GGUF;
+see [`crates/model/src/config.rs`](crates/model/src/config.rs).
 
 ```sh
-./target/release/llmoxide-fetch            # both, into models/
+./target/release/llmoxide-fetch            # all three, into models/
 ./target/release/llmoxide-fetch gemma4     # or one
 ./target/release/llmoxide-fetch hf:owner/repo/file.gguf
 ./target/release/llmoxide-fetch https://huggingface.co/owner/repo/blob/main/f.gguf
@@ -163,6 +184,9 @@ Everything is checked against llama.cpp rather than asserted:
 | gemma4 CPU forward | **byte-identical** greedy output to `llama-completion --temp 0` |
 | gemma4 GPU kernels | every matvec within ~1e-7 of the CPU dequant-dot, on real weights |
 | gemma4 GPU forward | all 773 intermediate tensors match the CPU path across 48 layers (~1e-6) |
+| E4B CPU forward | 674 tensors across all 42 layers traced against `llama-eval-callback`; KV-sharing boundary matches exactly (llama.cpp emits `Kcur` for layers 0–23 only) |
+| E4B GPU forward | **471/471** checkpoints match the CPU path across 42 layers (~1e-6), per-layer embeddings included |
+| E4B chat format | `reasoning_content` / `content` split matches `llama-server --jinja` on the same request, thinking on and off |
 | qwen35 tokenizer | exact id-for-id match with `llama-tokenize` on 18 cases + 3 files (~11k tokens) |
 | qwen35 CPU forward | 567 tensors across all 64 layers match `llama-eval-callback` within 4e-4 on a real 27B; **byte-identical** greedy output to `llama-completion --temp 0` |
 | qwen35 GPU forward | **771/771** checkpoints match the CPU path on the 27B (logits rel 1.3e-6, same argmax) |
@@ -396,14 +420,17 @@ crates/server     the private REPL, plus the axum OpenAI-compatible API
   range inside one dispatch of `n_v_heads` workgroups, so those layers get no
   token parallelism during prefill and cannot fill the GPU. A chunked
   formulation is the obvious next thing to attack.
-- Neither architecture can rewind its cache, so prompt reuse is append-only:
+- No architecture here can rewind its cache, so prompt reuse is append-only:
   gemma4's ring buffers have overwritten the positions, and qwen35's recurrent
   state was never a history to begin with.
-- The MTP/NextN draft head (`blk.64`) is skipped at load; no speculative
-  decoding.
+- No speculative decoding, though two of the checkpoints ship a drafter for it:
+  qwen35's MTP/NextN head (`blk.64`) is skipped at load, and Gemma 4 publishes a
+  separate MTP drafter (`google/gemma-4-E4B-it-assistant`). Wiring either up
+  needs a KV cache that can rewind on a rejected draft, which is the same gap as
+  the entry above.
 - Single request at a time, one GPU context; no batching across clients.
-- Text only — both vocabularies carry image/audio/video tokens, but no
-  multimodal path is implemented.
+- Text only — the vocabularies carry image/audio/video tokens and E4B ships an
+  `mmproj` encoder, but no multimodal path is implemented.
 - The context is capped at `LLMOXIDE_CTX`, well below the models' 262144,
   since attention scratch scales with it.
 - Private mode covers this process, not the machine, and not the server: see

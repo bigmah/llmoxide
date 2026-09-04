@@ -41,6 +41,10 @@ pub const ALIASES: &[(&str, &str)] = &[
         "https://huggingface.co/yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF/resolve/main/gemma4-v2-Q4_K_M.gguf",
     ),
     (
+        "gemma4-e4b",
+        "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf",
+    ),
+    (
         "qwen35",
         "https://huggingface.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED/resolve/main/Qwen3.8-27B-OBLITERATED-Q6_K.gguf",
     ),

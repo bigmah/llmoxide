@@ -16,8 +16,17 @@
 //! h  = h + rms(Wo attn(q,k,v)) * post_attention_norm
 //! y  = rms(h) * ffn_norm
 //! h  = h + rms(Wd (gelu(Wg y) * Wu y)) * post_ffw_norm
+//! h  = h + rms(Wp (gelu(Wg_ple h) * ple[layer])) * post_norm   // E-series only
 //! h  = h * layer_output_scale
 //! ```
+//!
+//! The per-layer-embedding (PLE) line is what separates the E-series (E2B/E4B)
+//! from the dense checkpoints. Each layer gets its own 256-wide embedding per
+//! token, looked up from a table rather than computed, and gates the residual
+//! stream through it. The dense 12B has `n_embd_per_layer == 0` and skips it.
+//!
+//! Layers past the KV-sharing boundary project Q only and attend into an
+//! earlier layer's cache; see [`crate::config::LayerConfig::kv_source`].
 
 use crate::cache::KvCache;
 use crate::config::Config;
@@ -47,6 +56,12 @@ struct Buffers {
     gate: Vec<f32>,
     up: Vec<f32>,
     scores: Vec<f32>,
+    /// `[t, n_layers, n_embd_per_layer]` — the blended per-layer inputs, held
+    /// for the whole batch because every layer indexes its own slice. Empty
+    /// when the checkpoint has no per-layer embeddings.
+    ple: Vec<f32>,
+    ple_proj: Vec<f32>,
+    ple_gate: Vec<f32>,
 }
 
 impl Buffers {
@@ -66,6 +81,9 @@ impl Buffers {
             gate: vec![0.0; max_tokens * cfg.ffn_dim],
             up: vec![0.0; max_tokens * cfg.ffn_dim],
             scores: Vec::new(),
+            ple: vec![0.0; max_tokens * cfg.n_embd_per_layer * cfg.n_layers],
+            ple_proj: vec![0.0; max_tokens * cfg.n_embd_per_layer * cfg.n_layers],
+            ple_gate: vec![0.0; max_tokens * cfg.n_embd_per_layer],
         }
     }
 }
@@ -118,6 +136,44 @@ impl<'a> Cpu<'a> {
         }
         trace("inp_scaled", h);
 
+        // --- per-layer embeddings ------------------------------------------
+        // Built once for the whole batch: each token gets one small vector per
+        // layer, half looked up from `per_layer_token_embd` and half projected
+        // from the token embedding, averaged as `(a + b) / sqrt(2)`.
+        let e = cfg.n_embd_per_layer;
+        let span = e * cfg.n_layers;
+        if let Some(ple) = &self.w.ple {
+            let pl = &mut b.ple[..t * span];
+            for (i, &tok) in tokens.iter().enumerate() {
+                ple.token_embd
+                    .dequant_row_into(tok as usize, &mut pl[i * span..(i + 1) * span]);
+            }
+            let lookup_scale = (e as f32).sqrt();
+            for v in pl.iter_mut() {
+                *v *= lookup_scale;
+            }
+            trace("inp_per_layer_selected", pl);
+
+            let proj = &mut b.ple_proj[..t * span];
+            ops::matmat(proj, &ple.model_proj, h, t);
+            let proj_scale = 1.0 / (d as f32).sqrt();
+            // The norm runs over each layer's slice independently, matching
+            // llama.cpp normalizing dim0 of the [e, n_layers, t] view.
+            for seg in proj.chunks_exact_mut(e) {
+                for v in seg.iter_mut() {
+                    *v *= proj_scale;
+                }
+                ops::rms_norm_mul(seg, ple.proj_norm, cfg.rms_eps);
+            }
+            trace("per_layer_proj", proj);
+
+            let blend = 1.0 / 2f32.sqrt();
+            for (o, &p) in pl.iter_mut().zip(proj.iter()) {
+                *o = (*o + p) * blend;
+            }
+            trace("inp_per_layer", pl);
+        }
+
         for il in 0..cfg.n_layers {
             let lc = &cfg.layers[il];
             let lw = &self.w.layers[il];
@@ -142,29 +198,15 @@ impl<'a> Cpu<'a> {
             }
             trace(&format!("attn_norm-{il}"), x);
 
-            // --- Q / K / V projections ------------------------------------
+            // --- Q projection ---------------------------------------------
+            // Q is projected on every layer, including the ones that own no KV
+            // and only read an earlier layer's cache.
             let q = &mut b.q[..t * q_dim];
-            let k = &mut b.k[..t * kv_dim];
-            let v = &mut b.v[..t * kv_dim];
-
             ops::matmat(q, &lw.attn_q, x, t);
             trace(&format!("Qcur-{il}"), q);
-            ops::matmat(k, &lw.attn_k, x, t);
-            trace(&format!("Kcur-{il}"), k);
 
-            if lc.v_from_k {
-                // Global layers ship no attn_v: V is the *same* projection as K,
-                // diverging only in the normalization applied below.
-                v.copy_from_slice(k);
-            } else {
-                ops::matmat(v, &lw.v_proj(), x, t);
-            }
-            trace(&format!("Vcur-{il}"), v);
-
-            // --- QK norm, RoPE, V norm ------------------------------------
-            for (i, head) in q.chunks_exact_mut(head_dim).enumerate() {
+            for head in q.chunks_exact_mut(head_dim) {
                 ops::rms_norm_mul(head, lw.attn_q_norm, cfg.rms_eps);
-                let _ = i;
             }
             trace(&format!("Qcur_normed-{il}"), q);
             for (i, head) in q.chunks_exact_mut(head_dim).enumerate() {
@@ -173,32 +215,54 @@ impl<'a> Cpu<'a> {
             }
             trace(&format!("Qcur_pos-{il}"), q);
 
-            for head in k.chunks_exact_mut(head_dim) {
-                ops::rms_norm_mul(head, lw.attn_k_norm, cfg.rms_eps);
-            }
-            trace(&format!("Kcur_normed-{il}"), k);
-            for (i, head) in k.chunks_exact_mut(head_dim).enumerate() {
-                let pos = base_pos + i / n_kv;
-                ops::rope_neox(head, pos, lc.rope_base, rope_factors);
-            }
-            trace(&format!("Kcur_pos-{il}"), k);
+            // --- K / V projections and cache write ------------------------
+            // Skipped entirely on shared-KV layers: they neither compute nor
+            // store, so the cache entry they read stays the one written by the
+            // owning layer below them.
+            if let Some(kvw) = &lw.kv {
+                let k = &mut b.k[..t * kv_dim];
+                let v = &mut b.v[..t * kv_dim];
 
-            // V is normalized per head with no learned weight and never rotated.
-            for head in v.chunks_exact_mut(head_dim) {
-                ops::rms_norm(head, cfg.rms_eps);
+                ops::matmat(k, &kvw.attn_k, x, t);
+                trace(&format!("Kcur-{il}"), k);
+
+                if lc.v_from_k {
+                    // No attn_v in the file: V is the *same* projection as K,
+                    // diverging only in the normalization applied below.
+                    v.copy_from_slice(k);
+                } else {
+                    ops::matmat(v, &kvw.v_proj(), x, t);
+                }
+                trace(&format!("Vcur-{il}"), v);
+
+                for head in k.chunks_exact_mut(head_dim) {
+                    ops::rms_norm_mul(head, kvw.attn_k_norm, cfg.rms_eps);
+                }
+                trace(&format!("Kcur_normed-{il}"), k);
+                for (i, head) in k.chunks_exact_mut(head_dim).enumerate() {
+                    let pos = base_pos + i / n_kv;
+                    ops::rope_neox(head, pos, lc.rope_base, rope_factors);
+                }
+                trace(&format!("Kcur_pos-{il}"), k);
+
+                // V is normalized per head with no learned weight, never rotated.
+                for head in v.chunks_exact_mut(head_dim) {
+                    ops::rms_norm(head, cfg.rms_eps);
+                }
+                trace(&format!("Vcur_normed-{il}"), v);
+
+                let lcache = cache.layer_mut(il);
+                for i in 0..t {
+                    lcache.store(
+                        base_pos + i,
+                        &k[i * kv_dim..(i + 1) * kv_dim],
+                        &v[i * kv_dim..(i + 1) * kv_dim],
+                    );
+                }
             }
-            trace(&format!("Vcur_normed-{il}"), v);
 
             // --- attention -------------------------------------------------
-            let lcache = &mut cache.layers[il];
-            for i in 0..t {
-                lcache.store(
-                    base_pos + i,
-                    &k[i * kv_dim..(i + 1) * kv_dim],
-                    &v[i * kv_dim..(i + 1) * kv_dim],
-                );
-            }
-
+            let lcache = cache.layer(il);
             let scale = cfg.attn_scale(il);
             let attn = &mut b.attn[..t * q_dim];
             for i in 0..t {
@@ -270,9 +334,37 @@ impl<'a> Cpu<'a> {
             }
             trace(&format!("ffn_post_norm-{il}"), proj);
 
-            // Residual, then the whole stream is rescaled by the layer's scalar.
             for (hv, &pv) in h.iter_mut().zip(proj.iter()) {
-                *hv = (*hv + pv) * lw.output_scale;
+                *hv += pv;
+            }
+            trace(&format!("pe_in-{il}"), h);
+
+            // --- per-layer embedding ---------------------------------------
+            // Gate the residual stream down to the per-layer width, modulate it
+            // by this layer's slice of the precomputed table, and project back.
+            if let Some(pl) = &lw.per_layer {
+                let gate = &mut b.ple_gate[..t * e];
+                ops::matmat(gate, &pl.inp_gate, h, t);
+                for (i, row) in gate.chunks_exact_mut(e).enumerate() {
+                    let inp = &b.ple[i * span + il * e..][..e];
+                    for (gv, &iv) in row.iter_mut().zip(inp) {
+                        *gv = ops::gelu(*gv) * iv;
+                    }
+                }
+                let proj = &mut b.proj[..t * d];
+                ops::matmat(proj, &pl.proj, gate, t);
+                for row in proj.chunks_exact_mut(d) {
+                    ops::rms_norm_mul(row, pl.post_norm, cfg.rms_eps);
+                }
+                trace(&format!("per_layer_embd_out-{il}"), proj);
+                for (hv, &pv) in h.iter_mut().zip(proj.iter()) {
+                    *hv += pv;
+                }
+            }
+
+            // The whole stream is rescaled by the layer's scalar.
+            for hv in h.iter_mut() {
+                *hv *= lw.output_scale;
             }
             trace(&format!("l_out-{il}"), h);
         }

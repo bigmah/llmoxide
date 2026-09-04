@@ -446,8 +446,11 @@ pub struct QuantKernels {
     pub q6k_t: wgpu::ComputePipeline,
     pub q8_0_t: wgpu::ComputePipeline,
     pub f32_t: wgpu::ComputePipeline,
+    pub bf16: wgpu::ComputePipeline,
+    pub bf16_t: wgpu::ComputePipeline,
     pub embed: wgpu::ComputePipeline,
     pub embed_f32: wgpu::ComputePipeline,
+    pub embed_q8_0: wgpu::ComputePipeline,
 }
 
 /// The quant shader with its shape constants and row reduction filled in. The
@@ -548,8 +551,11 @@ impl QuantKernels {
             q6k_t: make("matvec_q6k_t"),
             q8_0_t: make("matvec_q8_0_t"),
             f32_t: make("matvec_f32_t"),
+            bf16: make("matvec_bf16"),
+            bf16_t: make("matvec_bf16_t"),
             embed: make("embed_q6k"),
             embed_f32: make("embed_f32"),
+            embed_q8_0: make("embed_q8_0"),
             layout,
         }
     }
@@ -570,6 +576,8 @@ impl QuantKernels {
             (GgmlType::Q6K, true) => Ok(&self.q6k_t),
             (GgmlType::Q8_0, true) => Ok(&self.q8_0_t),
             (GgmlType::F32, true) => Ok(&self.f32_t),
+            (GgmlType::BF16, false) => Ok(&self.bf16),
+            (GgmlType::BF16, true) => Ok(&self.bf16_t),
             (other, _) => anyhow::bail!("no matvec kernel for {}", other.name()),
         }
     }
@@ -579,6 +587,7 @@ impl QuantKernels {
         match ty {
             GgmlType::Q6K => Ok(&self.embed),
             GgmlType::F32 => Ok(&self.embed_f32),
+            GgmlType::Q8_0 => Ok(&self.embed_q8_0),
             other => anyhow::bail!("no embedding kernel for {}", other.name()),
         }
     }

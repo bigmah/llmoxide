@@ -1,6 +1,6 @@
 //! Download a checkpoint from Hugging Face, resumably and verified.
 //!
-//!   llmoxide-fetch                      # both models this repo is built around
+//!   llmoxide-fetch                      # every model this repo is built around
 //!   llmoxide-fetch gemma4               # one of them
 //!   llmoxide-fetch hf:owner/repo/f.gguf
 //!   llmoxide-fetch https://huggingface.co/owner/repo/blob/main/f.gguf
@@ -33,7 +33,7 @@ fn main() -> anyhow::Result<()> {
             specs.push(a.clone());
         }
     }
-    // No argument means the pair the repo is about.
+    // No argument means every model the repo is about.
     if specs.is_empty() {
         specs = hub::ALIASES.iter().map(|(n, _)| n.to_string()).collect();
     }
@@ -70,7 +70,7 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 const HELP: &str = "\
 llmoxide-fetch — download GGUF checkpoints from Hugging Face
 
-  llmoxide-fetch                       both models this repo is built around
+  llmoxide-fetch                       every model this repo is built around
   llmoxide-fetch gemma4                one alias
   llmoxide-fetch hf:owner/repo/f.gguf  shorthand
   llmoxide-fetch <https url>           a blob/blame/resolve URL

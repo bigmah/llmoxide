@@ -56,7 +56,11 @@ impl ParamArena {
             data.extend_from_slice(values);
         };
 
-        for name in ["output_norm.weight", "rope_freqs.weight"] {
+        for name in [
+            "output_norm.weight",
+            "rope_freqs.weight",
+            "per_layer_proj_norm.weight",
+        ] {
             if let Some(t) = g.tensor_opt(name) {
                 push(name, &t.to_f32(), &mut offsets, &mut data);
             }
@@ -71,6 +75,11 @@ impl ParamArena {
                 "post_ffw_norm.weight",
             ] {
                 let name = format!("blk.{i}.{suffix}");
+                let t = g.tensor(&name)?;
+                push(&name, &t.to_f32(), &mut offsets, &mut data);
+            }
+            if cfg.n_embd_per_layer > 0 {
+                let name = format!("blk.{i}.post_norm.weight");
                 let t = g.tensor(&name)?;
                 push(&name, &t.to_f32(), &mut offsets, &mut data);
             }
@@ -96,6 +105,7 @@ struct Pipelines {
     rope: wgpu::ComputePipeline,
     soft_cap: wgpu::ComputePipeline,
     write_cache: wgpu::ComputePipeline,
+    copy_rows: wgpu::ComputePipeline,
 
     attn_layout: wgpu::BindGroupLayout,
     scores: wgpu::ComputePipeline,
@@ -180,6 +190,7 @@ impl Pipelines {
                 "rope",
                 "soft_cap",
                 "write_cache",
+                "copy_rows",
             ],
         )
         .into_iter();
@@ -200,6 +211,7 @@ impl Pipelines {
             rope: ops.next().unwrap(),
             soft_cap: ops.next().unwrap(),
             write_cache: ops.next().unwrap(),
+            copy_rows: ops.next().unwrap(),
             ops_layout,
             scores: at.next().unwrap(),
             softmax: at.next().unwrap(),
@@ -239,8 +251,15 @@ pub struct GpuModel {
     logits: wgpu::Buffer,
     tokens: wgpu::Buffer,
     zero: wgpu::Buffer,
+    /// Per-layer-embedding scratch. Empty buffers when the checkpoint has none.
+    ple: wgpu::Buffer,
+    ple_proj: wgpu::Buffer,
+    ple_cur: wgpu::Buffer,
+    ple_gate: wgpu::Buffer,
 
     cache: Vec<LayerCache>,
+    /// Layer index -> entry in `cache`; shared layers point at an earlier one.
+    cache_index: Vec<usize>,
     uniforms: wgpu::Buffer,
     /// Per-layer scalar applied to the whole residual stream after the FFN.
     layer_scales: Vec<f32>,
@@ -265,10 +284,12 @@ impl GpuModel {
         max_batch: usize,
     ) -> anyhow::Result<Self> {
         // Quantized tensors go to the arena; F32 norms to the param buffer.
+        // BF16 rides along because gemma4's E-series ships `per_layer_model_proj`
+        // in it while everything around it is quantized.
         let quant_names: Vec<String> = g
             .tensors
             .iter()
-            .filter(|t| t.ty.is_quantized())
+            .filter(|t| t.ty.is_quantized() || t.ty == gguf::GgmlType::BF16)
             .map(|t| t.name.clone())
             .collect();
         let weights = Weights::upload(&gpu, g, quant_names)?;
@@ -286,17 +307,29 @@ impl GpuModel {
         // global ones, so this is the dominant scratch allocation.
         let max_vis = n_ctx;
         let scores_len = max_batch * cfg.n_heads * max_vis;
+        let ple_span = cfg.n_embd_per_layer * cfg.n_layers;
 
-        let cache = (0..cfg.n_layers)
-            .map(|i| {
-                let slots = cfg.kv_slots(i, n_ctx);
-                let bytes = f32s(slots * cfg.layers[i].kv_dim());
-                LayerCache {
-                    k: gpu.storage(&format!("k{i}"), bytes),
-                    v: gpu.storage(&format!("v{i}"), bytes),
-                }
-            })
-            .collect();
+        // Only layers that own their KV get storage; the rest are aimed at an
+        // earlier layer's buffers through `cache_index`.
+        let mut cache = Vec::new();
+        let mut cache_index = vec![usize::MAX; cfg.n_layers];
+        for i in 0..cfg.n_layers {
+            if !cfg.layers[i].owns_kv(i) {
+                continue;
+            }
+            let slots = cfg.kv_slots(i, n_ctx);
+            let bytes = f32s(slots * cfg.layers[i].kv_dim());
+            cache_index[i] = cache.len();
+            cache.push(LayerCache {
+                k: gpu.storage(&format!("k{i}"), bytes),
+                v: gpu.storage(&format!("v{i}"), bytes),
+            });
+        }
+        for i in 0..cfg.n_layers {
+            if cache_index[i] == usize::MAX {
+                cache_index[i] = cache_index[cfg.layers[i].kv_source];
+            }
+        }
 
         let layer_scales = (0..cfg.n_layers)
             .map(|i| {
@@ -326,12 +359,19 @@ impl GpuModel {
             logits: gpu.storage("logits", f32s(cfg.vocab)),
             tokens: gpu.storage("tokens", f32s(max_batch)),
             zero: gpu.upload_f32("zero", &[0.0]),
+            // wgpu rejects zero-sized storage buffers, so the no-PLE case still
+            // allocates one word that nothing ever binds.
+            ple: gpu.storage("ple", f32s(max_batch * ple_span).max(4)),
+            ple_proj: gpu.storage("ple_proj", f32s(max_batch * ple_span).max(4)),
+            ple_cur: gpu.storage("ple_cur", f32s(max_batch * cfg.n_embd_per_layer).max(4)),
+            ple_gate: gpu.storage("ple_gate", f32s(max_batch * cfg.n_embd_per_layer).max(4)),
             params,
             param_off,
             quant: QuantKernels::new(&gpu),
             pipes: Pipelines::new(&gpu),
             weights,
             cache,
+            cache_index,
             uniforms,
             layer_scales,
             cfg,
@@ -625,7 +665,7 @@ impl GpuModel {
             }),
         );
         plan.push(Dispatch {
-            pipeline: self.quant.embed.clone(),
+            pipeline: self.quant.embed_for(embd.ty)?.clone(),
             bind: self.matvec_bind(embd.buffer, &self.zero, &self.h, &self.uniforms, &self.tokens),
             offset: off,
             groups: (16, t as u32, 1),
@@ -639,6 +679,92 @@ impl GpuModel {
             groups: (cells((t * d) as u32, WG_OPS), 1, 1),
         });
         checkpoints.push(("inp_scaled".into(), plan.len(), 0));
+
+        // --- per-layer embeddings ------------------------------------------
+        let n_ple = cfg.n_embd_per_layer;
+        let ple_span = n_ple * cfg.n_layers;
+        if n_ple > 0 {
+            // Look up one row per token: n_layers * n_embd_per_layer wide.
+            let tbl = self.weights.get("per_layer_token_embd.weight")?;
+            let off = slot(
+                &mut u,
+                bytemuck::bytes_of(&MatvecParams {
+                    w_base: tbl.base_u32,
+                    in_dim: ple_span as u32,
+                    out_dim: cfg.vocab as u32,
+                    n_tokens: t as u32,
+                }),
+            );
+            plan.push(Dispatch {
+                pipeline: self.quant.embed_for(tbl.ty)?.clone(),
+                bind: self.matvec_bind(tbl.buffer, &self.zero, &self.ple, &self.uniforms, &self.tokens),
+                offset: off,
+                groups: (16, t as u32, 1),
+            });
+            let off = op!(u,
+                n_rows: t as u32, dim: ple_span as u32,
+                f0: (n_ple as f32).sqrt(),
+            );
+            plan.push(Dispatch {
+                pipeline: self.pipes.scale.clone(),
+                bind: self.ops_bind(&self.zero, &self.zero, &self.ple),
+                offset: off,
+                groups: (cells((t * ple_span) as u32, WG_OPS), 1, 1),
+            });
+
+            // The other half: project the scaled token embedding to the same
+            // shape, scale, and norm each layer's slice on its own.
+            let mp = self.weights.get("per_layer_model_proj.weight")?;
+            let off = slot(
+                &mut u,
+                bytemuck::bytes_of(&MatvecParams {
+                    w_base: mp.base_u32,
+                    in_dim: d as u32,
+                    out_dim: ple_span as u32,
+                    n_tokens: t as u32,
+                }),
+            );
+            plan.push(Dispatch {
+                pipeline: self.quant.pipeline_for(mp.ty, t as u32)?.clone(),
+                bind: self.matvec_bind(mp.buffer, &self.h, &self.ple_proj, &self.uniforms, &self.tokens),
+                offset: off,
+                groups: (crate::row_groups(ple_span as u32, max_groups), crate::token_groups(t as u32), 1),
+            });
+            let off = op!(u,
+                n_rows: t as u32, dim: ple_span as u32,
+                f0: 1.0 / (d as f32).sqrt(),
+            );
+            plan.push(Dispatch {
+                pipeline: self.pipes.scale.clone(),
+                bind: self.ops_bind(&self.zero, &self.zero, &self.ple_proj),
+                offset: off,
+                groups: (cells((t * ple_span) as u32, WG_OPS), 1, 1),
+            });
+            let off = op!(u,
+                n_rows: (t * cfg.n_layers) as u32, dim: n_ple as u32,
+                off0: self.param_off.at("per_layer_proj_norm.weight")?,
+                f0: cfg.rms_eps, u0: 1,
+            );
+            plan.push(Dispatch {
+                pipeline: self.pipes.rms_norm.clone(),
+                bind: self.ops_bind(&self.zero, &self.zero, &self.ple_proj),
+                offset: off,
+                groups: (cells((t * cfg.n_layers) as u32, 1), 1, 1),
+            });
+
+            // ple = (lookup + projected) / sqrt(2)
+            let off = op!(u,
+                n_rows: t as u32, dim: ple_span as u32,
+                f0: 1.0 / 2f32.sqrt(),
+            );
+            plan.push(Dispatch {
+                pipeline: self.pipes.add_scale.clone(),
+                bind: self.ops_bind(&self.zero, &self.ple_proj, &self.ple),
+                offset: off,
+                groups: (cells((t * ple_span) as u32, WG_OPS), 1, 1),
+            });
+            checkpoints.push(("inp_per_layer".into(), plan.len(), 8));
+        }
 
         for il in 0..cfg.n_layers {
             let lc = &cfg.layers[il];
@@ -669,12 +795,16 @@ impl GpuModel {
             });
             checkpoints.push((format!("attn_norm-{il}"), plan.len(), 1));
 
-            // Q, K, and V projections. On global layers V has no weight of its
-            // own and reuses the K projection output.
-            for (name, dst, out_dim) in [
-                (p("attn_q.weight"), &self.q, q_dim),
-                (p("attn_k.weight"), &self.k, kv_dim),
-            ] {
+            // Q is projected on every layer. K and V are skipped entirely on
+            // layers that share an earlier layer's cache — they contribute no
+            // keys or values, they only read.
+            let owns_kv = lc.owns_kv(il);
+
+            let mut projections = vec![(p("attn_q.weight"), &self.q, q_dim)];
+            if owns_kv {
+                projections.push((p("attn_k.weight"), &self.k, kv_dim));
+            }
+            for (name, dst, out_dim) in projections {
                 let h = self.weights.get(&name)?;
                 let off = slot(
                     &mut u,
@@ -692,44 +822,47 @@ impl GpuModel {
                     groups: (crate::row_groups(out_dim, max_groups), crate::token_groups(t as u32), 1),
                 });
             }
-            if lc.v_from_k {
-                // Global layers have no attn_v: V is a copy of the raw K
-                // projection, which diverges only in the normalization below.
-                let off = op!(u, n_rows: t as u32, dim: kv_dim,);
-                plan.push(Dispatch {
-                    pipeline: self.pipes.copy.clone(),
-                    bind: self.ops_bind(&self.k, &self.zero, &self.v),
-                    offset: off,
-                    groups: (cells(t as u32 * kv_dim, WG_OPS), 1, 1),
-                });
-            } else {
-                let h = self.weights.get(&p("attn_v.weight"))?;
-                let off = slot(
-                    &mut u,
-                    bytemuck::bytes_of(&MatvecParams {
-                        w_base: h.base_u32,
-                        in_dim: d as u32,
-                        out_dim: kv_dim,
-                        n_tokens: t as u32,
-                    }),
-                );
-                plan.push(Dispatch {
-                    pipeline: self.quant.pipeline_for(h.ty, t as u32)?.clone(),
-                    bind: self.matvec_bind(h.buffer, &self.x, &self.v, &self.uniforms, &self.tokens),
-                    offset: off,
-                    groups: (crate::row_groups(kv_dim, max_groups), crate::token_groups(t as u32), 1),
-                });
-            }
 
-            checkpoints.push((format!("Vcur-{il}"), plan.len(), 4));
+            if owns_kv {
+                if lc.v_from_k {
+                    // No attn_v in the file: V is a copy of the raw K
+                    // projection, which diverges only in the normalization below.
+                    let off = op!(u, n_rows: t as u32, dim: kv_dim,);
+                    plan.push(Dispatch {
+                        pipeline: self.pipes.copy.clone(),
+                        bind: self.ops_bind(&self.k, &self.zero, &self.v),
+                        offset: off,
+                        groups: (cells(t as u32 * kv_dim, WG_OPS), 1, 1),
+                    });
+                } else {
+                    let h = self.weights.get(&p("attn_v.weight"))?;
+                    let off = slot(
+                        &mut u,
+                        bytemuck::bytes_of(&MatvecParams {
+                            w_base: h.base_u32,
+                            in_dim: d as u32,
+                            out_dim: kv_dim,
+                            n_tokens: t as u32,
+                        }),
+                    );
+                    plan.push(Dispatch {
+                        pipeline: self.quant.pipeline_for(h.ty, t as u32)?.clone(),
+                        bind: self.matvec_bind(h.buffer, &self.x, &self.v, &self.uniforms, &self.tokens),
+                        offset: off,
+                        groups: (crate::row_groups(kv_dim, max_groups), crate::token_groups(t as u32), 1),
+                    });
+                }
+                checkpoints.push((format!("Vcur-{il}"), plan.len(), 4));
+            }
             checkpoints.push((format!("Qcur-{il}"), plan.len(), 2));
 
             // Per-head QK norms, then RoPE. V gets a bare norm and no rotation.
-            for (buf, gain, heads) in [
-                (&self.q, Some(p("attn_q_norm.weight")), cfg.n_heads as u32),
-                (&self.k, Some(p("attn_k_norm.weight")), n_kv),
-                (&self.v, None, n_kv),
-            ] {
+            let mut norms = vec![(&self.q, Some(p("attn_q_norm.weight")), cfg.n_heads as u32)];
+            if owns_kv {
+                norms.push((&self.k, Some(p("attn_k_norm.weight")), n_kv));
+                norms.push((&self.v, None, n_kv));
+            }
+            for (buf, gain, heads) in norms {
                 let (off0, u0) = match &gain {
                     Some(n) => (self.param_off.at(n)?, 1),
                     None => (0, 0),
@@ -746,11 +879,17 @@ impl GpuModel {
                 });
             }
 
-            checkpoints.push((format!("Vcur_normed-{il}"), plan.len(), 4));
+            if owns_kv {
+                checkpoints.push((format!("Vcur_normed-{il}"), plan.len(), 4));
+            }
             checkpoints.push((format!("Qcur_normed-{il}"), plan.len(), 2));
 
             let rope_off = self.param_off.at("rope_freqs.weight").unwrap_or(0);
-            for (buf, heads) in [(&self.q, cfg.n_heads as u32), (&self.k, n_kv)] {
+            let mut rotate = vec![(&self.q, cfg.n_heads as u32)];
+            if owns_kv {
+                rotate.push((&self.k, n_kv));
+            }
+            for (buf, heads) in rotate {
                 let off = slot_of(&mut u, Slot::Positioned(Op {
                     n_rows: t as u32 * heads, dim: head_dim,
                     off0: rope_off,
@@ -771,23 +910,27 @@ impl GpuModel {
 
             // KV cache write, then the three attention passes.
             let window = lc.window.map_or(0, |w| w.min(self.n_ctx)) as u32;
-            for (src, dst) in [(&self.k, 0), (&self.v, 1)] {
-                let off = slot_of(&mut u, Slot::Positioned(Op {
-                    n_rows: t as u32, dim: kv_dim, u0: window,
-                    ..Default::default()
-                }));
-                let cache = if dst == 0 {
-                    &self.cache[il].k
-                } else {
-                    &self.cache[il].v
-                };
-                plan.push(Dispatch {
-                    pipeline: self.pipes.write_cache.clone(),
-                    bind: self.ops_bind(src, &self.zero, cache),
-                    offset: off,
-                    groups: (cells(t as u32 * kv_dim, WG_OPS), 1, 1),
-                });
+            if owns_kv {
+                let slot_i = self.cache_index[il];
+                for (src, dst) in [(&self.k, 0), (&self.v, 1)] {
+                    let off = slot_of(&mut u, Slot::Positioned(Op {
+                        n_rows: t as u32, dim: kv_dim, u0: window,
+                        ..Default::default()
+                    }));
+                    let cache = if dst == 0 {
+                        &self.cache[slot_i].k
+                    } else {
+                        &self.cache[slot_i].v
+                    };
+                    plan.push(Dispatch {
+                        pipeline: self.pipes.write_cache.clone(),
+                        bind: self.ops_bind(src, &self.zero, cache),
+                        offset: off,
+                        groups: (cells(t as u32 * kv_dim, WG_OPS), 1, 1),
+                    });
+                }
             }
+
 
             let attn_off = slot_of(&mut u, Slot::Attention(Attn {
                 n_tokens: t as u32,
@@ -933,10 +1076,12 @@ impl GpuModel {
                 groups: (cells(t as u32, 1), 1, 1),
             });
 
-            // residual add fused with the layer's output scale
+            // Residual add. Without per-layer embeddings the layer's output
+            // scale fuses in here; with them it fuses into the PLE residual
+            // below instead, since that is what closes the block.
             let off = op!(u,
                 n_rows: t as u32, dim: d as u32,
-                f0: self.layer_scale(il),
+                f0: if n_ple > 0 { 1.0 } else { self.layer_scale(il) },
             );
             plan.push(Dispatch {
                 pipeline: self.pipes.add_scale.clone(),
@@ -944,6 +1089,92 @@ impl GpuModel {
                 offset: off,
                 groups: (cells((t * d) as u32, WG_OPS), 1, 1),
             });
+
+            // --- per-layer embedding ---------------------------------------
+            if n_ple > 0 {
+                checkpoints.push((format!("pe_in-{il}"), plan.len(), 0));
+
+                // Lift this layer's slice out of the packed per-token rows.
+                let off = op!(u,
+                    n_rows: t as u32, dim: n_ple as u32,
+                    u0: ple_span as u32, u1: (il * n_ple) as u32,
+                );
+                plan.push(Dispatch {
+                    pipeline: self.pipes.copy_rows.clone(),
+                    bind: self.ops_bind(&self.ple, &self.zero, &self.ple_cur),
+                    offset: off,
+                    groups: (cells((t * n_ple) as u32, WG_OPS), 1, 1),
+                });
+
+                let hg = self.weights.get(&p("inp_gate.weight"))?;
+                let off = slot(
+                    &mut u,
+                    bytemuck::bytes_of(&MatvecParams {
+                        w_base: hg.base_u32,
+                        in_dim: d as u32,
+                        out_dim: n_ple as u32,
+                        n_tokens: t as u32,
+                    }),
+                );
+                plan.push(Dispatch {
+                    pipeline: self.quant.pipeline_for(hg.ty, t as u32)?.clone(),
+                    bind: self.matvec_bind(hg.buffer, &self.h, &self.ple_gate, &self.uniforms, &self.tokens),
+                    offset: off,
+                    groups: (crate::row_groups(n_ple as u32, max_groups), crate::token_groups(t as u32), 1),
+                });
+
+                // gelu(gate) * this layer's embedding — the same kernel the FFN
+                // uses, with the per-layer slice standing in for `up`.
+                let off = op!(u, n_rows: t as u32, dim: n_ple as u32,);
+                plan.push(Dispatch {
+                    pipeline: self.pipes.geglu.clone(),
+                    bind: self.ops_bind(&self.zero, &self.ple_cur, &self.ple_gate),
+                    offset: off,
+                    groups: (cells((t * n_ple) as u32, WG_OPS), 1, 1),
+                });
+
+                let hp = self.weights.get(&p("proj.weight"))?;
+                let off = slot(
+                    &mut u,
+                    bytemuck::bytes_of(&MatvecParams {
+                        w_base: hp.base_u32,
+                        in_dim: n_ple as u32,
+                        out_dim: d as u32,
+                        n_tokens: t as u32,
+                    }),
+                );
+                plan.push(Dispatch {
+                    pipeline: self.quant.pipeline_for(hp.ty, t as u32)?.clone(),
+                    bind: self.matvec_bind(hp.buffer, &self.ple_gate, &self.proj, &self.uniforms, &self.tokens),
+                    offset: off,
+                    groups: (crate::row_groups(d as u32, max_groups), crate::token_groups(t as u32), 1),
+                });
+
+                let off = op!(u,
+                    n_rows: t as u32, dim: d as u32,
+                    off0: self.param_off.at(&p("post_norm.weight"))?,
+                    f0: cfg.rms_eps, u0: 1,
+                );
+                plan.push(Dispatch {
+                    pipeline: self.pipes.rms_norm.clone(),
+                    bind: self.ops_bind(&self.zero, &self.zero, &self.proj),
+                    offset: off,
+                    groups: (cells(t as u32, 1), 1, 1),
+                });
+                checkpoints.push((format!("per_layer_embd_out-{il}"), plan.len(), 6));
+
+                let off = op!(u,
+                    n_rows: t as u32, dim: d as u32,
+                    f0: self.layer_scale(il),
+                );
+                plan.push(Dispatch {
+                    pipeline: self.pipes.add_scale.clone(),
+                    bind: self.ops_bind(&self.zero, &self.proj, &self.h),
+                    offset: off,
+                    groups: (cells((t * d) as u32, WG_OPS), 1, 1),
+                });
+            }
+
             checkpoints.push((format!("l_out-{il}"), plan.len(), 0));
         }
 
@@ -1100,6 +1331,7 @@ impl GpuModel {
             5 => &self.attn,
             6 => &self.proj,
             7 => &self.gate,
+            8 => &self.ple,
             _ => &self.h,
         }
     }
@@ -1144,8 +1376,8 @@ impl GpuModel {
                 layout: &self.pipes.attn_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: self.q.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: self.cache[il].k.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: self.cache[il].v.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.cache[self.cache_index[il]].k.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: self.cache[self.cache_index[il]].v.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: self.scores.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 4, resource: self.attn.as_entire_binding() },
                     wgpu::BindGroupEntry {

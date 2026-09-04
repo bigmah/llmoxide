@@ -63,7 +63,13 @@ impl LayerCache {
 }
 
 pub struct KvCache {
+    /// One entry per *owning* layer, not per layer. Checkpoints that share KV
+    /// across the tail of the stack allocate far fewer of these than there are
+    /// blocks — on E4B, 24 caches for 42 layers.
     pub layers: Vec<LayerCache>,
+    /// Layer index -> position in [`Self::layers`]. Shared layers point at the
+    /// entry owned by an earlier layer.
+    index: Vec<usize>,
     /// Number of positions written so far; the next token lands at this index.
     pub len: usize,
     pub capacity: usize,
@@ -71,25 +77,49 @@ pub struct KvCache {
 
 impl KvCache {
     pub fn new(cfg: &Config, n_ctx: usize) -> Self {
-        let layers = (0..cfg.n_layers)
-            .map(|i| {
-                let lc = &cfg.layers[i];
-                let slots = cfg.kv_slots(i, n_ctx);
-                let kv_dim = lc.kv_dim();
-                LayerCache {
-                    k: vec![0.0; slots * kv_dim],
-                    v: vec![0.0; slots * kv_dim],
-                    slots,
-                    kv_dim,
-                    window: lc.window.map(|w| w.min(n_ctx)),
-                }
-            })
-            .collect();
+        let mut layers = Vec::new();
+        let mut index = vec![usize::MAX; cfg.n_layers];
+        for i in 0..cfg.n_layers {
+            if !cfg.layers[i].owns_kv(i) {
+                continue;
+            }
+            let lc = &cfg.layers[i];
+            let slots = cfg.kv_slots(i, n_ctx);
+            let kv_dim = lc.kv_dim();
+            index[i] = layers.len();
+            layers.push(LayerCache {
+                k: vec![0.0; slots * kv_dim],
+                v: vec![0.0; slots * kv_dim],
+                slots,
+                kv_dim,
+                window: lc.window.map(|w| w.min(n_ctx)),
+            });
+        }
+        // Second pass: point the sharing layers at their source, which is
+        // always below them and therefore already placed.
+        for i in 0..cfg.n_layers {
+            if index[i] == usize::MAX {
+                index[i] = index[cfg.layers[i].kv_source];
+                debug_assert_ne!(index[i], usize::MAX, "layer {i} shares a layer with no cache");
+            }
+        }
         Self {
             layers,
+            index,
             len: 0,
             capacity: n_ctx,
         }
+    }
+
+    /// The cache layer `il` reads from — its own, or an earlier layer's.
+    #[inline]
+    pub fn layer(&self, il: usize) -> &LayerCache {
+        &self.layers[self.index[il]]
+    }
+
+    #[inline]
+    pub fn layer_mut(&mut self, il: usize) -> &mut LayerCache {
+        &mut self.layers[self.index[il]]
     }
 
     pub fn clear(&mut self) {

@@ -649,3 +649,127 @@ fn embed_f32(
         i = i + WG * nwg.x;
     }
 }
+
+// ---------------------------------------------------------------- BF16 ----
+//
+// Gemma 4's E-series ships `per_layer_model_proj` as bf16 while everything
+// around it is quantized. bf16 is just the top 16 bits of an f32, so widening
+// is a shift rather than a decode — two weights per word, four per pair.
+
+fn wbf16x4(base: u32) -> vec4<f32> {
+    let w0 = weights[base];
+    let w1 = weights[base + 1u];
+    return vec4<f32>(
+        bitcast<f32>(w0 << 16u),
+        bitcast<f32>(w0 & 0xFFFF0000u),
+        bitcast<f32>(w1 << 16u),
+        bitcast<f32>(w1 & 0xFFFF0000u));
+}
+
+@compute @workgroup_size(WG)
+fn matvec_bf16(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let tid = lid.x;
+    let lane = tid % LANES;
+    let row_in_wg = tid / LANES;
+    let quads = p.in_dim / 4u;
+    // Two bf16 per word, so a row spans in_dim/2 words.
+    let row_words = p.in_dim / 2u;
+
+    var row = wg.x * ROWS + row_in_wg;
+    loop {
+        if (row - row_in_wg >= p.out_dim) { break; }
+        let row_base = p.w_base + min(row, p.out_dim - 1u) * row_words;
+
+        var acc = 0.0;
+        var i = lane;
+        loop {
+            if (i >= quads) { break; }
+            acc = acc + dot(wbf16x4(row_base + i * 2u), x4[i]);
+            i = i + LANES;
+        }
+
+        let total = reduce_row(tid, lane, acc);
+        if (lane == 0u && row < p.out_dim) {
+            y[row] = total;
+        }
+        row = row + nwg.x * ROWS;
+    }
+}
+
+@compute @workgroup_size(WG)
+fn matvec_bf16_t(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let tid = lid.x;
+    let lane = tid % LANES;
+    let row_in_wg = tid / LANES;
+    let tile_base = wg.y * TILE;
+    let quads = p.in_dim / 4u;
+    let x_stride = p.in_dim / 4u;
+    let row_words = p.in_dim / 2u;
+    let tile_n = min(TILE, p.n_tokens - min(tile_base, p.n_tokens));
+
+    var row = wg.x * ROWS + row_in_wg;
+    loop {
+        if (row - row_in_wg >= p.out_dim) { break; }
+        let row_base = p.w_base + min(row, p.out_dim - 1u) * row_words;
+
+        var acc: array<f32, TILE>;
+        for (var i = 0u; i < tile_n; i = i + 1u) { acc[i] = 0.0; }
+
+        var i = lane;
+        loop {
+            if (i >= quads) { break; }
+            let w = wbf16x4(row_base + i * 2u);
+            for (var tt = 0u; tt < tile_n; tt = tt + 1u) {
+                acc[tt] = acc[tt] + dot(w, x4[(tile_base + tt) * x_stride + i]);
+            }
+            i = i + LANES;
+        }
+
+        for (var tt = 0u; tt < tile_n; tt = tt + 1u) {
+            store_row(tid, lane, acc[tt], row, tile_base + tt);
+        }
+        row = row + nwg.x * ROWS;
+    }
+}
+
+// Q8_0 embedding gather. E4B quantizes both `token_embd` and the much larger
+// `per_layer_token_embd` to Q8_0, so this serves the ordinary token lookup and
+// the per-layer table alike — the only difference is the row width.
+@compute @workgroup_size(WG)
+fn embed_q8_0(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let t = wg.y;
+    let row = tokens[t];
+    let blocks = p.in_dim / 32u;
+    // 36-byte repacked blocks: one word of scale, eight of quants.
+    let row_base = p.w_base + row * blocks * 9u;
+    let out_base = t * p.in_dim;
+
+    var b = lid.x + wg.x * WG;
+    loop {
+        if (b >= blocks) { break; }
+        let blk = row_base + b * 9u;
+        let d = unpack2x16float(weights[blk]).x;
+        let e = out_base + b * 32u;
+        for (var w = 0u; w < 8u; w = w + 1u) {
+            let q = i8x4(weights[blk + 1u + w]) * d;
+            let o = e + w * 4u;
+            y[o] = q.x;
+            y[o + 1u] = q.y;
+            y[o + 2u] = q.z;
+            y[o + 3u] = q.w;
+        }
+        b = b + WG * nwg.x;
+    }
+}

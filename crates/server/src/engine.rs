@@ -147,7 +147,10 @@ impl Engine {
         let (backend, chat) = match Arch::detect(&g)? {
             Arch::Gemma4 => {
                 let cfg = model::Config::from_gguf(&g)?;
-                let chat = ChatFormat::Gemma4(Special::new(&tok)?);
+                let chat = ChatFormat::Gemma4(Special::new(
+                    &tok,
+                    g.str("tokenizer.chat_template").ok(),
+                )?);
                 let device = gpu::Gpu::blocking_new()?;
                 tracing::info!(adapter = %device.adapter_name, "gpu");
                 let m = gpu::forward::GpuModel::load(device, &g, cfg, n_ctx, max_batch)?;

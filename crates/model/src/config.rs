@@ -5,6 +5,7 @@
 //! of genuinely fixed conventions (partial-RoPE sentinel, softcap form) are
 //! called out where they appear.
 
+use anyhow::Context;
 use gguf::Gguf;
 
 /// Frequency factors at or above this are the converter's "do not rotate this
@@ -26,6 +27,25 @@ fn eog_tokens(g: &Gguf) -> Vec<u32> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Read a per-layer integer that a checkpoint may store either as one scalar
+/// covering every layer or as an explicit per-layer array.
+///
+/// Both spellings are live: the 12B writes `head_count_kv` as a 48-entry array,
+/// E4B writes it as the scalar `2`. llama.cpp papers over this with
+/// `get_key_or_arr`; this is the same accommodation.
+fn per_layer_u32(g: &Gguf, key: &str, n_layers: usize) -> anyhow::Result<Vec<u32>> {
+    if let Ok(v) = g.u32_array(key) {
+        anyhow::ensure!(
+            v.len() == n_layers,
+            "{key}: {} entries for {n_layers} layers",
+            v.len()
+        );
+        return Ok(v);
+    }
+    let scalar = g.u64(key)? as u32;
+    Ok(vec![scalar; n_layers])
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +70,20 @@ pub struct LayerConfig {
     /// Global layers ship no `attn_v` tensor: V is projected with `attn_k`
     /// and then normalized differently. See [`crate::weights`].
     pub v_from_k: bool,
+    /// Which layer's KV cache this layer reads. Equal to the layer's own index
+    /// unless the checkpoint shares KV across the tail of the stack, in which
+    /// case several layers project only Q and attend into an earlier layer's
+    /// cache. See [`Config::from_gguf`].
+    pub kv_source: usize,
+}
+
+impl LayerConfig {
+    /// Whether this layer computes and stores its own K/V. Shared layers do
+    /// neither: their `attn_k`/`attn_v` weights are dead metadata.
+    #[inline]
+    pub fn owns_kv(&self, index: usize) -> bool {
+        self.kv_source == index
+    }
 }
 
 impl LayerConfig {
@@ -78,6 +112,11 @@ pub struct Config {
     /// How many leading pairs actually rotate — derived, for reporting only.
     pub rope_pairs: usize,
     pub context_length: usize,
+    /// Width of the per-layer embedding (PLE) vectors, or 0 when the checkpoint
+    /// has none. The E-series (E2B/E4B) spends most of its parameter budget on
+    /// a per-layer embedding table and keeps the residual stream narrow; the
+    /// dense 12B/31B set this to 0 and skip the whole path.
+    pub n_embd_per_layer: usize,
     pub layers: Vec<LayerConfig>,
     /// Token ids the model must never emit (image/audio sentinels).
     pub suppress_tokens: Vec<u32>,
@@ -105,15 +144,43 @@ impl Config {
         let rms_eps = g.f32(&k("attention.layer_norm_rms_epsilon"))?;
 
         // Per-layer arrays: KV head count and the SWA pattern.
-        let kv_heads = g.u32_array(&k("attention.head_count_kv"))?;
+        let kv_heads = per_layer_u32(g, &k("attention.head_count_kv"), n_layers)?;
         let swa_pattern = g.bool_array(&k("attention.sliding_window_pattern"))?;
         anyhow::ensure!(
-            kv_heads.len() == n_layers && swa_pattern.len() == n_layers,
-            "per-layer arrays disagree with block_count ({n_layers}): \
-             head_count_kv={}, sliding_window_pattern={}",
-            kv_heads.len(),
+            swa_pattern.len() == n_layers,
+            "sliding_window_pattern has {} entries for {n_layers} layers",
             swa_pattern.len()
         );
+
+        // Per-layer embeddings. Absent (or 0) on the dense checkpoints.
+        let n_embd_per_layer = g.usize(&k("embedding_length_per_layer_input")).unwrap_or(0);
+
+        // KV sharing across the tail of the stack. `shared_kv_layers = n` means
+        // the last `n` layers project Q only and attend into the cache of the
+        // last *preceding* layer of the same attention type — the sliding ones
+        // reuse `boundary - 2`, the global ones `boundary - 1`, which is exactly
+        // llama.cpp's reuse rule (llama-model.cpp, `n_layer_kv_from_start`).
+        let n_shared = g.usize(&k("attention.shared_kv_layers")).unwrap_or(0);
+        let boundary = n_layers
+            .checked_sub(n_shared)
+            .with_context(|| format!("shared_kv_layers {n_shared} exceeds block_count {n_layers}"))?;
+        anyhow::ensure!(
+            n_shared == 0 || boundary >= 2,
+            "shared_kv_layers {n_shared} leaves only {boundary} owning layers; \
+             need at least 2 so both attention types have a source"
+        );
+        if n_shared > 0 {
+            // The reuse rule assumes the two layers below the boundary are one
+            // of each type. Verify rather than trust the pattern.
+            anyhow::ensure!(
+                swa_pattern[boundary - 2] != swa_pattern[boundary - 1],
+                "layers {} and {} below the KV-sharing boundary are both swa={}; \
+                 the reuse rule needs one sliding and one global",
+                boundary - 2,
+                boundary - 1,
+                swa_pattern[boundary - 1]
+            );
+        }
 
         let head_dim_global = g.usize(&k("attention.key_length"))?;
         let head_dim_swa = g.usize(&k("attention.key_length_swa"))?;
@@ -131,8 +198,18 @@ impl Config {
                     rope_base: if swa { rope_base_swa } else { rope_base_global },
                     window: swa.then_some(window),
                     rope_factors: !swa,
-                    // Global layers have no attn_v tensor at all.
-                    v_from_k: !swa,
+                    // Driven by what the file actually ships rather than by the
+                    // SWA pattern: the 12B omits `attn_v` on global layers and
+                    // folds V into the K projection, while E4B ships a real
+                    // `attn_v` everywhere.
+                    v_from_k: !g.has_tensor(&format!("blk.{i}.attn_v.weight")),
+                    kv_source: if i < boundary {
+                        i
+                    } else if swa {
+                        boundary - 2
+                    } else {
+                        boundary - 1
+                    },
                 }
             })
             .collect();
@@ -163,6 +240,7 @@ impl Config {
             rope_factors,
             rope_pairs,
             context_length: g.usize(&k("context_length")).unwrap_or(8192),
+            n_embd_per_layer,
             layers,
             suppress_tokens: g.u32_array("tokenizer.ggml.suppress_tokens").unwrap_or_default(),
             bos: g.u64("tokenizer.ggml.bos_token_id").unwrap_or(2) as u32,
@@ -203,19 +281,40 @@ impl Config {
         }
     }
 
-    /// Total KV cache bytes at f16 for a given context length.
+    /// Total KV cache bytes at f16 for a given context length. Layers that
+    /// share an earlier layer's cache allocate nothing.
     pub fn kv_bytes(&self, n_ctx: usize) -> usize {
         (0..self.n_layers)
+            .filter(|&i| self.layers[i].owns_kv(i))
             .map(|i| self.kv_slots(i, n_ctx) * self.layers[i].kv_dim() * 2 * 2)
             .sum()
     }
 
+    /// Layers that actually hold a cache, in order.
+    pub fn kv_owning_layers(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.n_layers).filter(|&i| self.layers[i].owns_kv(i))
+    }
+
     pub fn summary(&self) -> String {
         let swa = self.layers.iter().filter(|l| l.swa).count();
+        let shared = self.n_layers - self.kv_owning_layers().count();
+        let extra = format!(
+            "{}{}",
+            if self.n_embd_per_layer > 0 {
+                format!("\n  per-layer embeddings: width {}", self.n_embd_per_layer)
+            } else {
+                String::new()
+            },
+            if shared > 0 {
+                format!("\n  KV sharing: {shared} of {} layers reuse an earlier cache", self.n_layers)
+            } else {
+                String::new()
+            },
+        );
         format!(
             "gemma4: {}L (
   {swa} sliding-window @ window {:?}, {} kv-heads, head_dim {}, rope_base {:.0}
-  {} global,           full attention, {} kv-heads, head_dim {}, rope_base {:.0}, V shares K proj
+  {} global,           full attention, {} kv-heads, head_dim {}, rope_base {:.0}{}
 ) d_model {} ffn {} heads {} vocab {} rope_dim {} (rest NoPE) softcap {:?}",
             self.n_layers,
             self.layers.iter().find(|l| l.swa).and_then(|l| l.window),
@@ -226,12 +325,17 @@ impl Config {
             self.layers.iter().find(|l| !l.swa).map_or(0, |l| l.n_kv_heads),
             self.layers.iter().find(|l| !l.swa).map_or(0, |l| l.head_dim),
             self.layers.iter().find(|l| !l.swa).map_or(0.0, |l| l.rope_base),
+            if self.layers.iter().any(|l| !l.swa && l.v_from_k) {
+                ", V shares K proj"
+            } else {
+                ""
+            },
             self.d_model,
             self.ffn_dim,
             self.n_heads,
             self.vocab,
             self.rope_pairs * 2,
             self.logit_softcap,
-        )
+        ) + &extra
     }
 }

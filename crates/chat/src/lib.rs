@@ -30,10 +30,23 @@ pub struct Special {
     pub response_open: u32,
     pub response_close: u32,
     pub quote: u32,
+    /// Whether this checkpoint suppresses reasoning by having the generation
+    /// prompt open *and immediately close* an empty thought channel.
+    ///
+    /// The 12B finetune does; Gemma 4's own E-series template does not, and
+    /// emitting it there is actively harmful — the model finds the channel
+    /// already closed, never opens another, and writes its reasoning into the
+    /// visible answer instead. Read off the embedded template rather than
+    /// assumed, since the two checkpoints disagree.
+    pub closes_empty_thought: bool,
 }
 
 impl Special {
-    pub fn new(t: &Tokenizer) -> anyhow::Result<Self> {
+    /// `template` is the checkpoint's embedded chat template, when it has one.
+    pub fn new(t: &Tokenizer, template: Option<&str>) -> anyhow::Result<Self> {
+        // The literal a template emits to suppress thinking, spelled as it
+        // appears in the jinja source: an escaped newline, not a real one.
+        const SUPPRESSOR: &str = r"<|channel>thought\n<channel|>";
         let get = |s: &str| {
             t.id_of(s)
                 .ok_or_else(|| anyhow::anyhow!("vocabulary is missing control token {s:?}"))
@@ -52,6 +65,7 @@ impl Special {
             response_open: get("<|tool_response>")?,
             response_close: get("<tool_response|>")?,
             quote: get(dsl::QUOTE)?,
+            closes_empty_thought: template.is_none_or(|t| t.contains(SUPPRESSOR)),
         })
     }
 }
@@ -183,9 +197,12 @@ impl<'a> PromptBuilder<'a> {
 ///
 /// Mirrors the checkpoint's template: a leading system turn carrying the system
 /// message and any tool declarations, then one turn per message, then the
-/// generation prompt. When thinking is disabled the generation prompt opens and
-/// immediately closes an empty thought channel — that is how the template
-/// suppresses reasoning, and omitting it makes the model think anyway.
+/// generation prompt. When thinking is disabled *and the checkpoint's template
+/// does this*, the generation prompt opens and immediately closes an empty
+/// thought channel — that is how those templates suppress reasoning, and
+/// omitting it makes the model think anyway. See
+/// [`Special::closes_empty_thought`]: the E-series has no such suppressor, and
+/// emitting one there costs the thought channel entirely.
 pub fn build_prompt(
     tok: &Tokenizer,
     sp: &Special,
@@ -295,7 +312,7 @@ pub fn build_prompt(
     }
 
     b.open_turn("model");
-    if !enable_thinking {
+    if !enable_thinking && sp.closes_empty_thought {
         b.push(sp.channel_open).text("thought\n").push(sp.channel_close);
     }
     b.finish()
