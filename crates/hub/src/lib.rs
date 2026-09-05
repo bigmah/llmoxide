@@ -63,6 +63,13 @@ pub const ALIASES: &[(&str, &str)] = &[
         "qwen3-0.6b",
         "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
     ),
+    // The one to bake into a page: 0.40 GB, and its `token_embd` is Q6_K, so
+    // the embedding gather kernel can read it. Q5_K_M is the same size class
+    // but quantizes the body to Q5_K, which there is no decoder for.
+    (
+        "qwen3-0.6b-q4",
+        "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf",
+    ),
 ];
 
 /// Turn an alias, a `hf:owner/repo/file` shorthand, or any Hugging Face file URL

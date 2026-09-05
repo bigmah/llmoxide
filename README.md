@@ -29,7 +29,7 @@ wiped: conversation, device buffers, locked pages.
 
 ## Models
 
-Four checkpoints, each validated against tensor-by-tensor. All run on the GPU;
+Five checkpoints, each validated against tensor-by-tensor. All run on the GPU;
 the CPU forward passes stay in the tree as the reference every kernel is checked
 against, not as a fallback.
 
@@ -40,6 +40,7 @@ against, not as a fallback.
 | `gemma4-e4b-q4` | `gemma-4-E4B-it-Q4_K_M.gguf` | gemma4, E4B, 42 layers | 5.34 GB | `d35a3aa7…` |
 | `qwen35` | `Qwen3.8-27B-OBLITERATED-Q6_K.gguf` | qwen35, 27B hybrid, 64 layers | 22.43 GB | `3535d4a1…` |
 | `qwen3-0.6b` | `Qwen3-0.6B-Q8_0.gguf` | qwen3, 0.6B dense, 28 layers | 0.64 GB | `e150ed54…` |
+| `qwen3-0.6b-q4` | `Qwen3-0.6B-Q4_K_M.gguf` | qwen3, 0.6B dense, 28 layers | 0.40 GB | `ac2d9771…` |
 
 From [`yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF`](https://huggingface.co/yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF)
 and [`OBLITERATUS/Qwen3.8-27B-OBLITERATED`](https://huggingface.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED)
@@ -487,23 +488,31 @@ third implementation after Naga and Tint, and it accepts the kernels unchanged.
 ### One file, model included
 
 ```sh
-scripts/build-web.sh --embed models/Qwen3-0.6B-Q8_0.gguf
+scripts/build-web.sh --embed models/Qwen3-0.6B-Q4_K_M.gguf
 ```
 
-Bakes the checkpoint into the page: **854 MB of HTML**, opens from `file://`,
-no server and no network. Ready in 2.1 s in Chrome and comparable in Safari.
+Bakes the checkpoint into the page. Nothing else is needed at runtime: no
+server, no network, no second file. Verified by running Chrome with DNS
+blackholed (`--host-resolver-rules=MAP * 0.0.0.0`) against a `file://` URL, and
+in Safari 26.6.
+
+| embedded checkpoint | page | ready |
+|---|---|---|
+| `qwen3-0.6b-q4` (0.40 GB) | 530 MB | 1.0 s |
+| `qwen3-0.6b` (0.64 GB) | 854 MB | 2.1 s |
 
 The base64 has to arrive in pieces. V8 caps a single string at 536,870,888
-characters and this model's base64 is 852,596,992 — so one blob is not slow,
-it is unbuildable. `build-web.sh` emits 48 MB chunks and the page drops each
-from the DOM as it decodes, since those strings are the largest objects on it.
+characters and the Q8_0 model's base64 is 852,596,992 — so one blob is not
+slow, it is unbuildable. `build-web.sh` emits 48 MB chunks either way and the
+page drops each from the DOM as it decodes, since those strings are the largest
+objects on it.
 
 **Compressing the model buys nothing.** Quantized weights are close to random:
 measured on this Q8_0, `gzip -9` gets 4.5% off and `zstd -19` 4.8%, which does
 not pay for a decompressor in the page. What *is* worth doing is serving the
-page with `Content-Encoding: gzip`, which takes the embedded build from 854 MB
-to **638 MB over the wire** — the base64 tax refunded almost exactly, for one
-line of server config and no code.
+page with `Content-Encoding: gzip`, which takes the Q8_0 embedded build from
+854 MB to **638 MB over the wire** — the base64 tax refunded almost exactly,
+for one line of server config and no code.
 
 Even so, prefer two files for a website. The embedded build cannot show
 download progress (nothing runs until the whole document is parsed), re-parses
@@ -663,8 +672,8 @@ web-sys into every native `cargo build`.
   since attention scratch scales with it.
 - Private mode covers this process, not the machine, and not the server: see
   "What this does not cover" and "Serving" above.
-- The embedded (`--embed`) build is an 854 MB HTML file with no download
-  progress and no separate caching of the model. It exists for offline
+- The embedded (`--embed`) build is a 530 MB HTML file (854 MB at Q8_0) with no
+  download progress and no separate caching of the model. It exists for offline
   distribution; hosting wants the two-file form.
 - The browser build needs WebGPU and has no CPU fallback — wasm32's 4 GB
   address space cannot hold the weights at any useful quantization. It also
