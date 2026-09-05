@@ -1,4 +1,4 @@
-//! The `qwen35` pre-tokenizer.
+//! The `qwen35` and `qwen2` pre-tokenizers.
 //!
 //! Byte-level BPE only merges within pre-tokenizer pieces, so this split *is*
 //! the tokenizer's word model — and it is also what guarantees a control
@@ -21,9 +21,33 @@
 //! ```
 //!
 //! The `\p{M}` terms are what distinguish this from the classic qwen2 split:
-//! combining marks travel with the letters they modify.
+//! combining marks travel with the letters they modify. Qwen3's vocabulary
+//! uses that older split, whose regex is this one with every `\p{M}` removed:
+//!
+//! ```text
+//! (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
+//! |[^\r\n\p{L}\p{N}]?\p{L}+
+//! |\p{N}
+//! | ?[^\s\p{L}\p{N}]+[\r\n]*
+//! |\s*[\r\n]+
+//! |\s+(?!\S)
+//! |\s+
+//! ```
+//!
+//! Every place the two differ is a test of `Flags::mark`, so the two splits
+//! are one function with marks switched off rather than two hand-ports that
+//! could drift. Both are validated id-for-id against `llama-tokenize`.
 
 use crate::unicode;
+
+/// Whether combining marks group with the letters they follow.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Marks {
+    /// `\p{M}` appears in the regex: qwen35.
+    WithLetters,
+    /// It does not: qwen2, and so Qwen3.
+    Standalone,
+}
 
 #[derive(Clone, Copy, Default)]
 struct Flags {
@@ -37,6 +61,15 @@ struct Flags {
 
 /// Split `text` into pre-tokenizer pieces, returned as borrowed slices.
 pub fn split_qwen35(text: &str) -> Vec<&str> {
+    split(text, Marks::WithLetters)
+}
+
+/// The classic qwen2 split, which Qwen3's vocabulary uses.
+pub fn split_qwen2(text: &str) -> Vec<&str> {
+    split(text, Marks::Standalone)
+}
+
+pub fn split(text: &str, marks: Marks) -> Vec<&str> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let n = chars.len();
 
@@ -47,7 +80,10 @@ pub fn split_qwen35(text: &str) -> Vec<&str> {
             Some(&(_, c)) => Flags {
                 in_text: true,
                 letter: unicode::is_letter(c),
-                mark: unicode::is_mark(c),
+                // The single point of difference between the two splits: with
+                // marks standalone, every `\p{M}` test below goes dead and the
+                // regex collapses to qwen2's.
+                mark: marks == Marks::WithLetters && unicode::is_mark(c),
                 number: unicode::is_number(c),
                 whitespace: unicode::is_whitespace(c),
             },
@@ -179,6 +215,23 @@ mod tests {
 
     fn split(s: &str) -> Vec<&str> {
         split_qwen35(s)
+    }
+
+    /// The one behavioural difference between the two splits, pinned so a
+    /// refactor cannot quietly collapse them into each other.
+    #[test]
+    fn qwen2_does_not_group_combining_marks_with_letters() {
+        // "cafe" + U+0301 COMBINING ACUTE ACCENT.
+        let s = "cafe\u{301}";
+        assert_eq!(split_qwen35(s), ["cafe\u{301}"]);
+        assert_eq!(split_qwen2(s), ["cafe", "\u{301}"]);
+    }
+
+    #[test]
+    fn splits_agree_when_no_marks_are_present() {
+        for s in ["Hello, world!", "don't 123", "  a  b\n\nc", "def f(x): return x"] {
+            assert_eq!(split_qwen35(s), split_qwen2(s), "disagreed on {s:?}");
+        }
     }
 
     #[test]

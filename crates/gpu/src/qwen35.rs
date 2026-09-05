@@ -77,19 +77,38 @@ impl ParamArena {
     fn build(g: &Gguf, cfg: &Config) -> anyhow::Result<Self> {
         let mut data = Vec::new();
         let mut offsets = HashMap::new();
-        let push = |name: String, data: &mut Vec<f32>, offsets: &mut HashMap<String, u32>| -> anyhow::Result<()> {
-            let t = g.tensor(&name)?;
-            offsets.insert(name, data.len() as u32);
+        // `key` is what the dispatch below looks up; `from` is the tensor it
+        // actually comes from. The two differ only for the pre-FFN norm, which
+        // qwen35 spells `post_attention_norm` and qwen3 spells `ffn_norm`.
+        let push = |key: String,
+                    from: &str,
+                    data: &mut Vec<f32>,
+                    offsets: &mut HashMap<String, u32>|
+         -> anyhow::Result<()> {
+            let t = g.tensor(from)?;
+            offsets.insert(key, data.len() as u32);
             data.extend_from_slice(&t.to_f32());
             Ok(())
         };
 
-        push("output_norm.weight".into(), &mut data, &mut offsets)?;
+        push("output_norm.weight".into(), "output_norm.weight", &mut data, &mut offsets)?;
         for i in 0..cfg.n_layers {
-            let mut names = vec![
-                format!("blk.{i}.attn_norm.weight"),
+            let ffn_norm = {
+                let qwen35 = format!("blk.{i}.post_attention_norm.weight");
+                if g.has_tensor(&qwen35) {
+                    qwen35
+                } else {
+                    format!("blk.{i}.ffn_norm.weight")
+                }
+            };
+            push(
                 format!("blk.{i}.post_attention_norm.weight"),
-            ];
+                &ffn_norm,
+                &mut data,
+                &mut offsets,
+            )?;
+
+            let mut names = vec![format!("blk.{i}.attn_norm.weight")];
             if cfg.recurrent[i] {
                 names.extend([
                     format!("blk.{i}.ssm_conv1d.weight"),
@@ -104,7 +123,7 @@ impl ParamArena {
                 ]);
             }
             for n in names {
-                push(n, &mut data, &mut offsets)?;
+                push(n.clone(), &n, &mut data, &mut offsets)?;
             }
         }
         Ok(Self { data, offsets })
@@ -341,18 +360,12 @@ pub struct Qwen35Gpu {
 }
 
 impl Qwen35Gpu {
-    pub fn load(
-        gpu: Gpu,
-        g: &Gguf,
-        cfg: Config,
-        n_ctx: usize,
-        max_batch: usize,
-    ) -> anyhow::Result<Self> {
-        // Matvec weights go to the arena — by explicit name so the trailing
-        // NextN/MTP block is never uploaded and the all-F32 synthetic
-        // checkpoints work the same way as quantized ones.
+    /// Which tensors belong in the weight arena, by explicit name so the
+    /// trailing NextN/MTP block is never uploaded and the all-F32 synthetic
+    /// checkpoints work the same way as quantized ones.
+    pub fn arena_tensors(header: &gguf::Header, cfg: &Config) -> Vec<String> {
         let mut names = vec!["token_embd.weight".to_string()];
-        if g.tensor_opt("output.weight").is_some() {
+        if header.has_tensor("output.weight") {
             names.push("output.weight".to_string());
         }
         for i in 0..cfg.n_layers {
@@ -375,7 +388,32 @@ impl Qwen35Gpu {
             }
             names.extend([p("ffn_gate.weight"), p("ffn_up.weight"), p("ffn_down.weight")]);
         }
+        names
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load(
+        gpu: Gpu,
+        g: &Gguf,
+        cfg: Config,
+        n_ctx: usize,
+        max_batch: usize,
+    ) -> anyhow::Result<Self> {
+        let names = Self::arena_tensors(g, &cfg);
         let weights = Weights::upload(&gpu, g, names)?;
+        Self::load_with_weights(gpu, g, cfg, weights, n_ctx, max_batch)
+    }
+
+    /// Build the model around weights that are already resident. The seam the
+    /// browser build enters through; see `gpu::forward::GpuModel`.
+    pub fn load_with_weights(
+        gpu: Gpu,
+        g: &Gguf,
+        cfg: Config,
+        weights: Weights,
+        n_ctx: usize,
+        max_batch: usize,
+    ) -> anyhow::Result<Self> {
 
         let param_off = ParamArena::build(g, &cfg)?;
         let params = gpu.upload_f32("params", &param_off.data);
@@ -384,7 +422,10 @@ impl Qwen35Gpu {
         let conv_dim = cfg.conv_dim();
         let q_dim = cfg.n_heads * cfg.head_dim;
         let kv_dim = cfg.kv_dim();
-        let fused_dim = conv_dim.max(2 * q_dim);
+        // Wide enough for whichever projection lands here: the delta layers'
+        // q|k|v stream, or the attention layers' query (doubled when the
+        // checkpoint fuses an output gate into it).
+        let fused_dim = conv_dim.max(cfg.n_heads * cfg.q_stride());
         let f32s = |n: usize| (n * 4) as u64;
 
         let state = (0..cfg.n_layers)
@@ -393,7 +434,7 @@ impl Qwen35Gpu {
                     LayerState::Linear {
                         conv: gpu.storage(
                             &format!("conv{i}"),
-                            f32s((cfg.conv_kernel - 1) * conv_dim),
+                            f32s(cfg.conv_kernel.saturating_sub(1) * conv_dim),
                         ),
                         s: gpu.storage(
                             &format!("s{i}"),
@@ -421,7 +462,10 @@ impl Qwen35Gpu {
             x: gpu.storage("x", f32s(max_batch * d)),
             fused: gpu.storage("fused", f32s(max_batch * fused_dim)),
             conv: gpu.storage("conv", f32s(max_batch * conv_dim)),
-            conv_scratch: gpu.storage("conv_scratch", f32s((cfg.conv_kernel - 1) * conv_dim)),
+            conv_scratch: gpu.storage(
+                "conv_scratch",
+                f32s(cfg.conv_kernel.saturating_sub(1) * conv_dim),
+            ),
             z: gpu.storage("z", f32s(max_batch * cfg.d_inner)),
             alpha: gpu.storage("alpha", f32s(max_batch * cfg.n_v_heads)),
             beta: gpu.storage("beta", f32s(max_batch * cfg.n_v_heads)),
@@ -486,6 +530,7 @@ impl Qwen35Gpu {
 
     /// Count the non-zero words in every buffer [`Self::wipe`] is responsible
     /// for, so a wipe can be verified rather than trusted. See `wipe_check`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn residue(&self) -> Vec<(String, usize, usize)> {
         let mut out = Vec::new();
         let mut count = |name: &str, b: &wgpu::Buffer| {
@@ -937,15 +982,28 @@ impl Qwen35Gpu {
                     unreachable!("layer {il}: state kind disagrees with config");
                 };
 
-                matvec(&mut u, &mut plan, &p("attn_q.weight"), &self.x, &self.fused, (2 * q_dim) as u32)?;
-                checkpoints.push((format!("Qcur_full-{il}"), plan.len(), 2));
+                // With a fused gate the projection lands in `fused` and is
+                // deinterleaved below; without one it is already the query and
+                // goes straight to `q`.
+                let (q_dst, q_slot) = if cfg.query_gate {
+                    (&self.fused, 2)
+                } else {
+                    (&self.q, 7)
+                };
+                let q_out = (cfg.n_heads * cfg.q_stride()) as u32;
+                matvec(&mut u, &mut plan, &p("attn_q.weight"), &self.x, q_dst, q_out)?;
+                checkpoints.push((format!("Qcur_full-{il}"), plan.len(), q_slot));
                 matvec(&mut u, &mut plan, &p("attn_k.weight"), &self.x, &self.k, kv_dim as u32)?;
                 checkpoints.push((format!("Kcur-{il}"), plan.len(), 9));
                 matvec(&mut u, &mut plan, &p("attn_v.weight"), &self.x, &self.v, kv_dim as u32)?;
                 checkpoints.push((format!("Vcur-{il}"), plan.len(), 10));
 
                 // Deinterleave the fused per-head [query | gate] pairs.
-                for (dst, half) in [(&self.q, 0u32), (&self.gate_a, cfg.head_dim as u32)] {
+                for (dst, half) in if cfg.query_gate {
+                    vec![(&self.q, 0u32), (&self.gate_a, cfg.head_dim as u32)]
+                } else {
+                    Vec::new()
+                } {
                     let off = op!(u,
                         n_rows: (t * cfg.n_heads) as u32, dim: cfg.head_dim as u32,
                         u0: half,
@@ -1025,13 +1083,16 @@ impl Qwen35Gpu {
                 }
 
                 // The fused projection's gate halves scale the head outputs.
-                let off = op!(u, n_rows: t as u32, dim: q_dim as u32,);
-                plan.push(Dispatch {
-                    pipeline: self.pipes.mul_sigmoid.clone(),
-                    bind: self.ops_bind(&self.zero, &self.gate_a, &self.attn),
-                    offset: off,
-                    groups: (cells((t * q_dim) as u32, WG_OPS), 1, 1),
-                });
+                // Plain qwen3 has no such halves and goes straight to Wo.
+                if cfg.query_gate {
+                    let off = op!(u, n_rows: t as u32, dim: q_dim as u32,);
+                    plan.push(Dispatch {
+                        pipeline: self.pipes.mul_sigmoid.clone(),
+                        bind: self.ops_bind(&self.zero, &self.gate_a, &self.attn),
+                        offset: off,
+                        groups: (cells((t * q_dim) as u32, WG_OPS), 1, 1),
+                    });
+                }
                 checkpoints.push((format!("attn_gated-{il}"), plan.len(), 11));
 
                 matvec(&mut u, &mut plan, &p("attn_output.weight"), &self.attn, &self.proj, d as u32)?;
@@ -1136,9 +1197,8 @@ impl Qwen35Gpu {
         })
     }
 
-    /// Run `tokens` starting at the current position and return the final
-    /// logits. Mirrors `model::qwen35::cpu::Cpu::forward`.
-    pub fn forward(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+    /// Check the batch fits and stage its token ids. Returns the base position.
+    fn begin(&mut self, tokens: &[u32]) -> anyhow::Result<usize> {
         let t = tokens.len();
         anyhow::ensure!(t > 0 && t <= self.max_batch, "batch of {t} out of range");
         let base_pos = self.pos;
@@ -1147,6 +1207,64 @@ impl Qwen35Gpu {
         self.gpu
             .queue
             .write_buffer(&self.tokens, 0, bytemuck::cast_slice(tokens));
+        Ok(base_pos)
+    }
+
+    /// [`forward`](Self::forward) with the logit readback awaited rather than
+    /// blocked on — the only shape a browser can use. See
+    /// `gpu::forward::GpuModel::forward_async`.
+    pub async fn forward_async(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+        anyhow::ensure!(
+            self.debug_stop.is_none(),
+            "checkpoint capture is only available on the blocking path"
+        );
+        let t = tokens.len();
+        let base_pos = self.begin(tokens)?;
+
+        if t == 1 {
+            if self.decode.is_none() {
+                self.decode = Some(self.build_plan(1)?);
+            }
+            let plan = self.decode.take().expect("decode plan");
+            self.dispatch(&plan, t, base_pos);
+            self.decode = Some(plan);
+        } else {
+            let plan = self.build_plan(t)?;
+            self.dispatch(&plan, t, base_pos);
+        }
+        Ok(self.gpu.read_f32_async(&self.logits, self.cfg.vocab).await)
+    }
+
+    /// Run the whole graph and advance the position, leaving the logits on the
+    /// device. Split from the readback so the caller chooses how to wait.
+    fn dispatch(&mut self, cp: &CachedPlan, t: usize, base_pos: usize) {
+        let d = self.cfg.d_model;
+        let mut bytes = Vec::with_capacity(cp.slots.len() * UNIFORM_SLOT as usize);
+        for s in &cp.slots {
+            s.emit(base_pos as u32, t as u32, &mut bytes);
+        }
+        self.gpu.queue.write_buffer(&self.uniforms, 0, &bytes);
+        self.run(&cp.plan);
+
+        // Only the last token's row feeds the output projection.
+        self.copy_at(&self.h, ((t - 1) * d * 4) as u64, &self.x, 0, (d * 4) as u64);
+
+        let mut tail_bytes = Vec::new();
+        for s in &cp.tail_slots {
+            s.emit(base_pos as u32, t as u32, &mut tail_bytes);
+        }
+        self.gpu.queue.write_buffer(&self.uniforms, 0, &tail_bytes);
+        self.run(&cp.tail);
+
+        self.pos += t;
+    }
+
+    /// Run `tokens` starting at the current position and return the final
+    /// logits. Mirrors `model::qwen35::cpu::Cpu::forward`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn forward(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+        let t = tokens.len();
+        let base_pos = self.begin(tokens)?;
 
         if t == 1 && self.debug_stop.is_none() {
             if self.decode.is_none() {
@@ -1162,8 +1280,8 @@ impl Qwen35Gpu {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn execute(&mut self, cp: &CachedPlan, t: usize, base_pos: usize) -> anyhow::Result<Vec<f32>> {
-        let d = self.cfg.d_model;
         let mut bytes = Vec::with_capacity(cp.slots.len() * UNIFORM_SLOT as usize);
         for s in &cp.slots {
             s.emit(base_pos as u32, t as u32, &mut bytes);
@@ -1184,20 +1302,8 @@ impl Qwen35Gpu {
             return Ok(self.gpu.read_f32(b, n));
         }
 
-        self.gpu.queue.write_buffer(&self.uniforms, 0, &bytes);
-        self.run(&cp.plan);
+        self.dispatch(cp, t, base_pos);
 
-        // Only the last token's row feeds the output projection.
-        self.copy_at(&self.h, ((t - 1) * d * 4) as u64, &self.x, 0, (d * 4) as u64);
-
-        let mut tail_bytes = Vec::new();
-        for s in &cp.tail_slots {
-            s.emit(base_pos as u32, t as u32, &mut tail_bytes);
-        }
-        self.gpu.queue.write_buffer(&self.uniforms, 0, &tail_bytes);
-        self.run(&cp.tail);
-
-        self.pos += t;
         let timing = std::env::var("LLMOXIDE_TIMING").is_ok();
         if timing {
             // Force the queued compute to finish before timing the readback,
@@ -1214,6 +1320,7 @@ impl Qwen35Gpu {
         Ok(logits)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn debug_buffer(&self, i: usize) -> &wgpu::Buffer {
         match i {
             1 => &self.x,

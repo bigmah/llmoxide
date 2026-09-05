@@ -48,6 +48,21 @@ pub const ALIASES: &[(&str, &str)] = &[
         "qwen35",
         "https://huggingface.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED/resolve/main/Qwen3.8-27B-OBLITERATED-Q6_K.gguf",
     ),
+    // The browser build's checkpoint. Not ggml-org's, which ships only Q8_0
+    // (8.0 GB) and Q4_0 — the first is more GPU memory than a tab should ask
+    // for and the second is a quantization this repo has no decoder for. This
+    // build is Q4_K/Q6_K throughout, which is exactly what the kernels handle.
+    (
+        "gemma4-e4b-q4",
+        "https://huggingface.co/lmstudio-community/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf",
+    ),
+    // Small enough to serve from a website. Q8_0 rather than Q4_K_M because at
+    // 0.6B the quantization error is what you notice first, and 0.64 GB is
+    // already well inside any sane budget.
+    (
+        "qwen3-0.6b",
+        "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
+    ),
 ];
 
 /// Turn an alias, a `hf:owner/repo/file` shorthand, or any Hugging Face file URL

@@ -10,7 +10,7 @@
 //!   because no multi-digit ASCII merges exist in the table.
 //! * Characters outside the vocabulary decompose into `<0xNN>` byte tokens.
 //!
-//! **qwen35** ([`Style::ByteLevel`], `tokenizer.ggml.model = "gpt2"`):
+//! **qwen35 / qwen3** ([`Style::ByteLevel`], `tokenizer.ggml.model = "gpt2"`):
 //!
 //! * Text is first split by the `qwen35` pre-tokenizer ([`pre`]); merges never
 //!   cross pieces, which is also what keeps control-token spellings inert.
@@ -35,8 +35,11 @@ const META_SPACE: char = '\u{2581}';
 pub enum Style {
     /// SentencePiece-surface BPE: spaces to `▁`, `<0xNN>` byte fallback.
     MetaSpace,
-    /// GPT-2 byte-level BPE behind the qwen35 pre-tokenizer.
-    ByteLevel,
+    /// GPT-2 byte-level BPE. The payload is which pre-tokenizer split the
+    /// checkpoint wants — the two differ only over combining marks, and
+    /// picking the wrong one does not fail, it just tokenizes subtly
+    /// differently everywhere.
+    ByteLevel(pre::Marks),
 }
 
 /// GPT-2's byte-to-character bijection. Printable Latin-1 bytes stand for
@@ -115,12 +118,15 @@ impl Tokenizer {
         let style = match g.str("tokenizer.ggml.model").unwrap_or("llama") {
             "gpt2" => {
                 let pre = g.str("tokenizer.ggml.pre").unwrap_or("");
-                anyhow::ensure!(
-                    pre == "qwen35",
-                    "byte-level vocab with unsupported pre-tokenizer {pre:?} \
-                     (only \"qwen35\" is implemented)"
-                );
-                Style::ByteLevel
+                let marks = match pre {
+                    "qwen35" => pre::Marks::WithLetters,
+                    "qwen2" => pre::Marks::Standalone,
+                    other => anyhow::bail!(
+                        "byte-level vocab with unsupported pre-tokenizer {other:?} \
+                         (only \"qwen35\" and \"qwen2\" are implemented)"
+                    ),
+                };
+                Style::ByteLevel(marks)
             }
             _ => Style::MetaSpace,
         };
@@ -233,8 +239,8 @@ impl Tokenizer {
             Style::MetaSpace => self.encode_metaspace(text, out),
             // Merges never cross pre-tokenizer pieces, so each piece is an
             // independent BPE problem.
-            Style::ByteLevel => {
-                for piece in pre::split_qwen35(text) {
+            Style::ByteLevel(marks) => {
+                for piece in pre::split(text, marks) {
                     let syms = piece.bytes().map(|b| self.seed_sym(byte_to_char(b)));
                     self.merge_and_emit(syms.collect(), out);
                 }
@@ -323,7 +329,7 @@ impl Tokenizer {
                 // characters exist), so fallback only arises for meta-space.
                 None => match self.style {
                     Style::MetaSpace => self.push_byte_fallback(&s.text, out),
-                    Style::ByteLevel => out.push(self.unk),
+                    Style::ByteLevel(_) => out.push(self.unk),
                 },
             }
             i = s.next;
@@ -433,7 +439,7 @@ impl<'a> Decoder<'a> {
 
         // Byte-level spellings decode character-by-character to raw bytes;
         // partial UTF-8 sequences wait in `pending` like everything else.
-        if self.tok.style == Style::ByteLevel {
+        if matches!(self.tok.style, Style::ByteLevel(_)) {
             self.pending.extend(text.chars().filter_map(char_to_byte));
             return self.take_valid();
         }

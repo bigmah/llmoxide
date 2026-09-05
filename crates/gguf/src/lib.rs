@@ -1,14 +1,28 @@
 //! Minimal, zero-copy GGUF v2/v3 reader.
 //!
-//! The file is mmap'd and never copied; [`TensorView`] hands out borrowed byte
-//! slices that point straight into the mapping. Dequantization lives in
-//! [`quant`], and the shapes follow ggml's `ne` convention: `ne[0]` is the
-//! fastest-varying axis, which for a weight matrix is the *input* dimension.
+//! Natively the file is mmap'd and never copied; [`TensorView`] hands out
+//! borrowed byte slices that point straight into the mapping. Dequantization
+//! lives in [`quant`], and the shapes follow ggml's `ne` convention: `ne[0]` is
+//! the fastest-varying axis, which for a weight matrix is the *input*
+//! dimension.
+//!
+//! The reader is split in two so it can also work where the whole file cannot
+//! be resident. [`Header`] is everything *except* the tensor payload — the
+//! metadata and the tensor table — and parses from a prefix of the file.
+//! [`Gguf`] pairs a header with a [`Source`] of bytes for the payload, of which
+//! the mmap is only one; [`Source::Sparse`] holds a chosen few tensors and
+//! nothing else. That is what the browser build runs on: a 4.6 GB checkpoint
+//! does not fit in wasm32's 4 GB address space, so only the F32 norms are made
+//! resident and the quantized weights are streamed from a JS `File` straight
+//! into GPU buffers, never passing through linear memory as a whole.
 
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::File;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
+#[cfg(not(target_arch = "wasm32"))]
 use memmap2::Mmap;
 
 pub mod quant;
@@ -34,6 +48,14 @@ pub enum Error {
     Utf8(&'static str),
     #[error("tensor {0:?} not found")]
     NoTensor(String),
+    #[error("tensor {0:?} is known but its bytes are not resident in this source")]
+    NotResident(String),
+    #[error("tensor {name:?} needs {want} bytes but {got} were supplied")]
+    WrongLength {
+        name: String,
+        want: usize,
+        got: usize,
+    },
     #[error("metadata key {0:?} not found")]
     NoKey(String),
     #[error("metadata key {key:?} is {actual}, wanted {wanted}")]
@@ -385,28 +407,31 @@ impl<'a> TensorView<'a> {
 // Reader
 // ---------------------------------------------------------------------------
 
-pub struct Gguf {
-    _file: File,
-    mmap: Mmap,
-    /// Absolute file offset of the tensor data section.
-    data_offset: u64,
+/// A GGUF file's metadata and tensor table — everything but the payload.
+///
+/// Split out from [`Gguf`] because it is parseable from a *prefix* of the file.
+/// Reading a few megabytes tells you every tensor's type, shape and offset,
+/// which is enough to plan an upload before a single weight byte has been
+/// moved.
+pub struct Header {
     pub version: u32,
     pub metadata: HashMap<String, Value>,
     pub tensors: Vec<TensorInfo>,
+    /// Absolute file offset of the tensor data section.
+    data_offset: u64,
     index: HashMap<String, usize>,
 }
 
-impl Gguf {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let file = File::open(path.as_ref())?;
-        // SAFETY: we require the model file not be mutated while mapped, which
-        // is the same contract every mmap-based loader operates under.
-        let mmap = unsafe { Mmap::map(&file)? };
-        Self::from_mmap(file, mmap)
-    }
-
-    fn from_mmap(file: File, mmap: Mmap) -> Result<Self> {
-        let mut c = Cursor::new(&mmap);
+impl Header {
+    /// Parse from the start of a GGUF file.
+    ///
+    /// `prefix` need only reach the end of the tensor table; a truncated one
+    /// fails with [`Error::Eof`], which the caller can treat as "read more and
+    /// retry" rather than as a corrupt file. Nothing here is bounds-checked
+    /// against the file length — the prefix does not know it — so callers that
+    /// have the full size should follow up with [`Header::check_bounds`].
+    pub fn parse(prefix: &[u8]) -> Result<Self> {
+        let mut c = Cursor::new(prefix);
 
         let magic = c.u32()?;
         if magic != MAGIC {
@@ -455,9 +480,22 @@ impl Gguf {
             .max(1);
         let data_offset = align_up(c.pos as u64, alignment);
 
-        let file_len = mmap.len() as u64;
-        for t in &tensors {
-            let end = data_offset + t.offset + t.byte_len() as u64;
+        Ok(Self {
+            version,
+            metadata,
+            tensors,
+            data_offset,
+            index,
+        })
+    }
+
+    /// Reject any tensor that runs past the end of a file of `file_len` bytes.
+    ///
+    /// This is the check that catches a truncated download: an interrupted
+    /// transfer leaves a header promising tensors the file does not contain.
+    pub fn check_bounds(&self, file_len: u64) -> Result<()> {
+        for t in &self.tensors {
+            let end = self.data_offset + t.offset + t.byte_len() as u64;
             if end > file_len {
                 return Err(Error::TensorOutOfBounds {
                     name: t.name.clone(),
@@ -466,31 +504,36 @@ impl Gguf {
                 });
             }
         }
-
-        Ok(Self {
-            _file: file,
-            mmap,
-            data_offset,
-            version,
-            metadata,
-            tensors,
-            index,
-        })
-    }
-
-    /// Hint the OS to fault the whole mapping in. Worth doing once up front so
-    /// the first token doesn't pay for 7 GB of page faults.
-    pub fn prefault(&self) {
-        // `Mmap::advise` is best-effort; failure just means slower first token.
-        let _ = self.mmap.advise(memmap2::Advice::WillNeed);
-    }
-
-    pub fn file_size(&self) -> u64 {
-        self.mmap.len() as u64
+        Ok(())
     }
 
     pub fn tensor_data_offset(&self) -> u64 {
         self.data_offset
+    }
+
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.index.contains_key(name)
+    }
+
+    /// A tensor's type, shape and offset, without needing its bytes.
+    pub fn info(&self, name: &str) -> Result<&TensorInfo> {
+        let i = *self
+            .index
+            .get(name)
+            .ok_or_else(|| Error::NoTensor(name.into()))?;
+        Ok(&self.tensors[i])
+    }
+
+    /// Absolute `[start, end)` byte range of a tensor within the file. This is
+    /// what a streaming loader reads.
+    pub fn byte_range(&self, info: &TensorInfo) -> std::ops::Range<u64> {
+        let start = self.data_offset + info.offset;
+        start..start + info.byte_len() as u64
+    }
+
+    /// Total bytes occupied by tensor data.
+    pub fn tensor_bytes(&self) -> u64 {
+        self.tensors.iter().map(|t| t.byte_len() as u64).sum()
     }
 
     // -- metadata accessors -------------------------------------------------
@@ -589,36 +632,161 @@ impl Gguf {
         }
     }
 
-    // -- tensor accessors ---------------------------------------------------
+}
 
-    pub fn has_tensor(&self, name: &str) -> bool {
-        self.index.contains_key(name)
+// ---------------------------------------------------------------------------
+// Payload source
+// ---------------------------------------------------------------------------
+
+/// Where a [`Gguf`]'s tensor bytes come from.
+enum Source {
+    /// The mapped file. Zero-copy and the only variant that can serve a
+    /// checkpoint larger than addressable memory.
+    #[cfg(not(target_arch = "wasm32"))]
+    Mmap {
+        _file: File,
+        mmap: Mmap,
+    },
+    /// The whole file, in memory.
+    Bytes(Vec<u8>),
+    /// Only the named tensors, each holding exactly its own bytes.
+    ///
+    /// Asking for anything else is [`Error::NotResident`] rather than a panic
+    /// or, worse, a silently wrong slice — the browser build keeps only the
+    /// F32 norms here and would otherwise read a 4.6 GB checkpoint's quantized
+    /// weights out of a buffer that never held them.
+    Sparse(HashMap<String, Vec<u8>>),
+}
+
+/// A GGUF file: its [`Header`], plus somewhere to read tensor payload from.
+///
+/// Derefs to the header, so metadata accessors (`g.str(..)`, `g.usize(..)`,
+/// `g.tensors`) read the same as they always did.
+pub struct Gguf {
+    header: Header,
+    source: Source,
+}
+
+impl Gguf {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let file = File::open(path.as_ref())?;
+        // SAFETY: we require the model file not be mutated while mapped, which
+        // is the same contract every mmap-based loader operates under.
+        let mmap = unsafe { Mmap::map(&file)? };
+        let header = Header::parse(&mmap)?;
+        header.check_bounds(mmap.len() as u64)?;
+        Ok(Self {
+            header,
+            source: Source::Mmap { _file: file, mmap },
+        })
     }
 
-    pub fn tensor(&self, name: &str) -> Result<TensorView<'_>> {
-        let i = *self
-            .index
-            .get(name)
-            .ok_or_else(|| Error::NoTensor(name.into()))?;
-        Ok(self.tensor_at(i))
+    /// A whole GGUF already in memory.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        let header = Header::parse(&bytes)?;
+        header.check_bounds(bytes.len() as u64)?;
+        Ok(Self {
+            header,
+            source: Source::Bytes(bytes),
+        })
     }
 
-    pub fn tensor_opt(&self, name: &str) -> Option<TensorView<'_>> {
-        self.index.get(name).map(|&i| self.tensor_at(i))
+    /// A header plus payload for *some* of its tensors.
+    ///
+    /// Every entry must be exactly the tensor's `byte_len()`, which is checked
+    /// here: a short buffer would otherwise dequantize into whatever followed
+    /// it. Tensors absent from `resident` keep their metadata — shape, type,
+    /// offset — and fail only if their bytes are actually asked for.
+    pub fn sparse(header: Header, resident: HashMap<String, Vec<u8>>) -> Result<Self> {
+        for (name, bytes) in &resident {
+            let info = header.info(name)?;
+            if bytes.len() != info.byte_len() {
+                return Err(Error::WrongLength {
+                    name: name.clone(),
+                    want: info.byte_len(),
+                    got: bytes.len(),
+                });
+            }
+        }
+        Ok(Self {
+            header,
+            source: Source::Sparse(resident),
+        })
     }
 
-    pub fn tensor_at(&self, i: usize) -> TensorView<'_> {
-        let info = &self.tensors[i];
-        let start = (self.data_offset + info.offset) as usize;
-        TensorView {
-            info,
-            data: &self.mmap[start..start + info.byte_len()],
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    /// Hint the OS to fault the whole mapping in. Worth doing once up front so
+    /// the first token doesn't pay for 7 GB of page faults.
+    pub fn prefault(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Source::Mmap { mmap, .. } = &self.source {
+            // `Mmap::advise` is best-effort; failure just means slower first token.
+            let _ = mmap.advise(memmap2::Advice::WillNeed);
         }
     }
 
-    /// Total bytes occupied by tensor data.
-    pub fn tensor_bytes(&self) -> u64 {
-        self.tensors.iter().map(|t| t.byte_len() as u64).sum()
+    pub fn file_size(&self) -> u64 {
+        match &self.source {
+            #[cfg(not(target_arch = "wasm32"))]
+            Source::Mmap { mmap, .. } => mmap.len() as u64,
+            Source::Bytes(b) => b.len() as u64,
+            // A sparse source has no file behind it; the header's own end is
+            // the only length that means anything.
+            Source::Sparse(_) => self.header.data_offset + self.header.tensor_bytes(),
+        }
+    }
+
+    // -- tensor accessors ---------------------------------------------------
+
+    pub fn tensor(&self, name: &str) -> Result<TensorView<'_>> {
+        let info = self.header.info(name)?;
+        Ok(TensorView {
+            info,
+            data: self.payload(info)?,
+        })
+    }
+
+    pub fn tensor_opt(&self, name: &str) -> Option<TensorView<'_>> {
+        self.tensor(name).ok()
+    }
+
+    pub fn tensor_at(&self, i: usize) -> TensorView<'_> {
+        let info = &self.header.tensors[i];
+        TensorView {
+            info,
+            data: self.payload(info).expect("tensor payload not resident"),
+        }
+    }
+
+    /// Borrow one tensor's bytes out of whatever the source is.
+    fn payload(&self, info: &TensorInfo) -> Result<&[u8]> {
+        let len = info.byte_len();
+        match &self.source {
+            #[cfg(not(target_arch = "wasm32"))]
+            Source::Mmap { mmap, .. } => {
+                let start = (self.header.data_offset + info.offset) as usize;
+                Ok(&mmap[start..start + len])
+            }
+            Source::Bytes(b) => {
+                let start = (self.header.data_offset + info.offset) as usize;
+                Ok(&b[start..start + len])
+            }
+            Source::Sparse(map) => map
+                .get(&info.name)
+                .map(|v| v.as_slice())
+                .ok_or_else(|| Error::NotResident(info.name.clone())),
+        }
+    }
+}
+
+impl std::ops::Deref for Gguf {
+    type Target = Header;
+    fn deref(&self) -> &Header {
+        &self.header
     }
 }
 

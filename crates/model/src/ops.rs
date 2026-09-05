@@ -5,7 +5,34 @@
 //! which does not change results.
 
 use gguf::{quant, TensorView};
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
+#[cfg(target_arch = "wasm32")]
+use serial::ParIterMut as _;
+
+/// `par_iter_mut` with no threads behind it.
+///
+/// rayon compiles for `wasm32-unknown-unknown` but cannot run there: building
+/// its pool calls `std::thread::spawn`, which panics. Real wasm threads would
+/// need `SharedArrayBuffer`, which needs COOP/COEP response headers — and the
+/// browser build is a single HTML file that may be opened straight off disk,
+/// where there are no headers to set. So the reference kernels run one row at
+/// a time. Results are identical; only the wall clock differs, and nothing in
+/// the browser build calls these on the hot path (the GPU does that work).
+#[cfg(target_arch = "wasm32")]
+mod serial {
+    pub trait ParIterMut {
+        type Item;
+        fn par_iter_mut(&mut self) -> std::slice::IterMut<'_, Self::Item>;
+    }
+
+    impl<T> ParIterMut for [T] {
+        type Item = T;
+        fn par_iter_mut(&mut self) -> std::slice::IterMut<'_, T> {
+            self.iter_mut()
+        }
+    }
+}
 
 /// Root-mean-square norm over `x`, in place, without a learned weight.
 ///

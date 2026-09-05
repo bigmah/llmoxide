@@ -125,7 +125,13 @@ fn softmax_pass(
     let n_vis = pos - first_visible(pos) + 1u;
     let s_base = (token * at.n_heads + head) * at.max_vis;
 
-    var m = -3.4028235e38;
+    // f32::MIN, spelled by its bit pattern. The decimal form Rust prints for
+    // it, -3.4028235e38, is not a legal f32 literal in WGSL: the spec parses
+    // literals as abstract float first, and 3.4028235e38 is larger than
+    // f32::MAX, so the conversion overflows. Naga rounds it to nearest and
+    // accepts; Tint rejects, and the whole module fails to compile in a
+    // browser. A bitcast has one meaning everywhere.
+    var m = bitcast<f32>(0xff7fffffu);
     var j = tid;
     loop {
         if (j >= n_vis) { break; }

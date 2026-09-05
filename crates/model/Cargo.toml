@@ -7,9 +7,13 @@ edition.workspace = true
 gguf = { path = "../gguf" }
 secret = { path = "../secret" }
 anyhow.workspace = true
-rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+# rayon builds for wasm but panics the moment a pool is created; `ops::serial`
+# stands in there instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon.workspace = true
 
 [[bin]]
 name = "validate"

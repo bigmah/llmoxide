@@ -3,3 +3,7 @@ target/
 .DS_Store
 
 models/
+
+# Build output of scripts/build-web.sh; the shell it is generated from is
+# tracked, the 1.1 MB page with a wasm module baked into it is not.
+web/llmoxide.html

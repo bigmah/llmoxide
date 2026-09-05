@@ -22,29 +22,110 @@
 //! a terminal. Root on a live machine can still read process memory.
 
 use std::alloc::{GlobalAlloc, Layout};
-use std::ffi::c_void;
 use std::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
-extern "C" {
-    fn mlock(addr: *const c_void, len: usize) -> i32;
-    fn munlock(addr: *const c_void, len: usize) -> i32;
-    /// C11 Annex K. Unlike `memset`, the standard forbids optimizing this away
-    /// even when the buffer is provably dead — which is exactly the case for
-    /// every wipe here.
-    fn memset_s(s: *mut c_void, smax: usize, c: i32, n: usize) -> i32;
-    fn getpagesize() -> i32;
-    fn setrlimit(resource: i32, rlp: *const Rlimit) -> i32;
-    fn ptrace(request: i32, pid: i32, addr: *mut c_void, data: i32) -> i32;
+use sys::*;
+
+/// The four primitives this crate is built on, and the one platform where they
+/// do not exist.
+///
+/// On wasm32 none of them have an equivalent — there is no `mlock` because
+/// there is no swap to be locked out of, no core file to suppress, and no
+/// `ptrace` to deny. The shims keep every call site below identical rather
+/// than scattering `#[cfg]` through `SecretVec`, and the *zeroing* — the part
+/// that still means something in a browser tab — is a real implementation, not
+/// a stub. See the module docs on `wasm` for what that does and does not buy.
+#[cfg(not(target_arch = "wasm32"))]
+mod sys {
+    use std::ffi::c_void;
+
+    extern "C" {
+        pub fn mlock(addr: *const c_void, len: usize) -> i32;
+        pub fn munlock(addr: *const c_void, len: usize) -> i32;
+        /// C11 Annex K. Unlike `memset`, the standard forbids optimizing this
+        /// away even when the buffer is provably dead — which is exactly the
+        /// case for every wipe here.
+        pub fn memset_s(s: *mut c_void, smax: usize, c: i32, n: usize) -> i32;
+        pub fn getpagesize() -> i32;
+        pub fn setrlimit(resource: i32, rlp: *const Rlimit) -> i32;
+        pub fn ptrace(request: i32, pid: i32, addr: *mut c_void, data: i32) -> i32;
+    }
+
+    #[repr(C)]
+    pub struct Rlimit {
+        pub rlim_cur: u64,
+        pub rlim_max: u64,
+    }
+
+    pub const RLIMIT_CORE: i32 = 4;
+    pub const PT_DENY_ATTACH: i32 = 31;
 }
 
-#[repr(C)]
-struct Rlimit {
-    rlim_cur: u64,
-    rlim_max: u64,
-}
+/// wasm32 stand-ins.
+///
+/// What survives the port: `memset_s` becomes a volatile write loop, which is
+/// the same guarantee by a different route — the optimizer may not elide a
+/// volatile store even to a provably dead buffer. So `SecretVec` and
+/// `ZeroizingAlloc` still overwrite what they are asked to.
+///
+/// What does not survive, and is not claimed: locking. A wasm module's memory
+/// is a JS `ArrayBuffer` the host may move, page or snapshot however it likes,
+/// and nothing inside the sandbox can pin it. `mlock` returning 0 here means
+/// "nothing to do", not "locked" — so a browser session is zeroed but never
+/// locked, and the tab's own heap snapshot is outside this crate's reach
+/// entirely.
+#[cfg(target_arch = "wasm32")]
+mod sys {
+    use std::ffi::c_void;
 
-const RLIMIT_CORE: i32 = 4;
-const PT_DENY_ATTACH: i32 = 31;
+    /// No swap in a wasm sandbox, so there is nothing to lock out of it.
+    /// Reports success so `SecretVec::grow` does not print a warning that
+    /// would be true everywhere and useful nowhere.
+    pub unsafe fn mlock(_addr: *const c_void, _len: usize) -> i32 {
+        0
+    }
+
+    pub unsafe fn munlock(_addr: *const c_void, _len: usize) -> i32 {
+        0
+    }
+
+    /// Volatile so the write cannot be optimized away, which is the only
+    /// property `memset_s` was being used for.
+    pub unsafe fn memset_s(s: *mut c_void, _smax: usize, c: i32, n: usize) -> i32 {
+        let p = s.cast::<u8>();
+        for i in 0..n {
+            std::ptr::write_volatile(p.add(i), c as u8);
+        }
+        0
+    }
+
+    /// One wasm page. `SecretVec` only uses this as an allocation alignment,
+    /// and a 64 KiB granule would waste most of a small buffer, so report the
+    /// conventional 4 KiB instead.
+    pub unsafe fn getpagesize() -> i32 {
+        4096
+    }
+
+    #[repr(C)]
+    pub struct Rlimit {
+        pub rlim_cur: u64,
+        pub rlim_max: u64,
+    }
+
+    /// No core files to suppress.
+    pub unsafe fn setrlimit(_resource: i32, _rlp: *const Rlimit) -> i32 {
+        0
+    }
+
+    /// No ptrace to deny. A browser devtools session can read this memory and
+    /// nothing here can stop it.
+    pub unsafe fn ptrace(_request: i32, _pid: i32, _addr: *mut c_void, _data: i32) -> i32 {
+        0
+    }
+
+    pub const RLIMIT_CORE: i32 = 4;
+    pub const PT_DENY_ATTACH: i32 = 31;
+}
 
 /// Overwrite `len` bytes at `ptr`, with a guarantee the write survives the
 /// optimizer.

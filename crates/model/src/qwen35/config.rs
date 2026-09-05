@@ -1,11 +1,20 @@
-//! qwen35 (Qwen3.5 27B) architecture description, derived from GGUF metadata.
+//! qwen35 and qwen3 architecture description, derived from GGUF metadata.
 //!
-//! This is a *hybrid* stack: most layers are gated-delta-net linear attention
-//! ("recurrent" in llama.cpp's terms), with a full-attention layer every
-//! `full_attention_interval`-th position. The checkpoint also appends one
-//! NextN/MTP block past the main stack (`nextn_predict_layers = 1`); it is
-//! only used for speculative decoding, so the main forward pass skips it and
-//! `n_layers` here counts main layers only.
+//! qwen35 (Qwen3.5 27B) is a *hybrid* stack: most layers are gated-delta-net
+//! linear attention ("recurrent" in llama.cpp's terms), with a full-attention
+//! layer every `full_attention_interval`-th position. The checkpoint also
+//! appends one NextN/MTP block past the main stack (`nextn_predict_layers = 1`);
+//! it is only used for speculative decoding, so the main forward pass skips it
+//! and `n_layers` here counts main layers only.
+//!
+//! Plain **qwen3** (Qwen3 0.6B and friends) is the same description with two
+//! things switched off, which is why it lives here rather than in a module of
+//! its own: every layer is full attention ([`Config::recurrent`] all false),
+//! and the query projection carries no fused output gate
+//! ([`Config::query_gate`]). Everything else — RMSNorm, GQA, per-dim query and
+//! key norms, NeoX RoPE, SwiGLU — is bit-for-bit the same code path. The
+//! alternative was a second copy of an attention block this file already has
+//! working and validated.
 
 use gguf::Gguf;
 
@@ -49,7 +58,14 @@ pub struct Config {
     pub n_rot: usize,
     pub rope_base: f32,
 
-    // -- gated-delta-net layers --------------------------------------------
+    /// Whether `attn_q` emits a fused `[query | output-gate]` pair per head.
+    ///
+    /// qwen35 does; plain qwen3 does not, and its `attn_q` is `head_dim` wide
+    /// per head rather than `2 * head_dim`. This is the only difference in the
+    /// attention block between the two.
+    pub query_gate: bool,
+
+    // -- gated-delta-net layers (all zero when `recurrent` is all false) ----
     /// Depthwise causal conv width over the fused QKV stream (`ssm.conv_kernel`).
     pub conv_kernel: usize,
     /// Head width for both K and V sides of the state (`ssm.state_size`).
@@ -72,7 +88,14 @@ pub struct Config {
 impl Config {
     pub fn from_gguf(g: &Gguf) -> anyhow::Result<Self> {
         let arch = g.str("general.architecture")?.to_string();
-        anyhow::ensure!(arch == "qwen35", "unsupported architecture {arch:?}");
+        // The hybrid carries an `ssm.*` block and a gated query; the dense one
+        // carries neither, and reading those keys would fail rather than
+        // default.
+        let hybrid = match arch.as_str() {
+            "qwen35" => true,
+            "qwen3" => false,
+            other => anyhow::bail!("unsupported architecture {other:?}"),
+        };
         let k = |s: &str| format!("{arch}.{s}");
 
         let n_layers_all = g.usize(&k("block_count"))?;
@@ -87,33 +110,46 @@ impl Config {
             "key_length != value_length"
         );
 
-        let lin_head_dim = g.usize(&k("ssm.state_size"))?;
-        let n_k_heads = g.usize(&k("ssm.group_count"))?;
-        let n_v_heads = g.usize(&k("ssm.time_step_rank"))?;
-        let d_inner = g.usize(&k("ssm.inner_size"))?;
-        anyhow::ensure!(
-            d_inner == n_v_heads * lin_head_dim,
-            "ssm.inner_size {d_inner} != n_v_heads {n_v_heads} * head_dim {lin_head_dim}"
-        );
-        anyhow::ensure!(
-            n_v_heads % n_k_heads == 0,
-            "v-head count {n_v_heads} not a multiple of k-head count {n_k_heads}"
-        );
+        let (lin_head_dim, n_k_heads, n_v_heads, d_inner) = if hybrid {
+            let lin_head_dim = g.usize(&k("ssm.state_size"))?;
+            let n_k_heads = g.usize(&k("ssm.group_count"))?;
+            let n_v_heads = g.usize(&k("ssm.time_step_rank"))?;
+            let d_inner = g.usize(&k("ssm.inner_size"))?;
+            anyhow::ensure!(
+                d_inner == n_v_heads * lin_head_dim,
+                "ssm.inner_size {d_inner} != n_v_heads {n_v_heads} * head_dim {lin_head_dim}"
+            );
+            anyhow::ensure!(
+                n_v_heads % n_k_heads == 0,
+                "v-head count {n_v_heads} not a multiple of k-head count {n_k_heads}"
+            );
+            (lin_head_dim, n_k_heads, n_v_heads, d_inner)
+        } else {
+            (0, 0, 0, 0)
+        };
 
         // Which layers are recurrent: an explicit per-layer array wins, else
-        // every `interval`-th layer (1-based) is full attention.
-        let recurrent = match g.bool_array(&k("attention.recurrent_layers")) {
-            Ok(v) => {
-                anyhow::ensure!(v.len() >= n_layers, "recurrent_layers array too short");
-                v[..n_layers].to_vec()
-            }
-            Err(_) => {
-                let interval = g.usize(&k("full_attention_interval")).unwrap_or(4);
-                (0..n_layers).map(|i| (i + 1) % interval != 0).collect()
+        // every `interval`-th layer (1-based) is full attention. A dense stack
+        // has none.
+        let recurrent = if !hybrid {
+            vec![false; n_layers]
+        } else {
+            match g.bool_array(&k("attention.recurrent_layers")) {
+                Ok(v) => {
+                    anyhow::ensure!(v.len() >= n_layers, "recurrent_layers array too short");
+                    v[..n_layers].to_vec()
+                }
+                Err(_) => {
+                    let interval = g.usize(&k("full_attention_interval")).unwrap_or(4);
+                    (0..n_layers).map(|i| (i + 1) % interval != 0).collect()
+                }
             }
         };
 
-        let vocab = g.tensor("token_embd.weight")?.out_dim();
+        // The tensor table carries the shape; reading the payload for it would
+        // mean holding the whole embedding just to learn `ne[1]`, which the
+        // browser build cannot do.
+        let vocab = g.info("token_embd.weight")?.out_dim();
 
         Ok(Self {
             n_layers,
@@ -127,7 +163,8 @@ impl Config {
             head_dim,
             n_rot: g.usize(&k("rope.dimension_count")).unwrap_or(head_dim),
             rope_base: g.f32(&k("rope.freq_base"))?,
-            conv_kernel: g.usize(&k("ssm.conv_kernel"))?,
+            query_gate: hybrid,
+            conv_kernel: if hybrid { g.usize(&k("ssm.conv_kernel"))? } else { 0 },
             lin_head_dim,
             n_k_heads,
             n_v_heads,
@@ -160,8 +197,34 @@ impl Config {
         1.0 / (self.head_dim as f32).sqrt()
     }
 
+    /// Per-head stride of the `attn_q` projection: query, plus the output gate
+    /// when the checkpoint fuses one in.
+    pub fn q_stride(&self) -> usize {
+        if self.query_gate {
+            2 * self.head_dim
+        } else {
+            self.head_dim
+        }
+    }
+
     pub fn summary(&self) -> String {
         let recr = self.recurrent.iter().filter(|r| **r).count();
+        if recr == 0 {
+            return format!(
+                "qwen3: {}L dense @ {} heads/{} kv, head_dim {} rope {}/{} base {:.0} \
+                 d_model {} ffn {} vocab {}",
+                self.n_layers,
+                self.n_heads,
+                self.n_kv_heads,
+                self.head_dim,
+                self.n_rot,
+                self.head_dim,
+                self.rope_base,
+                self.d_model,
+                self.ffn_dim,
+                self.vocab,
+            );
+        }
         format!(
             "qwen35: {}L ({recr} gated-delta-net @ {} v-heads/{} k-heads x{}, \
              {} full-attn @ {} heads/{} kv, head_dim {} rope {}/{} base {:.0}) \

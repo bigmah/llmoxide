@@ -276,6 +276,21 @@ pub struct GpuModel {
 }
 
 impl GpuModel {
+    /// Which tensors belong in the weight arena rather than the param buffer.
+    ///
+    /// Quantized tensors go to the arena; F32 norms to the param buffer. BF16
+    /// rides along because gemma4's E-series ships `per_layer_model_proj` in it
+    /// while everything around it is quantized.
+    pub fn arena_tensors(header: &gguf::Header) -> Vec<String> {
+        header
+            .tensors
+            .iter()
+            .filter(|t| t.ty.is_quantized() || t.ty == gguf::GgmlType::BF16)
+            .map(|t| t.name.clone())
+            .collect()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load(
         gpu: Gpu,
         g: &Gguf,
@@ -283,17 +298,25 @@ impl GpuModel {
         n_ctx: usize,
         max_batch: usize,
     ) -> anyhow::Result<Self> {
-        // Quantized tensors go to the arena; F32 norms to the param buffer.
-        // BF16 rides along because gemma4's E-series ships `per_layer_model_proj`
-        // in it while everything around it is quantized.
-        let quant_names: Vec<String> = g
-            .tensors
-            .iter()
-            .filter(|t| t.ty.is_quantized() || t.ty == gguf::GgmlType::BF16)
-            .map(|t| t.name.clone())
-            .collect();
-        let weights = Weights::upload(&gpu, g, quant_names)?;
+        let weights = Weights::upload(&gpu, g, Self::arena_tensors(g))?;
+        Self::load_with_weights(gpu, g, cfg, weights, n_ctx, max_batch)
+    }
 
+    /// Build the model around weights that are already resident.
+    ///
+    /// The seam the browser build enters through: it streams the arena in
+    /// itself (see [`Weights::upload_streaming`]) because it cannot map the
+    /// file, and everything after that — the param buffer, the KV cache, the
+    /// pipelines — is the same code the native path runs. `g` need only be a
+    /// [`gguf::Gguf::sparse`] holding the F32 tensors read below.
+    pub fn load_with_weights(
+        gpu: Gpu,
+        g: &Gguf,
+        cfg: Config,
+        weights: Weights,
+        n_ctx: usize,
+        max_batch: usize,
+    ) -> anyhow::Result<Self> {
         let param_off = ParamArena::build(g, &cfg)?;
         let params = gpu.upload_f32("params", &param_off.data);
 
@@ -406,6 +429,7 @@ impl GpuModel {
     ///
     /// Slow — it reads the whole KV cache back over PCIe-equivalent bandwidth —
     /// and only meant for `wipe_check`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn residue(&self) -> Vec<(String, usize, usize)> {
         let mut out = Vec::new();
         let mut count = |name: &str, b: &wgpu::Buffer| {
@@ -522,6 +546,9 @@ struct CachedPlan {
     slots: Vec<Slot>,
     tail: Vec<Dispatch>,
     tail_slots: Vec<Slot>,
+    /// Only `execute`'s checkpoint capture reads these, and that is a native
+    /// tool; the browser build still builds the plan that carries them.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     checkpoints: Vec<(String, usize, usize)>,
 }
 
@@ -1239,15 +1266,10 @@ impl GpuModel {
 
     /// Run `tokens` starting at the current position and return the final
     /// logits. Mirrors `model::cpu::Cpu::forward`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn forward(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
         let t = tokens.len();
-        anyhow::ensure!(t > 0 && t <= self.max_batch, "batch of {t} out of range");
-        let base_pos = self.pos;
-        anyhow::ensure!(base_pos + t <= self.n_ctx, "context overflow");
-
-        self.gpu
-            .queue
-            .write_buffer(&self.tokens, 0, bytemuck::cast_slice(tokens));
+        let base_pos = self.begin(tokens)?;
 
         // Decode is one token at a time with a fixed shape, so its plan — and
         // the ~800 bind groups in it — is built once and reused. Prefill
@@ -1266,27 +1288,59 @@ impl GpuModel {
         }
     }
 
-    fn execute(&mut self, cp: &CachedPlan, t: usize, base_pos: usize) -> anyhow::Result<Vec<f32>> {
+    /// [`forward`](Self::forward) with the logit readback awaited rather than
+    /// blocked on.
+    ///
+    /// Identical dispatch — same plan, same kernels, same buffers — differing
+    /// only in how it waits for the result. A browser's main thread may not
+    /// block on a buffer map, so this is the only shape that works there.
+    /// Checkpoint capture is unavailable here; `bisect` is a native tool.
+    pub async fn forward_async(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+        anyhow::ensure!(
+            self.debug_stop.is_none(),
+            "checkpoint capture is only available on the blocking path"
+        );
+        let t = tokens.len();
+        let base_pos = self.begin(tokens)?;
+
+        if t == 1 {
+            if self.decode.is_none() {
+                self.decode = Some(self.build_plan(1)?);
+            }
+            let plan = self.decode.take().expect("decode plan");
+            self.dispatch(&plan, t, base_pos);
+            self.decode = Some(plan);
+        } else {
+            let plan = self.build_plan(t)?;
+            self.dispatch(&plan, t, base_pos);
+        }
+
+        let mut logits = self.gpu.read_f32_async(&self.logits, self.cfg.vocab).await;
+        self.suppress(&mut logits);
+        Ok(logits)
+    }
+
+    /// Check the batch fits and stage its token ids. Returns the base position.
+    fn begin(&mut self, tokens: &[u32]) -> anyhow::Result<usize> {
+        let t = tokens.len();
+        anyhow::ensure!(t > 0 && t <= self.max_batch, "batch of {t} out of range");
+        let base_pos = self.pos;
+        anyhow::ensure!(base_pos + t <= self.n_ctx, "context overflow");
+
+        self.gpu
+            .queue
+            .write_buffer(&self.tokens, 0, bytemuck::cast_slice(tokens));
+        Ok(base_pos)
+    }
+
+    /// Run the whole graph and advance the position, leaving the logits on the
+    /// device. Split from the readback so the caller chooses how to wait.
+    fn dispatch(&mut self, cp: &CachedPlan, t: usize, base_pos: usize) {
         let d = self.cfg.d_model;
         let mut bytes = Vec::with_capacity(cp.slots.len() * UNIFORM_SLOT as usize);
         for s in &cp.slots {
             s.emit(base_pos as u32, t as u32, &mut bytes);
         }
-
-        if let Some(stop) = self.debug_stop.clone() {
-            let (at, buf) = cp
-                .checkpoints
-                .iter()
-                .find(|(n, _, _)| *n == stop)
-                .map(|(_, i, b)| (*i, *b))
-                .ok_or_else(|| anyhow::anyhow!("unknown checkpoint {stop:?}"))?;
-            self.gpu.queue.write_buffer(&self.uniforms, 0, &bytes);
-            self.run(&cp.plan[..at]);
-            let b = self.debug_buffer(buf);
-            let n = (b.size() / 4) as usize;
-            return Ok(self.gpu.read_f32(b, n));
-        }
-
         self.gpu.queue.write_buffer(&self.uniforms, 0, &bytes);
         self.run(&cp.plan);
 
@@ -1301,6 +1355,39 @@ impl GpuModel {
         self.run(&cp.tail);
 
         self.pos += t;
+    }
+
+    /// Mask the tokens this checkpoint must never emit.
+    fn suppress(&self, logits: &mut [f32]) {
+        for &tok in &self.cfg.suppress_tokens {
+            if let Some(l) = logits.get_mut(tok as usize) {
+                *l = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn execute(&mut self, cp: &CachedPlan, t: usize, base_pos: usize) -> anyhow::Result<Vec<f32>> {
+        if let Some(stop) = self.debug_stop.clone() {
+            let (at, buf) = cp
+                .checkpoints
+                .iter()
+                .find(|(n, _, _)| *n == stop)
+                .map(|(_, i, b)| (*i, *b))
+                .ok_or_else(|| anyhow::anyhow!("unknown checkpoint {stop:?}"))?;
+            let mut bytes = Vec::with_capacity(cp.slots.len() * UNIFORM_SLOT as usize);
+            for s in &cp.slots {
+                s.emit(base_pos as u32, t as u32, &mut bytes);
+            }
+            self.gpu.queue.write_buffer(&self.uniforms, 0, &bytes);
+            self.run(&cp.plan[..at]);
+            let b = self.debug_buffer(buf);
+            let n = (b.size() / 4) as usize;
+            return Ok(self.gpu.read_f32(b, n));
+        }
+
+        self.dispatch(cp, t, base_pos);
+
         let timing = std::env::var("LLMOXIDE_TIMING").is_ok();
         let t_sync = std::time::Instant::now();
         if timing {
@@ -1314,14 +1401,11 @@ impl GpuModel {
         if timing {
             eprintln!("  readback {:?}", t_read.elapsed());
         }
-        for &tok in &self.cfg.suppress_tokens {
-            if let Some(l) = logits.get_mut(tok as usize) {
-                *l = f32::NEG_INFINITY;
-            }
-        }
+        self.suppress(&mut logits);
         Ok(logits)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn debug_buffer(&self, i: usize) -> &wgpu::Buffer {
         match i {
             1 => &self.x,

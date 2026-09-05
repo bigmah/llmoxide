@@ -137,9 +137,17 @@ fn matvec_q4k(
 
     // Rows are strided over the grid: the output projection has 262144 rows,
     // well past the 65535-per-dimension dispatch limit.
-    var row = wg.x * ROWS + row_in_wg;
+    // The loop bound is deliberately the workgroup's *base* row rather than
+    // this thread's, so it mentions nothing derived from `lid`. Both forms
+    // iterate the same number of times — `row - row_in_wg` is `row_block` —
+    // but only this one is uniform to a compiler that will not do the algebra,
+    // and the reduction below contains a `workgroupBarrier`. Naga accepts the
+    // subtracted form; Tint rejects it, so WebGPU refuses to compile the whole
+    // module. Do not fold `row_in_wg` back into the loop variable.
+    var row_block = wg.x * ROWS;
     loop {
-        if (row - row_in_wg >= p.out_dim) { break; }
+        if (row_block >= p.out_dim) { break; }
+        let row = row_block + row_in_wg;
         let row_base = p.w_base + min(row, p.out_dim - 1u) * row_stride;
 
         var acc = 0.0;
@@ -167,7 +175,7 @@ fn matvec_q4k(
         if (lane == 0u && row < p.out_dim) {
             y[row] = total;
         }
-        row = row + nwg.x * ROWS;
+        row_block = row_block + nwg.x * ROWS;
     }
 }
 
@@ -189,9 +197,17 @@ fn matvec_q4k_t(
     // barrier fallback's reduction.
     let tile_n = min(TILE, p.n_tokens - min(tile_base, p.n_tokens));
 
-    var row = wg.x * ROWS + row_in_wg;
+    // The loop bound is deliberately the workgroup's *base* row rather than
+    // this thread's, so it mentions nothing derived from `lid`. Both forms
+    // iterate the same number of times — `row - row_in_wg` is `row_block` —
+    // but only this one is uniform to a compiler that will not do the algebra,
+    // and the reduction below contains a `workgroupBarrier`. Naga accepts the
+    // subtracted form; Tint rejects it, so WebGPU refuses to compile the whole
+    // module. Do not fold `row_in_wg` back into the loop variable.
+    var row_block = wg.x * ROWS;
     loop {
-        if (row - row_in_wg >= p.out_dim) { break; }
+        if (row_block >= p.out_dim) { break; }
+        let row = row_block + row_in_wg;
         let row_base = p.w_base + min(row, p.out_dim - 1u) * row_stride;
 
         var acc: array<f32, TILE>;
@@ -229,7 +245,7 @@ fn matvec_q4k_t(
         for (var tt = 0u; tt < tile_n; tt = tt + 1u) {
             store_row(tid, lane, acc[tt], row, tile_base + tt);
         }
-        row = row + nwg.x * ROWS;
+        row_block = row_block + nwg.x * ROWS;
     }
 }
 
@@ -293,9 +309,17 @@ fn matvec_q6k(
     let row_stride = blocks * 56u;    // 224 bytes per repacked block
     let n_units = blocks * 8u;
 
-    var row = wg.x * ROWS + row_in_wg;
+    // The loop bound is deliberately the workgroup's *base* row rather than
+    // this thread's, so it mentions nothing derived from `lid`. Both forms
+    // iterate the same number of times — `row - row_in_wg` is `row_block` —
+    // but only this one is uniform to a compiler that will not do the algebra,
+    // and the reduction below contains a `workgroupBarrier`. Naga accepts the
+    // subtracted form; Tint rejects it, so WebGPU refuses to compile the whole
+    // module. Do not fold `row_in_wg` back into the loop variable.
+    var row_block = wg.x * ROWS;
     loop {
-        if (row - row_in_wg >= p.out_dim) { break; }
+        if (row_block >= p.out_dim) { break; }
+        let row = row_block + row_in_wg;
         let row_base = p.w_base + min(row, p.out_dim - 1u) * row_stride;
 
         var acc = 0.0;
@@ -333,7 +357,7 @@ fn matvec_q6k(
         if (lane == 0u && row < p.out_dim) {
             y[row] = total;
         }
-        row = row + nwg.x * ROWS;
+        row_block = row_block + nwg.x * ROWS;
     }
 }
 
@@ -353,9 +377,17 @@ fn matvec_q6k_t(
     let x_stride = p.in_dim / 4u;
     let tile_n = min(TILE, p.n_tokens - min(tile_base, p.n_tokens));
 
-    var row = wg.x * ROWS + row_in_wg;
+    // The loop bound is deliberately the workgroup's *base* row rather than
+    // this thread's, so it mentions nothing derived from `lid`. Both forms
+    // iterate the same number of times — `row - row_in_wg` is `row_block` —
+    // but only this one is uniform to a compiler that will not do the algebra,
+    // and the reduction below contains a `workgroupBarrier`. Naga accepts the
+    // subtracted form; Tint rejects it, so WebGPU refuses to compile the whole
+    // module. Do not fold `row_in_wg` back into the loop variable.
+    var row_block = wg.x * ROWS;
     loop {
-        if (row - row_in_wg >= p.out_dim) { break; }
+        if (row_block >= p.out_dim) { break; }
+        let row = row_block + row_in_wg;
         let row_base = p.w_base + min(row, p.out_dim - 1u) * row_stride;
 
         var acc: array<f32, TILE>;
@@ -398,7 +430,7 @@ fn matvec_q6k_t(
         for (var tt = 0u; tt < tile_n; tt = tt + 1u) {
             store_row(tid, lane, acc[tt], row, tile_base + tt);
         }
-        row = row + nwg.x * ROWS;
+        row_block = row_block + nwg.x * ROWS;
     }
 }
 
@@ -427,9 +459,17 @@ fn matvec_q8_0(
     let blocks = p.in_dim / 32u;
     let row_stride = blocks * 9u;
 
-    var row = wg.x * ROWS + row_in_wg;
+    // The loop bound is deliberately the workgroup's *base* row rather than
+    // this thread's, so it mentions nothing derived from `lid`. Both forms
+    // iterate the same number of times — `row - row_in_wg` is `row_block` —
+    // but only this one is uniform to a compiler that will not do the algebra,
+    // and the reduction below contains a `workgroupBarrier`. Naga accepts the
+    // subtracted form; Tint rejects it, so WebGPU refuses to compile the whole
+    // module. Do not fold `row_in_wg` back into the loop variable.
+    var row_block = wg.x * ROWS;
     loop {
-        if (row - row_in_wg >= p.out_dim) { break; }
+        if (row_block >= p.out_dim) { break; }
+        let row = row_block + row_in_wg;
         let row_base = p.w_base + min(row, p.out_dim - 1u) * row_stride;
 
         var acc = 0.0;
@@ -451,7 +491,7 @@ fn matvec_q8_0(
         if (lane == 0u && row < p.out_dim) {
             y[row] = total;
         }
-        row = row + nwg.x * ROWS;
+        row_block = row_block + nwg.x * ROWS;
     }
 }
 
@@ -470,9 +510,17 @@ fn matvec_q8_0_t(
     let x_stride = p.in_dim / 4u;
     let tile_n = min(TILE, p.n_tokens - min(tile_base, p.n_tokens));
 
-    var row = wg.x * ROWS + row_in_wg;
+    // The loop bound is deliberately the workgroup's *base* row rather than
+    // this thread's, so it mentions nothing derived from `lid`. Both forms
+    // iterate the same number of times — `row - row_in_wg` is `row_block` —
+    // but only this one is uniform to a compiler that will not do the algebra,
+    // and the reduction below contains a `workgroupBarrier`. Naga accepts the
+    // subtracted form; Tint rejects it, so WebGPU refuses to compile the whole
+    // module. Do not fold `row_in_wg` back into the loop variable.
+    var row_block = wg.x * ROWS;
     loop {
-        if (row - row_in_wg >= p.out_dim) { break; }
+        if (row_block >= p.out_dim) { break; }
+        let row = row_block + row_in_wg;
         let row_base = p.w_base + min(row, p.out_dim - 1u) * row_stride;
 
         var acc: array<f32, TILE>;
@@ -498,7 +546,7 @@ fn matvec_q8_0_t(
         for (var tt = 0u; tt < tile_n; tt = tt + 1u) {
             store_row(tid, lane, acc[tt], row, tile_base + tt);
         }
-        row = row + nwg.x * ROWS;
+        row_block = row_block + nwg.x * ROWS;
     }
 }
 
@@ -526,9 +574,17 @@ fn matvec_f32(
     let row_in_wg = tid / LANES;
     let quads = p.in_dim / 4u;
 
-    var row = wg.x * ROWS + row_in_wg;
+    // The loop bound is deliberately the workgroup's *base* row rather than
+    // this thread's, so it mentions nothing derived from `lid`. Both forms
+    // iterate the same number of times — `row - row_in_wg` is `row_block` —
+    // but only this one is uniform to a compiler that will not do the algebra,
+    // and the reduction below contains a `workgroupBarrier`. Naga accepts the
+    // subtracted form; Tint rejects it, so WebGPU refuses to compile the whole
+    // module. Do not fold `row_in_wg` back into the loop variable.
+    var row_block = wg.x * ROWS;
     loop {
-        if (row - row_in_wg >= p.out_dim) { break; }
+        if (row_block >= p.out_dim) { break; }
+        let row = row_block + row_in_wg;
         let row_base = p.w_base + min(row, p.out_dim - 1u) * p.in_dim;
 
         var acc = 0.0;
@@ -543,7 +599,7 @@ fn matvec_f32(
         if (lane == 0u && row < p.out_dim) {
             y[row] = total;
         }
-        row = row + nwg.x * ROWS;
+        row_block = row_block + nwg.x * ROWS;
     }
 }
 
@@ -561,9 +617,17 @@ fn matvec_f32_t(
     let x_stride = p.in_dim / 4u;
     let tile_n = min(TILE, p.n_tokens - min(tile_base, p.n_tokens));
 
-    var row = wg.x * ROWS + row_in_wg;
+    // The loop bound is deliberately the workgroup's *base* row rather than
+    // this thread's, so it mentions nothing derived from `lid`. Both forms
+    // iterate the same number of times — `row - row_in_wg` is `row_block` —
+    // but only this one is uniform to a compiler that will not do the algebra,
+    // and the reduction below contains a `workgroupBarrier`. Naga accepts the
+    // subtracted form; Tint rejects it, so WebGPU refuses to compile the whole
+    // module. Do not fold `row_in_wg` back into the loop variable.
+    var row_block = wg.x * ROWS;
     loop {
-        if (row - row_in_wg >= p.out_dim) { break; }
+        if (row_block >= p.out_dim) { break; }
+        let row = row_block + row_in_wg;
         let row_base = p.w_base + min(row, p.out_dim - 1u) * p.in_dim;
 
         var acc: array<f32, TILE>;
@@ -582,7 +646,7 @@ fn matvec_f32_t(
         for (var tt = 0u; tt < tile_n; tt = tt + 1u) {
             store_row(tid, lane, acc[tt], row, tile_base + tt);
         }
-        row = row + nwg.x * ROWS;
+        row_block = row_block + nwg.x * ROWS;
     }
 }
 
@@ -679,9 +743,17 @@ fn matvec_bf16(
     // Two bf16 per word, so a row spans in_dim/2 words.
     let row_words = p.in_dim / 2u;
 
-    var row = wg.x * ROWS + row_in_wg;
+    // The loop bound is deliberately the workgroup's *base* row rather than
+    // this thread's, so it mentions nothing derived from `lid`. Both forms
+    // iterate the same number of times — `row - row_in_wg` is `row_block` —
+    // but only this one is uniform to a compiler that will not do the algebra,
+    // and the reduction below contains a `workgroupBarrier`. Naga accepts the
+    // subtracted form; Tint rejects it, so WebGPU refuses to compile the whole
+    // module. Do not fold `row_in_wg` back into the loop variable.
+    var row_block = wg.x * ROWS;
     loop {
-        if (row - row_in_wg >= p.out_dim) { break; }
+        if (row_block >= p.out_dim) { break; }
+        let row = row_block + row_in_wg;
         let row_base = p.w_base + min(row, p.out_dim - 1u) * row_words;
 
         var acc = 0.0;
@@ -696,7 +768,7 @@ fn matvec_bf16(
         if (lane == 0u && row < p.out_dim) {
             y[row] = total;
         }
-        row = row + nwg.x * ROWS;
+        row_block = row_block + nwg.x * ROWS;
     }
 }
 
@@ -715,9 +787,17 @@ fn matvec_bf16_t(
     let row_words = p.in_dim / 2u;
     let tile_n = min(TILE, p.n_tokens - min(tile_base, p.n_tokens));
 
-    var row = wg.x * ROWS + row_in_wg;
+    // The loop bound is deliberately the workgroup's *base* row rather than
+    // this thread's, so it mentions nothing derived from `lid`. Both forms
+    // iterate the same number of times — `row - row_in_wg` is `row_block` —
+    // but only this one is uniform to a compiler that will not do the algebra,
+    // and the reduction below contains a `workgroupBarrier`. Naga accepts the
+    // subtracted form; Tint rejects it, so WebGPU refuses to compile the whole
+    // module. Do not fold `row_in_wg` back into the loop variable.
+    var row_block = wg.x * ROWS;
     loop {
-        if (row - row_in_wg >= p.out_dim) { break; }
+        if (row_block >= p.out_dim) { break; }
+        let row = row_block + row_in_wg;
         let row_base = p.w_base + min(row, p.out_dim - 1u) * row_words;
 
         var acc: array<f32, TILE>;
@@ -736,7 +816,7 @@ fn matvec_bf16_t(
         for (var tt = 0u; tt < tile_n; tt = tt + 1u) {
             store_row(tid, lane, acc[tt], row, tile_base + tt);
         }
-        row = row + nwg.x * ROWS;
+        row_block = row_block + nwg.x * ROWS;
     }
 }
 

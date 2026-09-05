@@ -20,9 +20,16 @@ pub const Q4K_GPU_BLOCK_BYTES: usize = 144;
 /// scale word and every quant word are u32-aligned.
 pub const Q8_0_GPU_BLOCK_BYTES: usize = 36;
 
-/// Keep a margin under the adapter's binding limit; the packer is greedy and
-/// only checks before appending.
-const TARGET_BUFFER_BYTES: u64 = 3 << 30;
+/// Largest buffer the packer will build when the caller does not say.
+///
+/// Native adapters here report a ~4 GB binding limit, so this is a margin
+/// under it rather than the limit itself; the packer is greedy and only checks
+/// before appending. A browser is a different story — WebGPU's *default*
+/// `maxStorageBufferBindingSize` is 128 MB and even the adapter maximum is
+/// commonly 2 GB — so [`Plan::build_with`] takes the real number and
+/// [`Gpu::arena_buffer_bytes`](crate::Gpu::arena_buffer_bytes) derives it from
+/// the device.
+pub const TARGET_BUFFER_BYTES: u64 = 3 << 30;
 /// Tensor start alignment. 256 keeps every block type aligned and matches the
 /// usual `min_storage_buffer_offset_alignment`.
 const TENSOR_ALIGN: u64 = 256;
@@ -49,14 +56,33 @@ pub fn gpu_bytes(ty: GgmlType, n: usize) -> usize {
     }
 }
 
-/// Copy one tensor into `dst`, applying the Q6_K repack.
-pub fn encode_tensor(t: &TensorView<'_>, dst: &mut [u8]) {
-    match t.ty() {
+/// On-disk and GPU-side bytes per block, for a type's repack.
+///
+/// Both are 1 for the dense types, whose "blocks" are single elements — which
+/// makes any byte count a whole number of them, so a dense tensor can be split
+/// anywhere.
+pub fn block_strides(ty: GgmlType) -> (usize, usize) {
+    match ty {
+        GgmlType::Q6K => (gguf::quant::Q6K_BLOCK_BYTES, Q6K_GPU_BLOCK_BYTES),
+        GgmlType::Q8_0 => (gguf::quant::Q8_0_BLOCK_BYTES, Q8_0_GPU_BLOCK_BYTES),
+        GgmlType::Q4K => (gguf::quant::Q4K_BLOCK_BYTES, Q4K_GPU_BLOCK_BYTES),
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => (1, 1),
+    }
+}
+
+/// Copy a whole number of blocks into `dst`, applying the type's repack.
+///
+/// Split out from [`encode_tensor`] so a tensor too large to hold twice — the
+/// E4B token embedding is ~590 MB once repacked — can be moved a piece at a
+/// time. Both slices must cover the *same* block count, which is what
+/// [`block_strides`] is for; a dense type has a stride of one byte, so any
+/// split is legal there.
+pub fn encode_blocks(ty: GgmlType, src: &[u8], dst: &mut [u8]) {
+    match ty {
         GgmlType::Q6K => {
             // 210 -> 224 bytes; the trailing 14 bytes are padding the shader
             // never reads, but zeroing keeps the upload deterministic.
-            for (src, out) in t
-                .data
+            for (src, out) in src
                 .chunks_exact(gguf::quant::Q6K_BLOCK_BYTES)
                 .zip(dst.chunks_exact_mut(Q6K_GPU_BLOCK_BYTES))
             {
@@ -67,8 +93,7 @@ pub fn encode_tensor(t: &TensorView<'_>, dst: &mut [u8]) {
         GgmlType::Q8_0 => {
             // 34 -> 36 bytes: the f16 scale keeps its word to itself so the 32
             // quants that follow start on a u32 boundary.
-            for (src, out) in t
-                .data
+            for (src, out) in src
                 .chunks_exact(gguf::quant::Q8_0_BLOCK_BYTES)
                 .zip(dst.chunks_exact_mut(Q8_0_GPU_BLOCK_BYTES))
             {
@@ -77,8 +102,13 @@ pub fn encode_tensor(t: &TensorView<'_>, dst: &mut [u8]) {
                 out[4..].copy_from_slice(&src[2..]);
             }
         }
-        _ => dst[..t.data.len()].copy_from_slice(t.data),
+        _ => dst[..src.len()].copy_from_slice(src),
     }
+}
+
+/// Copy one tensor into `dst`, applying the Q6_K repack.
+pub fn encode_tensor(t: &TensorView<'_>, dst: &mut [u8]) {
+    encode_blocks(t.ty(), t.data, dst)
 }
 
 /// Plans the packing before any GPU memory is touched, so allocation failures
@@ -90,20 +120,35 @@ pub struct Plan {
 
 impl Plan {
     pub fn build(g: &Gguf, names: impl IntoIterator<Item = String>) -> anyhow::Result<Self> {
+        Self::build_with(g, names, TARGET_BUFFER_BYTES)
+    }
+
+    /// Plan against a specific maximum buffer size.
+    ///
+    /// Only the tensor *table* is read, never the payload, so this also works
+    /// on a [`gguf::Header`] parsed from a prefix — which is how the browser
+    /// build knows what to allocate before it has fetched a single weight.
+    pub fn build_with(
+        header: &gguf::Header,
+        names: impl IntoIterator<Item = String>,
+        target: u64,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(target >= TENSOR_ALIGN, "buffer target {target} is too small");
         let mut handles = Vec::new();
         let mut buffer_sizes: Vec<u64> = vec![0];
 
         for name in names {
-            let t = g.tensor(&name)?;
-            let size = gpu_bytes(t.ty(), t.elem_count()) as u64;
+            let t = header.info(&name)?;
+            let size = gpu_bytes(t.ty, t.elem_count()) as u64;
             anyhow::ensure!(
-                size <= TARGET_BUFFER_BYTES,
-                "tensor {name} is {size} bytes, larger than one buffer"
+                size <= target,
+                "tensor {name} is {size} bytes, larger than the {target}-byte \
+                 buffer limit this device allows"
             );
 
             let cur = buffer_sizes.last_mut().expect("at least one buffer");
             let start = cur.next_multiple_of(TENSOR_ALIGN);
-            let (buffer, base) = if start + size > TARGET_BUFFER_BYTES {
+            let (buffer, base) = if start + size > target {
                 buffer_sizes.push(size);
                 (buffer_sizes.len() - 1, 0)
             } else {
@@ -118,7 +163,7 @@ impl Plan {
                     base_u32: (base / 4) as u32,
                     in_dim: t.in_dim() as u32,
                     out_dim: t.out_dim() as u32,
-                    ty: t.ty(),
+                    ty: t.ty,
                 },
             ));
         }

@@ -107,7 +107,10 @@ impl<'a> Weights<'a> {
 
             layers.push(LayerWeights {
                 attn_norm: f32_tensor(&p("attn_norm.weight"))?,
-                post_attention_norm: f32_tensor(&p("post_attention_norm.weight"))?,
+                // Same tensor, two converter spellings: qwen35 emits
+                // `post_attention_norm`, qwen3 the classic `ffn_norm`.
+                post_attention_norm: f32_tensor(&p("post_attention_norm.weight"))
+                    .or_else(|_| f32_tensor(&p("ffn_norm.weight")))?,
                 attn,
                 ffn: FfnWeights {
                     gate: g.tensor(&p("ffn_gate.weight"))?,
@@ -180,8 +183,9 @@ impl<'a> Weights<'a> {
                     output,
                 } => {
                     checks.extend([
-                        // Q carries query and gate: two head_dim blocks per head.
-                        ("attn_q.out", q.out_dim(), cfg.n_heads * cfg.head_dim * 2),
+                        // With a fused gate, Q is two head_dim blocks per head;
+                        // without one, just the query.
+                        ("attn_q.out", q.out_dim(), cfg.n_heads * cfg.q_stride()),
                         ("attn_k.out", k.out_dim(), cfg.kv_dim()),
                         ("attn_v.out", v.out_dim(), cfg.kv_dim()),
                         ("attn_q_norm.len", q_norm.len(), cfg.head_dim),

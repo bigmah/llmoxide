@@ -8,11 +8,16 @@ gguf = { path = "../gguf" }
 model = { path = "../model" }
 anyhow.workspace = true
 wgpu.workspace = true
-pollster.workspace = true
 bytemuck.workspace = true
 half.workspace = true
 tokenizer = { path = "../tokenizer" }
 tracing.workspace = true
+futures-channel = { version = "0.3", default-features = false, features = ["std"] }
+
+# `pollster` blocks a thread, which a browser's main thread may not do, and
+# `naga` is only here for the `msl` tool. Neither belongs in the wasm build.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster.workspace = true
 naga = { version = "27", features = ["wgsl-in", "msl-out"] }
 
 [[bin]]

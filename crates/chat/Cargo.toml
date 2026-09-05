@@ -4,8 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+gguf = { path = "../gguf" }
 tokenizer = { path = "../tokenizer" }
 model = { path = "../model" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[[bin]]
+name = "prompt"
+path = "src/bin/prompt.rs"

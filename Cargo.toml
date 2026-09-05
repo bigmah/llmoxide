@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/gguf", "crates/tokenizer", "crates/model", "crates/gpu", "crates/chat", "crates/secret", "crates/hub", "crates/server", "llmoxide"]
+# Built for wasm32 only (`scripts/build-web.sh`), never for the host, so it is
+# not a workspace member — `cargo build` would pull wasm-bindgen into every
+# native build for nothing.
+exclude = ["crates/wasm"]
 
 [workspace.package]
 version = "0.1.0"

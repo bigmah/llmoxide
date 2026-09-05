@@ -275,8 +275,9 @@ impl<'a> Cpu<'a> {
                     let n_kv = cfg.n_kv_heads;
                     let kv_dim = cfg.kv_dim();
                     let group = cfg.gqa_group();
-                    // Per-head [query | gate] stride in the fused projection.
-                    let qg = 2 * head_dim;
+                    // Per-head stride in the query projection: [query | gate]
+                    // on qwen35, query alone on plain qwen3.
+                    let qg = cfg.q_stride();
                     let q_dim = cfg.n_heads * qg;
 
                     let qfull = &mut b.qkv[..t * q_dim];
@@ -331,7 +332,9 @@ impl<'a> Cpu<'a> {
                         for hq in 0..cfg.n_heads {
                             let kv_head = hq / group;
                             let qh = &qfull[i * q_dim + hq * qg..][..head_dim];
-                            let gate = &qfull[i * q_dim + hq * qg + head_dim..][..head_dim];
+                            let gate = cfg
+                                .query_gate
+                                .then(|| &qfull[i * q_dim + hq * qg + head_dim..][..head_dim]);
 
                             for (p, sc) in b.scores.iter_mut().enumerate() {
                                 let kh = &lcache.k_at(p)[kv_head * head_dim..][..head_dim];
@@ -351,9 +354,12 @@ impl<'a> Cpu<'a> {
                                 }
                             }
                             // The fused projection's second half gates the
-                            // attention output before Wo.
-                            for (o, &gv) in out.iter_mut().zip(gate) {
-                                *o *= ops::sigmoid(gv);
+                            // attention output before Wo. Plain qwen3 has no
+                            // such half and goes straight to Wo.
+                            if let Some(gate) = gate {
+                                for (o, &gv) in out.iter_mut().zip(gate) {
+                                    *o *= ops::sigmoid(gv);
+                                }
                             }
                         }
                     }

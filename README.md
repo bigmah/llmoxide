@@ -1,8 +1,10 @@
 # llmoxide
 
-A local inference CLI that leaves nothing behind, for two specific checkpoints —
-GGUF loader, k-quant decoders, tokenizers, and wgpu compute kernels written from
-scratch in Rust with no ML dependencies.
+A local inference CLI that leaves nothing behind — GGUF loader, k-quant
+decoders, tokenizers, and wgpu compute kernels written from scratch in Rust with
+no ML dependencies. Three architectures: gemma4, qwen35's hybrid delta-net
+stack, and plain dense Qwen3. The same code also compiles to wasm and runs in a
+browser on WebGPU — see [In a browser](#in-a-browser).
 
 The point of it is `llmoxide-private`: a session that writes nothing to disk,
 keeps the conversation in locked memory, and can overwrite every trace of it on
@@ -27,7 +29,7 @@ wiped: conversation, device buffers, locked pages.
 
 ## Models
 
-Three checkpoints, each validated against tensor-by-tensor. All run on the GPU;
+Four checkpoints, each validated against tensor-by-tensor. All run on the GPU;
 the CPU forward passes stay in the tree as the reference every kernel is checked
 against, not as a fallback.
 
@@ -35,14 +37,52 @@ against, not as a fallback.
 |---|---|---|---|---|
 | `gemma4` | `gemma4-v2-Q4_K_M.gguf` | gemma4, 12B, 48 layers | 7.38 GB | `0b9506ca…` |
 | `gemma4-e4b` | `gemma-4-E4B-it-Q8_0.gguf` | gemma4, E4B, 42 layers | 8.03 GB | `34be82b1…` |
+| `gemma4-e4b-q4` | `gemma-4-E4B-it-Q4_K_M.gguf` | gemma4, E4B, 42 layers | 5.34 GB | `d35a3aa7…` |
 | `qwen35` | `Qwen3.8-27B-OBLITERATED-Q6_K.gguf` | qwen35, 27B hybrid, 64 layers | 22.43 GB | `3535d4a1…` |
+| `qwen3-0.6b` | `Qwen3-0.6B-Q8_0.gguf` | qwen3, 0.6B dense, 28 layers | 0.64 GB | `e150ed54…` |
 
 From [`yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF`](https://huggingface.co/yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF)
 and [`OBLITERATUS/Qwen3.8-27B-OBLITERATED`](https://huggingface.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED)
 respectively, and `gemma4-e4b` from
 [`ggml-org/gemma-4-E4B-it-GGUF`](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF).
+`qwen3-0.6b` is the one small enough to *serve*: 0.64 GB, from
+[`unsloth/Qwen3-0.6B-GGUF`](https://huggingface.co/unsloth/Qwen3-0.6B-GGUF).
+It is Q8_0 rather than a Q4 because at 0.6B the quantization error is the first
+thing you notice, and 0.64 GB is already inside any sane download budget. There
+is nothing smaller worth having in either family — see
+[Why not a smaller Gemma](#why-not-a-smaller-gemma).
+
+`gemma4-e4b-q4` is the same E4B at a size a browser tab will actually allocate,
+from [`lmstudio-community`](https://huggingface.co/lmstudio-community/gemma-4-E4B-it-GGUF) —
+that repo rather than the obvious ones because a GGUF is only loadable here if
+*every* tensor is a type the decoders handle. ggml-org publishes E4B as Q8_0 or
+Q4_0, and there is no Q4_0 decoder; bartowski's Q4_K_M mixes in 84 Q5_K
+tensors, which there is also no decoder for. Both are rejected at load rather
+than part-way through a forward pass, which is what the structure check in
+`llmoxide-fetch` is for — it caught the second one after the download had
+already passed its SHA-256.
 `qwen35` is the interesting one architecturally: a hybrid stack where three
 quarters of the layers are gated delta-net rather than attention.
+
+Plain **qwen3** is not a separate implementation. Read as a config, it *is*
+qwen35 with two things switched off: every layer is full attention rather than
+delta-net, and `attn_q` carries no fused output gate, so it is `head_dim` wide
+per head instead of `2 * head_dim`. Everything else — RMSNorm, GQA, per-dim
+query and key norms, NeoX RoPE, SwiGLU — is the same code, so `qwen3` costs one
+`Config::query_gate` flag and three branches rather than a second copy of an
+attention block that already worked. The 27B is re-checked against the CPU path
+at all 771 checkpoints after every change to it.
+
+Two Qwen traps came with that. Its vocabulary uses the **classic `qwen2`
+pre-tokenizer split**, which is the qwen35 one with every `\p{M}` term removed —
+so combining marks no longer travel with the letters they modify. Picking the
+wrong split does not fail, it just tokenizes subtly differently everywhere;
+`pre::Marks` makes it one function with marks switched off rather than two
+hand-ports that could drift. And Qwen3 ships **no `general.sampling.*`
+metadata**, so a single hard-coded fallback would sample it with Gemma's
+temperature of 1.0 against Qwen's published 0.7 — which on a 0.6B model reads
+as the model being weak rather than the sampler being wrong.
+`Sampling::family_default` picks per family.
 
 One chat-format trap comes with it. The two checkpoints disagree on how to turn
 *off* reasoning: the 12B's template suppresses it by making the generation prompt
@@ -191,6 +231,11 @@ Everything is checked against llama.cpp rather than asserted:
 | qwen35 CPU forward | 567 tensors across all 64 layers match `llama-eval-callback` within 4e-4 on a real 27B; **byte-identical** greedy output to `llama-completion --temp 0` |
 | qwen35 GPU forward | **771/771** checkpoints match the CPU path on the 27B (logits rel 1.3e-6, same argmax) |
 | qwen35 chat format | prompt ids match a jinja2 rendering of the embedded template, with and without tools |
+| qwen3 tokenizer | exact id-for-id match with `llama-tokenize` on 21 cases and 6 files (30 610 tokens), with `--no-escape`; the only divergences are literal `<think>`/`<tool_call>` spellings in raw text, which are deliberately not matched as control tokens and which the validated qwen35 path treats the same way |
+| qwen3 CPU forward | **byte-identical** greedy output to `llama-completion --temp 0` on 6 prompts / 288 tokens, code and prose |
+| qwen3 GPU forward | **339/339** checkpoints match the CPU path across 28 layers, same argmax |
+| qwen3 chat format | single-turn prompt ids match a jinja2 rendering of the embedded template exactly; multi-turn deliberately differs, see below |
+| browser kernels | the WGSL rewrites for Tint leave `bisect` at **all checkpoints match** on E4B Q4_K_M, and `kernels` matching the CPU dequant-dot on *both* reduction paths (`LLMOXIDE_NO_SUBGROUP=1` is the one the browser takes) |
 
 Tools that reproduce this:
 
@@ -201,6 +246,8 @@ Tools that reproduce this:
 ./target/release/validate_qwen35 <model> <refs.json> <ids>     # vs llama-eval-callback
 ./target/release/upload_check   <model>                        # weight arena readback
 ./target/release/wipe_check     <model> [prompt]               # wipe leaves no residue
+./target/release/tok            <model> [text]                 # ids, vs llama-tokenize
+./target/release/prompt         <model> < messages.json        # chat ids, vs a jinja render
 ```
 
 `bisect` reports the *first* diverging checkpoint, which is how the NaN in
@@ -305,6 +352,15 @@ assistant turns reproduce the empty thought channel the generation prompt
 emits — otherwise every turn diverges from the cache at the first assistant
 message and re-prefills the whole conversation.
 
+This is the one place the prompt deliberately departs from the checkpoints'
+own templates, and it applies to Qwen too. Qwen3's template strips the think
+block from assistant turns before the last user message; the 27B's emits none
+at all. Both would diverge from what the model actually generated, because the
+generation prompt that produced those turns *ended* with
+`<think>\n\n</think>\n\n`. Replaying it is both closer to the model's real
+context and the only version that keeps the cache. Single-turn prompts, where
+the question does not arise, match the template id-for-id.
+
 ## One-shot generation
 
 ```sh
@@ -398,6 +454,140 @@ behaviours shared by both:
   will occasionally invent one, and a client that dispatched it would either
   error out or run something unintended.
 
+## In a browser
+
+The same engine, compiled to wasm32 and pointed at WebGPU instead of Metal.
+One self-contained HTML file — the wasm module is baked into it — and the
+checkpoint either downloads once and caches, or is read off your own disk.
+Either way it goes straight into GPU memory and is never uploaded anywhere.
+
+```sh
+scripts/build-web.sh              # -> web/llmoxide.html, ~1.2 MB
+open web/llmoxide.html            # or serve it; both work
+```
+
+To host it, put `llmoxide.html` and a `.gguf` on any static host and point
+`MODEL_URL` at the checkpoint (it defaults to `./Qwen3-0.6B-Q8_0.gguf`, i.e.
+the file sitting next to the page). The download is one ordinary GET — no Range
+support needed — so a plain bucket or CDN is enough, and it lands in the Cache
+API so a repeat visit starts instantly. `?model=<url>` overrides it for
+testing.
+
+| checkpoint | download | load | decode |
+|---|---|---|---|
+| `qwen3-0.6b` | 0.64 GB | 3.0 s | 32–115 tok/s |
+| `gemma4-e4b-q4` | 5.34 GB (local file) | 5.0 s | 24–30 tok/s |
+
+```
+»  My favourite colour is teal. Just acknowledge that briefly.
+Teal is a lovely colour!
+»  What is my favourite colour?
+Your favourite colour is teal.
+»  /wipe
+wiped: conversation, device buffers, locked pages.
+»  What is my favourite colour?
+I do not know your favorite color.
+```
+
+Measured in Chrome on the M4 Pro. `gemma4-e4b-q4` puts **5.54 GB of weights
+resident in 5.0 s** — 1.1–1.2 GB/s from disk through the browser to the GPU —
+and decodes at the same order as the native build's 22.3 tok/s, which is less
+surprising than it sounds: the kernels are identical. WGSL is WebGPU's own
+shading language, so `crates/gpu/src/shaders` ships to the browser unchanged
+rather than being translated.
+
+Needs WebGPU: Chrome or Edge 113+, or Safari 26+. There is no fallback, and
+that is not laziness — see below.
+
+### Why not a smaller Gemma
+
+There isn't one. The smallest Gemma 4 is E2B, and its smallest GGUF at any
+quantization is 2.29 GB; **66% of that file is embeddings**, because the vocab
+is 262144 and the E-series multiplies it by depth — its per-layer embedding
+table alone is 262144 x 256 x 35 = 2.35 B parameters. Push every weight in E2B
+to two bits and the floor is still 1.16 GB. The E-series spends bytes to save
+FLOPs, which is the right trade for a phone and the wrong one for a download.
+
+Qwen3 0.6B is the way under a gigabyte, and it is why `qwen3` is supported at
+all. Do not expect much of it — it is a 0.6B model, fine for short exchanges
+and visibly limited beyond that — but it is coherent, it streams fast, and it
+fits.
+
+### Why the weights never enter wasm memory
+
+wasm32 addresses 4 GB. The checkpoint is 5.3. So a CPU forward pass in the
+browser is not slow, it is *impossible* — there is nowhere to put the weights,
+at any quantization that leaves the model worth running.
+
+The loader is therefore split. `gguf::Header` is everything but the tensor
+payload, and parses from a **prefix** of the file: a few megabytes gives every
+tensor's type, shape and offset, which is enough to plan the whole upload
+before a weight byte has moved. `Weights::upload_streaming` then walks that
+table pulling 32 MB at a time out of the JS `File` and writing each chunk
+straight into a GPU buffer. Peak host usage is one chunk. `gguf::Source::Sparse`
+holds the handful of F32 norms that model construction actually reads by name,
+and returns a *typed error* for anything else rather than a wrong slice — which
+is how the one place that read an 800 MB tensor merely to learn its `ne[1]`
+turned up on the first run.
+
+Two things follow from that split, and both are load-bearing:
+
+- `Blob::slice` must be the `f64` overload. The `i32` one saturates past 2 GB —
+  a third of the way in — and every tensor after that point would load from the
+  clamped offset with no error anywhere.
+- Buffer sizes come from the device, not from a constant. Native adapters here
+  report a 30 GB `max_buffer_size`; WebGPU's *default* is 256 MB, and the
+  adapter maximum is commonly 2 GB. (This M4 Pro offers 4.29 GB, so the model
+  lands in two buffers.)
+
+### Two shaders that compile natively and not in a browser
+
+Both were found by running it, both produced no error at the point of failure,
+and both are now caught up front by `Gpu::check_shaders` — which asks for
+compilation messages *before* the 5.5 GB upload rather than after.
+
+- **Naga and Tint disagree about uniformity.** The matvec kernels stride rows
+  across the grid with `if (row - row_in_wg >= p.out_dim) { break; }`. The
+  `row_in_wg` cancels, so every thread runs the same number of iterations and
+  reaches the reduction's `workgroupBarrier` together — which is what makes the
+  barrier legal. Naga accepts this. Tint will not do the algebra, sees a bound
+  derived from `local_invocation_id`, and rejects the whole module. Keeping the
+  loop variable as the workgroup's *base* row fixes it and changes nothing.
+  Native never noticed because native takes the `subgroupAdd` path, which has
+  no barrier at all; the barrier fallback is only reached with
+  `LLMOXIDE_NO_SUBGROUP=1`.
+- **`-3.4028235e38` is not a valid f32 literal in WGSL.** It is what Rust
+  prints for `f32::MIN`, and it round-trips in Rust. WGSL parses literals as
+  abstract float first, where `3.4028235e38` is larger than `f32::MAX`, so the
+  conversion overflows. `bitcast<f32>(0xff7fffffu)` means one thing everywhere.
+
+The symptom in both cases was the same and is worth recognising: WebGPU does
+not fail `create_shader_module`, it reports asynchronously. So pipelines are
+created invalid, every dispatch against them is silently dropped, and the first
+visible sign is a reply made of `<unused12><unused35>` ninety seconds later.
+
+### What does not survive the port
+
+- **`mlock` does not.** A wasm module's memory is a JS `ArrayBuffer` the host
+  may move, page or snapshot at will, and nothing inside the sandbox can pin
+  it. `secret::sys`'s wasm shims say so rather than quietly returning success
+  for a lock that never happened. The zeroing allocator *is* real — `memset_s`
+  becomes a volatile write loop, which is the same guarantee by another route —
+  so `/wipe` still overwrites the conversation, the heap blocks it passed
+  through, and every device buffer. It cannot reach the tab's own heap
+  snapshot, and devtools can read this memory regardless.
+- **The 27B does not** — not for any code reason, it simply will not fit. The
+  qwen35 module itself compiles to wasm and is what runs Qwen3 0.6B there.
+- **The CPU reference path does not** — see above. It still compiles (rayon
+  swapped for a serial shim, since real wasm threads need `SharedArrayBuffer`
+  and so COOP/COEP headers, which a local file has no way to set), but there is
+  no memory for it to run in.
+- **Checkpoint capture does not.** `bisect` and `wipe_check` read buffers back
+  synchronously, and a browser's main thread may not block on a buffer map.
+  Everything on the hot path went async instead: `GpuModel::forward_async` is
+  the same dispatch as `forward`, differing only in how it waits — which is
+  also what keeps the page responsive and lets tokens paint as they arrive.
+
 ## Layout
 
 ```
@@ -405,11 +595,17 @@ crates/gguf       GGUF v3 reader, mmap'd; Q4_K / Q6_K / Q8_0 decoders
 crates/tokenizer  gemma4 BPE (262144 tokens) + qwen35 byte-level BPE (248320)
 crates/model      architecture configs, CPU reference forward passes, sampling
 crates/gpu        wgpu device, weight arena, WGSL kernels, both GPU forwards
-crates/chat       prompt assembly: gemma4's tool DSL + qwen35's ChatML/XML
+crates/chat       prompt assembly: gemma4's tool DSL + qwen's ChatML/XML
 crates/secret     locked, self-zeroing memory; the zeroing global allocator
 crates/hub        resumable, verified Hugging Face downloads
 crates/server     the private REPL, plus the axum OpenAI-compatible API
+crates/wasm       the browser build: WebGPU, streamed weights, chat REPL
+web/              the page shell; build-web.sh emits llmoxide.html into it
 ```
+
+`crates/wasm` is deliberately **not** a workspace member — it only ever builds
+for `wasm32-unknown-unknown`, and membership would pull wasm-bindgen and
+web-sys into every native `cargo build`.
 
 ## Known limitations
 
@@ -435,3 +631,21 @@ crates/server     the private REPL, plus the axum OpenAI-compatible API
   since attention scratch scales with it.
 - Private mode covers this process, not the machine, and not the server: see
   "What this does not cover" and "Serving" above.
+- The browser build needs WebGPU and has no CPU fallback — wasm32's 4 GB
+  address space cannot hold the weights at any useful quantization. It also
+  cannot `mlock`, so it is the one entry point where "leaves nothing behind" is
+  a weaker claim than elsewhere. See "In a browser".
+- Qwen3 0.6B is the only checkpoint here small enough to serve over the web,
+  and it is a 0.6B model: fine for short exchanges, visibly limited past that,
+  and prone to answering *about* your question rather than answering it. There
+  is no larger option under a gigabyte in either family — see "Why not a
+  smaller Gemma".
+- `qwen3` support is dense-attention only. The delta-net path it shares a module
+  with is exercised by the 27B, not by any small checkpoint, so a regression
+  there needs the 22 GB file to catch.
+- The browser build's correctness rests on the native `bisect`, not on a check
+  that runs in a browser: comparing per-checkpoint tensors there would mean
+  shipping the CPU reference path, which is exactly what does not fit. The
+  kernels are byte-identical WGSL and `Gpu::check_shaders` proves they compiled,
+  but nothing verifies the browser's *numerics* against the CPU the way
+  `bisect` does natively.

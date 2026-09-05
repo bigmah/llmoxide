@@ -2,12 +2,18 @@
 
 pub mod arena;
 pub mod forward;
+/// The hybrid delta-net stack, and plain dense Qwen3 with its delta-net layers
+/// and query gate switched off — see `model::qwen35::Config`. The 27B has no
+/// route into a browser tab, but Qwen3 0.6B is 0.6 GB and very much does.
 pub mod qwen35;
 
 use std::collections::HashMap;
 
 use arena::{Handle, Plan};
-use gguf::{GgmlType, Gguf};
+use gguf::GgmlType;
+// Only the mapped upload path names the whole file.
+#[cfg(not(target_arch = "wasm32"))]
+use gguf::Gguf;
 use wgpu::util::DeviceExt;
 
 pub struct Gpu {
@@ -40,6 +46,15 @@ impl Gpu {
         // `LLMOXIDE_NO_SUBGROUP` forces the barrier fallback, which is
         // otherwise unreachable on hardware that has subgroups — and so would
         // never be exercised.
+        // WebGPU will not take the subgroup path at all. Its WGSL requires an
+        // `enable subgroups;` directive before `subgroupAdd`, and Naga still
+        // rejects that directive — so unlike the native backend, where the
+        // builtins compile without it, the shader would simply fail to build.
+        // The barrier reduction is the browser's only option, and it is the
+        // same one `LLMOXIDE_NO_SUBGROUP=1` exercises natively.
+        #[cfg(target_arch = "wasm32")]
+        let subgroups = false;
+        #[cfg(not(target_arch = "wasm32"))]
         let subgroups = adapter.features().contains(wgpu::Features::SUBGROUP)
             && std::env::var_os("LLMOXIDE_NO_SUBGROUP").is_none();
         let (device, queue) = adapter
@@ -66,11 +81,36 @@ impl Gpu {
         // only correct if a subgroup is exactly ROWS_PER_GROUP-wide and its
         // lanes are the workgroup's threads in order, and wgpu reports a
         // supported *range* (4..64 on Apple) rather than the real width — so
-        // ask the hardware before trusting it.
+        // ask the hardware before trusting it. The probe reads a buffer back
+        // synchronously, which a browser cannot do; there it is moot anyway,
+        // since `subgroups` is already false.
+        #[cfg(not(target_arch = "wasm32"))]
         let subgroups = subgroups && subgroup_layout_matches(&device, &queue);
 
+        // Browsers withhold the GPU's actual name — it is a fingerprinting
+        // surface — so `name` comes back empty there and the banner would read
+        // as a missing value rather than a withheld one. Fall back to whatever
+        // the adapter will say about itself.
+        let info = adapter.get_info();
+        let adapter_name = if !info.name.is_empty() {
+            info.name.clone()
+        } else {
+            let said: Vec<&str> = [info.driver.as_str(), info.driver_info.as_str()]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect();
+            match (said.is_empty(), info.backend) {
+                // Chrome reports no driver strings either, so there is genuinely
+                // nothing to name. Say the API rather than printing wgpu's
+                // internal "BrowserWebGpu".
+                (true, wgpu::Backend::BrowserWebGpu) => "WebGPU".to_string(),
+                (true, b) => format!("{b} adapter"),
+                (false, _) => said.join(" "),
+            }
+        };
+
         Ok(Self {
-            adapter_name: adapter.get_info().name,
+            adapter_name,
             device,
             queue,
             limits,
@@ -78,8 +118,74 @@ impl Gpu {
         })
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn blocking_new() -> anyhow::Result<Self> {
         pollster::block_on(Self::new())
+    }
+
+    /// Compile the quantized kernels and report any error, before anything
+    /// expensive has happened.
+    ///
+    /// Worth its own step because of how this fails otherwise. A WGSL compiler
+    /// that rejects the module does not fail the `create_shader_module` call —
+    /// the error arrives asynchronously — so pipeline creation silently yields
+    /// invalid pipelines, every dispatch against them is dropped, and the first
+    /// symptom is a reply made of `<unused12>` after a 90-second weight upload.
+    /// Asking for the compilation messages up front turns that into one clear
+    /// error in about a millisecond.
+    ///
+    /// This is not hypothetical: Naga and Tint disagree about the uniformity of
+    /// the barrier reduction's loop bound, which made the whole module
+    /// uncompilable in a browser while every native path was fine. See the note
+    /// on `row_block` in `shaders/quant.wgsl`.
+    pub async fn check_shaders(&self) -> anyhow::Result<()> {
+        // Every module the gemma4 forward pass compiles. Checking only some of
+        // them would be worse than checking none, since it reads as a clean
+        // bill of health.
+        let quant = quant_shader_source(self.subgroups);
+        let sources: [(&str, &str); 3] = [
+            ("quant", &quant),
+            ("ops", include_str!("shaders/ops.wgsl")),
+            ("attn", include_str!("shaders/attn.wgsl")),
+        ];
+
+        let mut errors = Vec::new();
+        for (name, src) in sources {
+            let module = self.shader(name, src);
+            for m in module.get_compilation_info().await.messages {
+                if m.message_type != wgpu::CompilationMessageType::Error {
+                    continue;
+                }
+                errors.push(match &m.location {
+                    Some(l) => format!(
+                        "  {name}.wgsl line {}:{}  {}",
+                        l.line_number, l.line_position, m.message
+                    ),
+                    None => format!("  {name}.wgsl  {}", m.message),
+                });
+            }
+        }
+        anyhow::ensure!(
+            errors.is_empty(),
+            "these kernels do not compile on this device:\n{}",
+            errors.join("\n")
+        );
+        Ok(())
+    }
+
+    /// Largest weight buffer this device will accept.
+    ///
+    /// The arena packs tensors into a handful of big storage buffers, and how
+    /// big is a property of the device, not of the model. Natively both limits
+    /// come back around 4 GB and [`arena::TARGET_BUFFER_BYTES`] is what binds.
+    /// In a browser they are the binding constraint: WebGPU's default
+    /// `maxStorageBufferBindingSize` is 128 MB, and even after asking for the
+    /// adapter's maximum it is commonly 2 GB — so a 4.6 GB checkpoint becomes
+    /// three buffers there and two here.
+    pub fn arena_buffer_bytes(&self) -> u64 {
+        arena::TARGET_BUFFER_BYTES
+            .min(self.limits.max_storage_buffer_binding_size as u64)
+            .min(self.limits.max_buffer_size)
     }
 
     /// Compile a compute shader with Naga's loop-termination guards disabled.
@@ -95,7 +201,14 @@ impl Gpu {
             label: Some(label),
             source: wgpu::ShaderSource::Wgsl(source.into()),
         };
+        // On the web there is no Naga in the pipeline to instruct: WGSL goes to
+        // the browser, which applies its own rules and ignores these knobs. The
+        // loop guard this exists to remove is not there to begin with.
+        #[cfg(target_arch = "wasm32")]
+        return self.device.create_shader_module(desc);
+
         // SAFETY: the only requirement is that no loop in `source` is infinite.
+        #[cfg(not(target_arch = "wasm32"))]
         unsafe {
             self.device.create_shader_module_trusted(
                 desc,
@@ -155,8 +268,71 @@ impl Gpu {
             })
     }
 
+    /// Read a storage buffer back to the host.
+    ///
+    /// The only form that works everywhere: a browser cannot block its main
+    /// thread waiting for a map, so the wait has to be a suspension point. On
+    /// native nothing else drives the queue, so it is polled to completion
+    /// first and the await then resolves immediately.
+    pub async fn read_f32_async(&self, src: &wgpu::Buffer, len: usize) -> Vec<f32> {
+        let bytes = (len * 4) as u64;
+        let staging = self.buffer(
+            "readback",
+            bytes,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(src, 0, &staging, 0, bytes);
+        self.queue.submit([enc.finish()]);
+
+        let slice = staging.slice(..);
+        let (tx, rx) = futures_channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        rx.await.expect("map channel").expect("buffer map failed");
+
+        let out = bytemuck::cast_slice::<u8, f32>(&slice.get_mapped_range()).to_vec();
+        staging.unmap();
+        out
+    }
+
+    /// Read raw bytes back, awaiting the map. `offset` must be a multiple of
+    /// [`wgpu::COPY_BUFFER_ALIGNMENT`], as must `len`.
+    pub async fn read_bytes_async(&self, src: &wgpu::Buffer, offset: u64, len: usize) -> Vec<u8> {
+        let staging = self.buffer(
+            "readback",
+            len as u64,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(src, offset, &staging, 0, len as u64);
+        self.queue.submit([enc.finish()]);
+
+        let slice = staging.slice(..);
+        let (tx, rx) = futures_channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        if rx.await.map(|r| r.is_err()).unwrap_or(true) {
+            return Vec::new();
+        }
+        let out = slice.get_mapped_range().to_vec();
+        staging.unmap();
+        out
+    }
+
     /// Read a storage buffer back to the host. Synchronous and slow — for
     /// validation and final logits, not the hot path.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn read_f32(&self, src: &wgpu::Buffer, len: usize) -> Vec<f32> {
         let bytes = (len * 4) as u64;
         let staging = self.buffer(
@@ -188,6 +364,7 @@ impl Gpu {
 /// with `subgroup_invocation_id == local_invocation_index % LANES`. Both hold
 /// on Apple silicon; the matvec reduction is wrong without them, so a device
 /// that disagrees gets the barrier fallback instead.
+#[cfg(not(target_arch = "wasm32"))]
 fn subgroup_layout_matches(device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
     const PROBE: &str = r#"
 @group(0) @binding(0) var<storage, read_write> out: array<u32>;
@@ -275,6 +452,15 @@ fn main(
     pollster::block_on(device.pop_error_scope()).is_none() && ok
 }
 
+/// Bytes at human scale, for error messages.
+fn human_bytes(n: u64) -> String {
+    if n >= 1 << 30 {
+        format!("{:.2} GB", n as f64 / 1e9)
+    } else {
+        format!("{:.0} MB", n as f64 / 1e6)
+    }
+}
+
 /// Every model weight, resident on the GPU.
 pub struct Weights {
     pub buffers: Vec<wgpu::Buffer>,
@@ -283,6 +469,149 @@ pub struct Weights {
 }
 
 impl Weights {
+    /// Upload all tensors named by `names`, reading each one's bytes on demand.
+    ///
+    /// The variant for sources that cannot be mapped or held whole: `read`
+    /// is handed an absolute `[start, end)` byte range of the file and returns
+    /// just those bytes. That is what the browser build runs on — a 4.6 GB
+    /// checkpoint does not fit in wasm32's 4 GB address space, so weights go
+    /// from a JS `File` to a GPU buffer without linear memory ever holding
+    /// more than one chunk of one tensor.
+    ///
+    /// Writes are chunked for the same reason. `token_embd` alone is ~590 MB
+    /// once repacked, and both the staging copy `write_buffer` makes and the
+    /// scratch it is encoded into would otherwise be live at once.
+    pub async fn upload_streaming<F, Fut>(
+        gpu: &Gpu,
+        header: &gguf::Header,
+        names: impl IntoIterator<Item = String>,
+        mut read: F,
+        mut progress: impl FnMut(u64, u64),
+    ) -> anyhow::Result<Self>
+    where
+        F: FnMut(u64, u64) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+    {
+        /// Bytes of *repacked* output per write. Small enough that the staging
+        /// copy is cheap to hold, large enough that a 4.6 GB model is a few
+        /// hundred writes rather than a few hundred thousand.
+        const CHUNK: usize = 32 << 20;
+        /// Bytes of each buffer's first and last write kept for verification.
+        const SAMPLE: usize = 4096;
+
+        let plan = Plan::build_with(header, names, gpu.arena_buffer_bytes())?;
+        let total = plan.total_bytes();
+
+        let mut buffers = Vec::with_capacity(plan.buffer_sizes.len());
+        for (i, &size) in plan.buffer_sizes.iter().enumerate() {
+            buffers.push(gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("weights{i}")),
+                size: size.max(4),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }));
+        }
+
+        // Head and tail of each buffer, remembered as they are written so the
+        // check below compares against what was actually sent rather than
+        // against "not zero" — a Q6_K tensor's padding is legitimately zero,
+        // and a tensor's last block may be too.
+        let mut head: Vec<Option<(u64, Vec<u8>)>> = vec![None; buffers.len()];
+        let mut tail: Vec<Option<(u64, Vec<u8>)>> = vec![None; buffers.len()];
+
+        let mut done = 0u64;
+        for (name, h) in &plan.handles {
+            let info = header.info(name)?;
+            let range = header.byte_range(info);
+            let (src_stride, dst_stride) = arena::block_strides(info.ty);
+            let blocks = info.byte_len() / src_stride;
+            // Whole blocks per chunk: a partial one would repack garbage.
+            let per_chunk = (CHUNK / dst_stride).max(1);
+
+            let mut block = 0usize;
+            let mut scratch = Vec::new();
+            while block < blocks {
+                let n = per_chunk.min(blocks - block);
+                let src_from = range.start + (block * src_stride) as u64;
+                let bytes = read(src_from, src_from + (n * src_stride) as u64).await?;
+                anyhow::ensure!(
+                    bytes.len() == n * src_stride,
+                    "short read for {name}: wanted {} bytes, got {}",
+                    n * src_stride,
+                    bytes.len()
+                );
+
+                scratch.clear();
+                scratch.resize(n * dst_stride, 0);
+                arena::encode_blocks(info.ty, &bytes, &mut scratch);
+                let dst = h.base_u32 as u64 * 4 + (block * dst_stride) as u64;
+                gpu.queue.write_buffer(&buffers[h.buffer], dst, &scratch);
+
+                // `copy_buffer_to_buffer` needs 4-byte-aligned offsets and
+                // sizes; every tensor base is 256-aligned and every GPU block
+                // stride is a multiple of 4, so `dst` already is. Note this is
+                // a byte count, deliberately not named `n` — `n` above is a
+                // *block* count and shadowing it here silently turned the loop
+                // step into 4096, which re-read multi-chunk tensors dozens of
+                // times over and made a 5 s load take 285 s.
+                let sample = scratch.len().min(SAMPLE) & !3;
+                if sample > 0 {
+                    if head[h.buffer].is_none() {
+                        head[h.buffer] = Some((dst, scratch[..sample].to_vec()));
+                    }
+                    let off = scratch.len() - sample;
+                    tail[h.buffer] = Some((dst + off as u64, scratch[off..].to_vec()));
+                }
+                // Flush per chunk. Queued writes are only staged until a
+                // submit, so without this the whole model would accumulate in
+                // staging memory before any of it reached the device.
+                gpu.queue.submit([]);
+
+                block += n;
+                done += (n * dst_stride) as u64;
+                progress(done, total);
+            }
+        }
+
+        // Every planned byte was written exactly once. Cheap, and it is the
+        // invariant the loop step above can break without changing the result:
+        // overlapping writes still land the right bytes at the right offsets,
+        // so only the arithmetic gives the mistake away.
+        anyhow::ensure!(
+            done == total,
+            "upload accounting is wrong: wrote {done} bytes, planned {total}"
+        );
+
+        // Same check the mapped path runs, for the same reason: a driver under
+        // memory pressure can drop staged writes without raising anything, and
+        // the buffers then read back as zeros. Forty layers of silent garbage
+        // is much worse than a failed load, and a browser tab asking for
+        // gigabytes is a likelier place to hit it than a native process.
+        for (i, buf) in buffers.iter().enumerate() {
+            for sample in [&head[i], &tail[i]] {
+                let Some((offset, expect)) = sample else {
+                    continue;
+                };
+                let got = gpu.read_bytes_async(buf, *offset, expect.len()).await;
+                anyhow::ensure!(
+                    got == *expect,
+                    "weight upload verification failed: buffer {i} at byte {offset} \
+                     read back wrong (the GPU likely could not hold {} of weights — \
+                     close other tabs and retry, or use a smaller quantization)",
+                    crate::human_bytes(total),
+                );
+            }
+        }
+
+        Ok(Self {
+            bytes: total,
+            handles: plan.handles.into_iter().collect(),
+            buffers,
+        })
+    }
+
     /// Upload all tensors named by `names`.
     ///
     /// Buffers are filled and flushed **one at a time**. Mapping every buffer
@@ -291,12 +620,13 @@ impl Weights {
     /// briefly wants 50 GB — past Metal's working set, and the writes then
     /// vanish *silently* (the buffers read back as zeros, no error anywhere).
     /// Sequential fill + poll caps the transient at one buffer's shadow.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn upload(
         gpu: &Gpu,
         g: &Gguf,
         names: impl IntoIterator<Item = String>,
     ) -> anyhow::Result<Self> {
-        let plan = Plan::build(g, names)?;
+        let plan = Plan::build_with(g, names, gpu.arena_buffer_bytes())?;
 
         let mut by_buffer: Vec<Vec<&(String, Handle)>> = vec![Vec::new(); plan.buffer_sizes.len()];
         for entry in &plan.handles {
@@ -369,6 +699,7 @@ impl Weights {
 }
 
 /// Synchronous readback of `len` bytes at `offset`, for upload verification.
+#[cfg(not(target_arch = "wasm32"))]
 fn read_back(gpu: &Gpu, src: &wgpu::Buffer, offset: u64, len: usize) -> Vec<u8> {
     let staging = gpu.buffer(
         "verify",

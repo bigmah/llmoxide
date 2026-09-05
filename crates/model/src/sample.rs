@@ -1,7 +1,12 @@
 //! Token sampling.
 //!
-//! Defaults come from the checkpoint's own `general.sampling.*` metadata
-//! (top-k 64, top-p 0.95, temperature 1.0) rather than from convention.
+//! Defaults come from the checkpoint's own `general.sampling.*` metadata when
+//! it has any. gemma4 does — top-k 64, top-p 0.95, temperature 1.0. Qwen3 and
+//! qwen35 write none at all, so falling back to a single hard-coded default
+//! means sampling a Qwen checkpoint with Gemma's numbers, which is not a
+//! neutral choice: temperature 1.0 against Qwen's published 0.7 is visibly
+//! worse on a small model, and it looks like the model being weak rather than
+//! the sampler being wrong. The fallback is therefore per family.
 
 #[derive(Debug, Clone)]
 pub struct Sampling {
@@ -28,8 +33,27 @@ impl Default for Sampling {
 }
 
 impl Sampling {
+    /// What the model's authors recommend, for checkpoints that ship no
+    /// `general.sampling.*` metadata of their own.
+    ///
+    /// Qwen's figures are the non-thinking ones from the Qwen3 model card
+    /// (0.7 / 20 / 0.8); its thinking mode wants 0.6 / 20 / 0.95, which is a
+    /// per-request choice rather than a per-checkpoint one and so is not
+    /// decided here.
+    fn family_default(arch: &str) -> Self {
+        match arch {
+            "qwen3" | "qwen35" => Self {
+                temperature: 0.7,
+                top_k: 20,
+                top_p: 0.8,
+                ..Self::default()
+            },
+            _ => Self::default(),
+        }
+    }
+
     pub fn from_gguf(g: &gguf::Gguf) -> Self {
-        let d = Self::default();
+        let d = Self::family_default(g.str("general.architecture").unwrap_or(""));
         Self {
             temperature: g.f32("general.sampling.temp").unwrap_or(d.temperature),
             top_k: g

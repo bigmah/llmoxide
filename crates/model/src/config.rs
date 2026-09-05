@@ -226,7 +226,9 @@ impl Config {
             .position(|&f| f >= NO_ROPE_SENTINEL)
             .unwrap_or(rope_factors.len().max(head_dim_global / 2));
 
-        let vocab = g.tensor("token_embd.weight")?.out_dim();
+        // The tensor *table* carries the shape; reading the payload for it
+        // would mean holding an 800 MB embedding just to learn `ne[1]`.
+        let vocab = g.info("token_embd.weight")?.out_dim();
 
         Ok(Self {
             n_layers,
