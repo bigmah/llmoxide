@@ -473,10 +473,42 @@ support needed — so a plain bucket or CDN is enough, and it lands in the Cache
 API so a repeat visit starts instantly. `?model=<url>` overrides it for
 testing.
 
-| checkpoint | download | load | decode |
+| checkpoint | delivery | load | decode |
 |---|---|---|---|
-| `qwen3-0.6b` | 0.64 GB | 3.0 s | 32–115 tok/s |
-| `gemma4-e4b-q4` | 5.34 GB (local file) | 5.0 s | 24–30 tok/s |
+| `qwen3-0.6b` | 0.64 GB download | 3.0 s | 32–115 tok/s |
+| `gemma4-e4b-q4` | 5.34 GB local file | 5.0 s | 24–30 tok/s |
+
+Verified in **Chrome 141 and Safari 26.6** on the M4 Pro. Safari matters
+architecturally, not just as a checkbox: it reports `maxBufferSize` of 2.15 GB
+against Chrome's 4.29, which is exactly why `Gpu::arena_buffer_bytes` takes the
+number from the device rather than a constant. Its WGSL compiler is also a
+third implementation after Naga and Tint, and it accepts the kernels unchanged.
+
+### One file, model included
+
+```sh
+scripts/build-web.sh --embed models/Qwen3-0.6B-Q8_0.gguf
+```
+
+Bakes the checkpoint into the page: **854 MB of HTML**, opens from `file://`,
+no server and no network. Ready in 2.1 s in Chrome and comparable in Safari.
+
+The base64 has to arrive in pieces. V8 caps a single string at 536,870,888
+characters and this model's base64 is 852,596,992 — so one blob is not slow,
+it is unbuildable. `build-web.sh` emits 48 MB chunks and the page drops each
+from the DOM as it decodes, since those strings are the largest objects on it.
+
+**Compressing the model buys nothing.** Quantized weights are close to random:
+measured on this Q8_0, `gzip -9` gets 4.5% off and `zstd -19` 4.8%, which does
+not pay for a decompressor in the page. What *is* worth doing is serving the
+page with `Content-Encoding: gzip`, which takes the embedded build from 854 MB
+to **638 MB over the wire** — the base64 tax refunded almost exactly, for one
+line of server config and no code.
+
+Even so, prefer two files for a website. The embedded build cannot show
+download progress (nothing runs until the whole document is parsed), re-parses
+854 MB on every visit, and puts the model outside the Cache API. It is for
+handing someone a single file that works offline.
 
 ```
 »  My favourite colour is teal. Just acknowledge that briefly.
@@ -631,6 +663,9 @@ web-sys into every native `cargo build`.
   since attention scratch scales with it.
 - Private mode covers this process, not the machine, and not the server: see
   "What this does not cover" and "Serving" above.
+- The embedded (`--embed`) build is an 854 MB HTML file with no download
+  progress and no separate caching of the model. It exists for offline
+  distribution; hosting wants the two-file form.
 - The browser build needs WebGPU and has no CPU fallback — wasm32's 4 GB
   address space cannot hold the weights at any useful quantization. It also
   cannot `mlock`, so it is the one entry point where "leaves nothing behind" is

@@ -124,6 +124,7 @@
 </footer>
 
 <script id="wasm-b64" type="text/plain">@WASM_BASE64@</script>
+<!--@MODEL@-->
 
 <script type="module">
 /* ---------------------------------------------------------------- glue -- */
@@ -196,9 +197,55 @@ function wasmBytes() {
   const lim = a.limits;
   status(`ready · max buffer ${fmt(lim.maxBufferSize)}`
        + ` · max storage binding ${fmt(lim.maxStorageBufferBindingSize)}`);
+
+  if (window.__MODEL_CHUNKS__) {
+    // Nothing to choose: the checkpoint is in this file.
+    $("get").hidden = true;
+    $("pick").hidden = true;
+    $("lead").textContent = `${window.__MODEL_NAME__} is built into this page.`;
+    $("sub").textContent = "Nothing is downloaded and nothing is uploaded.";
+    bar.style.display = "block";
+    const t0 = performance.now();
+    try {
+      const blob = await embeddedBlob((stage, done, total) => {
+        fill.style.width = (100 * done / total).toFixed(1) + "%";
+        cap.textContent = `${stage} — ${fmt(done)} / ${fmt(total)}`;
+      });
+      await open(blob, window.__MODEL_NAME__);
+    } catch (e) {
+      bar.style.display = "none";
+      status("could not decode the embedded model: " + e, true);
+    }
+  }
 })();
 
 /* -- getting the bytes --------------------------------------------------- */
+
+/** The checkpoint baked into this file, if `build-web.sh --embed` put one here.
+ *
+ *  Base64 in several pieces on purpose: V8 caps a string at 536,870,888 chars
+ *  and this model's base64 is 852,596,992, so one blob would be unbuildable —
+ *  not slow, impossible. Each piece is dropped from the DOM as it is decoded,
+ *  since the parser's copies are the largest strings on the page. */
+async function embeddedBlob(onProgress) {
+  const n = window.__MODEL_CHUNKS__ | 0;
+  if (!n) return null;
+  const total = window.__MODEL_BYTES__;
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (let i = 0; i < n; i++) {
+    const el = document.getElementById("m" + i);
+    const bin = atob(el.textContent);
+    for (let j = 0; j < bin.length; j++) out[at + j] = bin.charCodeAt(j);
+    at += bin.length;
+    el.remove();
+    onProgress("decoding embedded model", at, total);
+    // Yield so the bar actually paints; the decode is otherwise one long
+    // synchronous block with nothing to show for it.
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  return new Blob([out]);
+}
 
 /** The model as a Blob, from the HTTP cache when it is already there.
  *
