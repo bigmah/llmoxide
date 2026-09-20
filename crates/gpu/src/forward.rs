@@ -38,7 +38,9 @@ struct Attn {
     window: u32,
     max_vis: u32,
     scale: f32,
-    _pad: [u32; 3],
+    /// 1 when this batch attends forward within itself as well as back.
+    bidi: u32,
+    _pad: [u32; 2],
 }
 
 /// All F32 model tensors concatenated into one buffer, addressed by offset.
@@ -532,7 +534,15 @@ impl Slot {
                 let mut a = *a;
                 a.base_pos = base_pos;
                 let end = base_pos + n_tokens;
-                a.max_vis = if a.window == 0 { end } else { a.window.min(end) };
+                // Causally a query sees at most `window` positions. Attending
+                // forward as well widens that by the rest of the batch, so the
+                // scores stride has to grow to match or later rows overwrite
+                // earlier ones. The buffer behind it is sized for `n_ctx`.
+                a.max_vis = match (a.window, a.bidi) {
+                    (0, _) => end,
+                    (w, 0) => w.min(end),
+                    (w, _) => (w + n_tokens - 1).min(end),
+                };
                 buf.extend_from_slice(bytemuck::bytes_of(&a));
             }
         }
@@ -654,7 +664,12 @@ impl GpuModel {
 }
 
 impl GpuModel {
-    fn build_plan(&self, t: usize) -> anyhow::Result<CachedPlan> {
+    /// Build the dispatch plan for a batch of `t` positions.
+    ///
+    /// With `embeds`, the residual stream is assumed to be staged already —
+    /// the caller wrote the rows into `h` — so the token lookup and the input
+    /// scale are omitted, and attention runs bidirectionally within the batch.
+    fn build_plan_for(&self, t: usize, embeds: bool) -> anyhow::Result<CachedPlan> {
         let cfg = self.cfg.clone();
         let d = cfg.d_model;
         let max_groups = self.gpu.limits.max_compute_workgroups_per_dimension;
@@ -681,30 +696,41 @@ impl GpuModel {
         }
 
         // --- embeddings ----------------------------------------------------
-        let embd = self.weights.get("token_embd.weight")?;
-        let off = slot(
-            &mut u,
-            bytemuck::bytes_of(&MatvecParams {
-                w_base: embd.base_u32,
-                in_dim: d as u32,
-                out_dim: cfg.vocab as u32,
-                n_tokens: t as u32,
-            }),
-        );
-        plan.push(Dispatch {
-            pipeline: self.quant.embed_for(embd.ty)?.clone(),
-            bind: self.matvec_bind(embd.buffer, &self.zero, &self.h, &self.uniforms, &self.tokens),
-            offset: off,
-            groups: (16, t as u32, 1),
-        });
+        // Skipped entirely for embedding input: `h` already holds the rows,
+        // and they must not be scaled — they are in the residual stream's
+        // space, not the token table's.
+        if !embeds {
+            let embd = self.weights.get("token_embd.weight")?;
+            let off = slot(
+                &mut u,
+                bytemuck::bytes_of(&MatvecParams {
+                    w_base: embd.base_u32,
+                    in_dim: d as u32,
+                    out_dim: cfg.vocab as u32,
+                    n_tokens: t as u32,
+                }),
+            );
+            plan.push(Dispatch {
+                pipeline: self.quant.embed_for(embd.ty)?.clone(),
+                bind: self.matvec_bind(
+                    embd.buffer,
+                    &self.zero,
+                    &self.h,
+                    &self.uniforms,
+                    &self.tokens,
+                ),
+                offset: off,
+                groups: (16, t as u32, 1),
+            });
 
-        let off = op!(u, n_rows: t as u32, dim: d as u32, f0: cfg.embed_scale,);
-        plan.push(Dispatch {
-            pipeline: self.pipes.scale.clone(),
-            bind: self.ops_bind(&self.zero, &self.zero, &self.h),
-            offset: off,
-            groups: (cells((t * d) as u32, WG_OPS), 1, 1),
-        });
+            let off = op!(u, n_rows: t as u32, dim: d as u32, f0: cfg.embed_scale,);
+            plan.push(Dispatch {
+                pipeline: self.pipes.scale.clone(),
+                bind: self.ops_bind(&self.zero, &self.zero, &self.h),
+                offset: off,
+                groups: (cells((t * d) as u32, WG_OPS), 1, 1),
+            });
+        }
         checkpoints.push(("inp_scaled".into(), plan.len(), 0));
 
         // --- per-layer embeddings ------------------------------------------
@@ -967,6 +993,7 @@ impl GpuModel {
                 kv_dim,
                 window,
                 scale: cfg.attn_scale(il),
+                bidi: embeds as u32,
                 ..Default::default()
             }));
             let attn_bind = self.attn_bind(il);
@@ -1276,16 +1303,50 @@ impl GpuModel {
         // batches vary in length and rebuild.
         if t == 1 && self.debug_stop.is_none() {
             if self.decode.is_none() {
-                self.decode = Some(self.build_plan(1)?);
+                self.decode = Some(self.build_plan_for(1, false)?);
             }
             let plan = self.decode.take().expect("decode plan");
             let r = self.execute(&plan, t, base_pos);
             self.decode = Some(plan);
             r
         } else {
-            let plan = self.build_plan(t)?;
+            let plan = self.build_plan_for(t, false)?;
             self.execute(&plan, t, base_pos)
         }
+    }
+
+    /// Run precomputed embedding rows in place of token ids.
+    ///
+    /// `rows` is `n * d_model` floats, row-major, already projected into the
+    /// residual stream — what the vision tower emits for an image. The span
+    /// attends to itself in both directions, so it runs as one batch and is
+    /// never split.
+    ///
+    /// Native only, like [`execute`](Self::execute): it blocks on the logit
+    /// readback, which a browser's main thread may not do. The browser build
+    /// has no image path to call it from anyway — the vision tower needs an
+    /// image decoder and 300 MB of weights that a tab does not want.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn forward_embeds(&mut self, rows: &[f32]) -> anyhow::Result<Vec<f32>> {
+        let d = self.cfg.d_model;
+        anyhow::ensure!(
+            !rows.is_empty() && rows.len() % d == 0,
+            "embedding rows are not a multiple of d_model"
+        );
+        let t = rows.len() / d;
+
+        // Zeros as the token ids. Nothing reads them as tokens on this path —
+        // the lookup is gone — but the per-layer embedding table is still
+        // indexed by them, and row 0 is the padding row, which is exactly what
+        // llama.cpp feeds the per-layer path for an encoded image.
+        let ids = vec![0u32; t];
+        let base_pos = self.begin(&ids)?;
+        self.gpu
+            .queue
+            .write_buffer(&self.h, 0, bytemuck::cast_slice(rows));
+
+        let plan = self.build_plan_for(t, true)?;
+        self.execute(&plan, t, base_pos)
     }
 
     /// [`forward`](Self::forward) with the logit readback awaited rather than
@@ -1305,13 +1366,13 @@ impl GpuModel {
 
         if t == 1 {
             if self.decode.is_none() {
-                self.decode = Some(self.build_plan(1)?);
+                self.decode = Some(self.build_plan_for(1, false)?);
             }
             let plan = self.decode.take().expect("decode plan");
             self.dispatch(&plan, t, base_pos);
             self.decode = Some(plan);
         } else {
-            let plan = self.build_plan(t)?;
+            let plan = self.build_plan_for(t, false)?;
             self.dispatch(&plan, t, base_pos);
         }
 

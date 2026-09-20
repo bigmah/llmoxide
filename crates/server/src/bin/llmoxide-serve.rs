@@ -41,7 +41,18 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let mut args = std::env::args().skip(1);
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // `--mmproj <path>` anywhere, or LLMOXIDE_MMPROJ.
+    let mmproj = argv
+        .iter()
+        .position(|a| a == "--mmproj")
+        .and_then(|i| argv.get(i + 1).cloned())
+        .or_else(|| std::env::var("LLMOXIDE_MMPROJ").ok());
+    let mut args = argv
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .filter(|a| Some(a.as_str()) != mmproj.as_deref())
+        .cloned();
     let model = args
         .next()
         .unwrap_or_else(|| "gemma4-v2-Q4_K_M.gguf".to_string());
@@ -59,9 +70,9 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(256);
 
-    tracing::info!(model, n_ctx, batch, "loading");
+    tracing::info!(model, n_ctx, batch, mmproj, "loading");
     let t0 = std::time::Instant::now();
-    let opts = LoadOptions::new()
+    let mut opts = LoadOptions::new()
         .n_ctx(n_ctx)
         .max_batch(batch)
         .device(if std::env::var_os("LLMOXIDE_CPU").is_some() {
@@ -69,6 +80,12 @@ async fn main() -> anyhow::Result<()> {
         } else {
             DevicePref::Gpu
         });
+    // With a vision tower loaded, `content` arrays carrying `image_url` parts
+    // are encoded in place; without one they are an error rather than being
+    // silently answered as text.
+    if let Some(path) = &mmproj {
+        opts = opts.mmproj(path);
+    }
     let engine = Session::load(&model, &opts)?;
     // Only now: loading stages gigabytes of weights through the heap, and those
     // are not secret. Nothing has been served yet.

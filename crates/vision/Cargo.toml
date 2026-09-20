@@ -1,0 +1,22 @@
+[package]
+name = "llmoxide-vision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Gemma 4 vision tower: pixels to residual-stream rows"
+
+[dependencies]
+gguf.workspace = true
+model.workspace = true
+anyhow.workspace = true
+rayon.workspace = true
+bytemuck.workspace = true
+tracing.workspace = true
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+    "gif",
+    "bmp",
+] }

@@ -38,6 +38,39 @@ pub type Trace<'t> = dyn FnMut(&str, &[f32]) + 't;
 
 fn no_trace(_: &str, _: &[f32]) {}
 
+/// What a forward pass consumes at position `cache.len`.
+///
+/// The second variant is the multimodal seam. Rows arriving that way are
+/// already in the residual stream's space — the vision tower's projector put
+/// them there — which is why they skip the `sqrt(d_model)` input scale that
+/// token embeddings get. llama.cpp is explicit about this
+/// (`ubatch.token ? sqrtf(n_embd) : 1.0f`); applying it anyway multiplies an
+/// image by ~50 and the model answers about something else entirely.
+#[derive(Clone, Copy)]
+pub enum Input<'i> {
+    Tokens(&'i [u32]),
+    /// `n` rows of `d_model` floats, row-major.
+    Embeds { rows: &'i [f32], n: usize },
+}
+
+impl Input<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Tokens(t) => t.len(),
+            Self::Embeds { n, .. } => *n,
+        }
+    }
+
+    /// Whether this run attends bidirectionally within its own batch.
+    ///
+    /// An image is not a causal sequence: llama.cpp clears causal attention
+    /// for the span an encoder produced (`mtmd_decode_use_non_causal` is true
+    /// for gemma4v) and restores it afterwards. Tokens keep the usual mask.
+    fn bidirectional(&self) -> bool {
+        matches!(self, Self::Embeds { .. })
+    }
+}
+
 pub struct Cpu<'a> {
     pub cfg: &'a Config,
     pub w: &'a Weights<'a>,
@@ -100,7 +133,15 @@ impl<'a> Cpu<'a> {
     /// Run `tokens` starting at `cache.len` and return the final logits for the
     /// last token only — the rest are never needed for autoregressive decoding.
     pub fn forward(&mut self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
-        self.forward_traced(tokens, cache, &mut no_trace)
+        self.run(Input::Tokens(tokens), cache, &mut no_trace)
+    }
+
+    /// Run precomputed embedding rows in place of token ids.
+    ///
+    /// `rows` is `n * d_model` floats, row-major, already projected into the
+    /// residual stream — what the vision tower emits for an image.
+    pub fn forward_embeds(&mut self, rows: &[f32], n: usize, cache: &mut KvCache) -> Vec<f32> {
+        self.run(Input::Embeds { rows, n }, cache, &mut no_trace)
     }
 
     pub fn forward_traced(
@@ -109,8 +150,18 @@ impl<'a> Cpu<'a> {
         cache: &mut KvCache,
         trace: &mut Trace<'_>,
     ) -> Vec<f32> {
+        self.run(Input::Tokens(tokens), cache, trace)
+    }
+
+    pub fn run(
+        &mut self,
+        input: Input<'_>,
+        cache: &mut KvCache,
+        trace: &mut Trace<'_>,
+    ) -> Vec<f32> {
         let cfg = self.cfg;
-        let t = tokens.len();
+        let t = input.len();
+        let bidi = input.bidirectional();
         let d = cfg.d_model;
         let base_pos = cache.len;
         assert!(t > 0, "forward called with no tokens");
@@ -125,14 +176,24 @@ impl<'a> Cpu<'a> {
 
         // --- embeddings ----------------------------------------------------
         let h = &mut b.h[..t * d];
-        for (i, &tok) in tokens.iter().enumerate() {
-            self.w
-                .token_embd
-                .dequant_row_into(tok as usize, &mut h[i * d..(i + 1) * d]);
-        }
-        trace("embd", h);
-        for v in h.iter_mut() {
-            *v *= cfg.embed_scale;
+        match input {
+            Input::Tokens(tokens) => {
+                for (i, &tok) in tokens.iter().enumerate() {
+                    self.w
+                        .token_embd
+                        .dequant_row_into(tok as usize, &mut h[i * d..(i + 1) * d]);
+                }
+                trace("embd", h);
+                for v in h.iter_mut() {
+                    *v *= cfg.embed_scale;
+                }
+            }
+            Input::Embeds { rows, .. } => {
+                assert_eq!(rows.len(), t * d, "embedding rows are not t * d_model");
+                h.copy_from_slice(rows);
+                trace("embd", h);
+                // No `embed_scale` here — see `Input::Embeds`.
+            }
         }
         trace("inp_scaled", h);
 
@@ -144,9 +205,26 @@ impl<'a> Cpu<'a> {
         let span = e * cfg.n_layers;
         if let Some(ple) = &self.w.ple {
             let pl = &mut b.ple[..t * span];
-            for (i, &tok) in tokens.iter().enumerate() {
-                ple.token_embd
-                    .dequant_row_into(tok as usize, &mut pl[i * span..(i + 1) * span]);
+            match input {
+                Input::Tokens(tokens) => {
+                    for (i, &tok) in tokens.iter().enumerate() {
+                        ple.token_embd
+                            .dequant_row_into(tok as usize, &mut pl[i * span..(i + 1) * span]);
+                    }
+                }
+                // An image row has no token id to look up, so the lookup half
+                // of the blend falls back to row 0 — the padding token — for
+                // every position, and only the projected half carries the
+                // image. This is what llama.cpp does
+                // (`build_inp_per_layer`, the `!ubatch.token` branch); the
+                // projection below is where the image actually enters.
+                Input::Embeds { .. } => {
+                    ple.token_embd.dequant_row_into(0, &mut pl[..span]);
+                    for i in 1..t {
+                        let (head, rest) = pl.split_at_mut(i * span);
+                        rest[..span].copy_from_slice(&head[..span]);
+                    }
+                }
             }
             let lookup_scale = (e as f32).sqrt();
             for v in pl.iter_mut() {
@@ -267,7 +345,19 @@ impl<'a> Cpu<'a> {
             let attn = &mut b.attn[..t * q_dim];
             for i in 0..t {
                 let pos = base_pos + i;
-                let window = lcache.visible(pos);
+                // A bidirectional run also sees the rest of its own batch,
+                // which the store loop above has already written. Sliding
+                // layers keep their span, now measured in both directions.
+                let window = if bidi {
+                    let causal = lcache.visible(pos);
+                    let last = match lc.window {
+                        Some(w) => (base_pos + t - 1).min(pos + w - 1),
+                        None => base_pos + t - 1,
+                    };
+                    *causal.start()..=last
+                } else {
+                    lcache.visible(pos)
+                };
                 let n_vis = window.end() - window.start() + 1;
                 b.scores.resize(n_vis, 0.0);
 

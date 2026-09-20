@@ -83,11 +83,12 @@ pub trait Backend: Send {
     /// [`Segment::Tokens`]: crate::session::Segment::Tokens
     /// [`Segment::Embeds`]: crate::session::Segment::Embeds
     ///
-    /// No architecture implements this yet, so the default returns
-    /// [`Error::Unsupported`]. It is declared now because the alternative —
-    /// discovering later that `forward` should have taken a sum type — is a
-    /// breaking change to every implementation and every caller, where adding
-    /// an override is neither.
+    /// gemma4 implements this; qwen35 does not, and its default returns
+    /// [`Error::Unsupported`].
+    ///
+    /// Implementations must treat the rows as a span that attends to itself
+    /// in **both** directions — an image is not a causal sequence — and must
+    /// not apply the input scale that token embeddings get.
     fn forward_embeds(&mut self, _rows: &[f32]) -> Result<Vec<f32>> {
         Err(Error::Unsupported("embedding input"))
     }
@@ -113,16 +114,26 @@ pub struct LoadOptions {
     pub n_ctx: usize,
     /// Prefill chunk size. Larger is faster and costs scratch memory
     /// proportional to `max_batch * d_model`.
+    ///
+    /// It is also the ceiling on one image: an encoded image prefills as a
+    /// single bidirectional batch, so `max_batch` must be at least as large
+    /// as the tower's token budget for that image.
     pub max_batch: usize,
     pub device: DevicePref,
+    /// The `mmproj-*.gguf` carrying the vision tower, when image input is
+    /// wanted. The text checkpoint is complete without it.
+    pub mmproj: Option<std::path::PathBuf>,
 }
 
 impl Default for LoadOptions {
     fn default() -> Self {
         Self {
             n_ctx: 16384,
+            // 256 tokens is also the largest image the vision tower will
+            // produce, so one fits in a batch by construction.
             max_batch: 256,
             device: DevicePref::Gpu,
+            mmproj: None,
         }
     }
 }
@@ -144,6 +155,12 @@ impl LoadOptions {
 
     pub fn device(mut self, d: DevicePref) -> Self {
         self.device = d;
+        self
+    }
+
+    /// Load a vision tower alongside the text model, enabling image input.
+    pub fn mmproj(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.mmproj = Some(path.into());
         self
     }
 }
@@ -210,6 +227,9 @@ fn gemma4_gpu(g: Gguf, opts: &LoadOptions) -> Result<Box<dyn Backend>> {
 impl Backend for Gemma4Gpu {
     fn forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
         Ok(self.inner.forward(tokens)?)
+    }
+    fn forward_embeds(&mut self, rows: &[f32]) -> Result<Vec<f32>> {
+        Ok(self.inner.forward_embeds(rows)?)
     }
     fn info(&self) -> &Info {
         &self.info
@@ -300,6 +320,13 @@ fn gemma4_cpu(g: Gguf, opts: &LoadOptions) -> Result<Box<dyn Backend>> {
 impl Backend for Gemma4Cpu {
     fn forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
         Ok(self.cpu.forward(tokens, &mut self.cache))
+    }
+    fn forward_embeds(&mut self, rows: &[f32]) -> Result<Vec<f32>> {
+        let d = self.info.d_model;
+        if rows.is_empty() || rows.len() % d != 0 {
+            return Err(Error::Unsupported("embedding rows are not a multiple of d_model"));
+        }
+        Ok(self.cpu.forward_embeds(rows, rows.len() / d, &mut self.cache))
     }
     fn info(&self) -> &Info {
         &self.info

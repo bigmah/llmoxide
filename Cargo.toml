@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/gguf", "crates/tokenizer", "crates/model", "crates/gpu", "crates/chat", "crates/secret", "crates/hub", "crates/server", "llmoxide"]
+members = ["crates/gguf", "crates/tokenizer", "crates/model", "crates/gpu", "crates/chat", "crates/vision", "crates/secret", "crates/hub", "crates/server", "llmoxide"]
 # Built for wasm32 only (`scripts/build-web.sh`), never for the host, so it is
 # not a workspace member — `cargo build` would pull wasm-bindgen into every
 # native build for nothing.
@@ -22,6 +22,7 @@ tokenizer = { package = "llmoxide-tokenizer", path = "crates/tokenizer", version
 model = { package = "llmoxide-model", path = "crates/model", version = "0.1.0" }
 gpu = { package = "llmoxide-gpu", path = "crates/gpu", version = "0.1.0" }
 chat = { package = "llmoxide-chat", path = "crates/chat", version = "0.1.0" }
+vision = { package = "llmoxide-vision", path = "crates/vision", version = "0.1.0" }
 secret = { package = "llmoxide-secret", path = "crates/secret", version = "0.1.0" }
 hub = { package = "llmoxide-hub", path = "crates/hub", version = "0.1.0" }
 llmoxide = { path = "llmoxide", version = "0.1.0" }

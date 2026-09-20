@@ -58,6 +58,8 @@
 
 pub mod backend;
 mod error;
+#[cfg(feature = "vision")]
+pub mod image_input;
 pub mod session;
 pub mod store;
 
@@ -71,6 +73,9 @@ pub use session::{
 // `Sampling` through these rather than adding `llmoxide-chat` and
 // `llmoxide-model` themselves and risking a version skew.
 pub use chat;
+#[cfg(feature = "vision")]
+pub use vision;
+
 pub use gguf;
 pub use model;
 pub use tokenizer;

@@ -13,8 +13,8 @@ pub enum Error {
     UnsupportedArch(String),
 
     /// The loaded backend has no implementation for this input or operation —
-    /// notably [`Backend::forward_embeds`], which no architecture implements
-    /// yet. See [`crate::backend`].
+    /// notably [`Backend::forward_embeds`], which only gemma4 implements.
+    /// See [`crate::backend`].
     ///
     /// [`Backend::forward_embeds`]: crate::backend::Backend::forward_embeds
     #[error("{0} is not supported by this backend")]
@@ -32,6 +32,10 @@ pub enum Error {
     /// No GPU adapter, or the checkpoint does not fit on the one present.
     #[error("no usable GPU: {0}")]
     NoDevice(String),
+
+    /// An image could not be read, decoded, or encoded.
+    #[error("image input: {0}")]
+    Image(String),
 
     #[error(transparent)]
     Gguf(#[from] gguf::Error),

@@ -39,6 +39,12 @@ pub struct Special {
     /// visible answer instead. Read off the embedded template rather than
     /// assumed, since the two checkpoints disagree.
     pub closes_empty_thought: bool,
+    /// The pair that brackets an encoded image, when the vocabulary has them.
+    ///
+    /// `None` for a checkpoint with no image tokens, which is what makes an
+    /// image-carrying request fail with a clear message rather than encoding
+    /// one into a stream the model has never seen bracketed that way.
+    pub image: Option<(u32, u32)>,
 }
 
 impl Special {
@@ -66,6 +72,7 @@ impl Special {
             response_close: get("<tool_response|>")?,
             quote: get(dsl::QUOTE)?,
             closes_empty_thought: template.is_none_or(|t| t.contains(SUPPRESSOR)),
+            image: t.id_of("<|image>").zip(t.id_of("<image|>")),
         })
     }
 }
@@ -160,10 +167,41 @@ impl Message {
     }
 }
 
+/// A run of prompt that occupies consecutive positions.
+///
+/// A text-only prompt is one [`Piece::Tokens`]. Images split it, because the
+/// positions they occupy carry rows rather than ids.
+#[derive(Debug, Clone)]
+pub enum Piece {
+    Tokens(Vec<u32>),
+    Embeds { rows: Vec<f32>, n: usize },
+}
+
+/// Turns an image content part into residual-stream rows.
+///
+/// A trait rather than a direct call so this crate stays free of the vision
+/// tower — prompt assembly should not pull in an image decoder, and the
+/// text-only paths must keep building with no encoder at all.
+pub trait ImageEncoder {
+    /// `part` is the content part verbatim, e.g.
+    /// `{"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}`.
+    fn encode(&self, part: &Value) -> anyhow::Result<(Vec<f32>, usize)>;
+}
+
+/// Refuses images. What the text-only entry points build with.
+pub struct NoImages;
+
+impl ImageEncoder for NoImages {
+    fn encode(&self, _: &Value) -> anyhow::Result<(Vec<f32>, usize)> {
+        anyhow::bail!("this prompt was built without an image encoder")
+    }
+}
+
 pub struct PromptBuilder<'a> {
     tok: &'a Tokenizer,
     sp: &'a Special,
     ids: Vec<u32>,
+    pieces: Vec<Piece>,
 }
 
 impl<'a> PromptBuilder<'a> {
@@ -172,6 +210,7 @@ impl<'a> PromptBuilder<'a> {
             tok,
             sp,
             ids: vec![sp.bos],
+            pieces: Vec::new(),
         }
     }
 
@@ -209,9 +248,45 @@ impl<'a> PromptBuilder<'a> {
         self.push(self.sp.turn_close).text("\n")
     }
 
+    /// Emit `<|image>` … rows … `<image|>`, closing the current token run
+    /// around the span the encoder produced.
+    fn image(&mut self, rows: Vec<f32>, n: usize) -> anyhow::Result<&mut Self> {
+        let (open, close) = self
+            .sp
+            .image
+            .ok_or_else(|| anyhow::anyhow!("this checkpoint's vocabulary has no image tokens"))?;
+        self.push(open);
+        let ids = std::mem::take(&mut self.ids);
+        self.pieces.push(Piece::Tokens(ids));
+        self.pieces.push(Piece::Embeds { rows, n });
+        Ok(self.push(close))
+    }
+
     pub fn finish(self) -> Vec<u32> {
+        debug_assert!(
+            self.pieces.is_empty(),
+            "finish() would drop encoded images; use finish_pieces()"
+        );
         self.ids
     }
+
+    pub fn finish_pieces(mut self) -> Vec<Piece> {
+        if !self.ids.is_empty() {
+            self.pieces.push(Piece::Tokens(std::mem::take(&mut self.ids)));
+        }
+        self.pieces
+    }
+}
+
+/// Whether a message carries an image part, and so needs the piece-wise path.
+pub fn has_image(m: &Message) -> bool {
+    matches!(&m.content, Some(Value::Array(parts))
+        if parts.iter().any(|p| {
+            matches!(
+                p.get("type").and_then(Value::as_str),
+                Some("image") | Some("image_url")
+            )
+        }))
 }
 
 /// Build the full prompt for a request.
@@ -231,6 +306,32 @@ pub fn build_prompt(
     tools: &[Tool],
     enable_thinking: bool,
 ) -> Vec<u32> {
+    // `None` keeps the historical behaviour exactly: image parts are dropped
+    // by `Message::text`, and the result is one token run.
+    let pieces = build_prompt_mm(tok, sp, messages, tools, enable_thinking, None)
+        .expect("text-only prompt assembly cannot fail");
+    pieces
+        .into_iter()
+        .flat_map(|p| match p {
+            Piece::Tokens(ids) => ids,
+            Piece::Embeds { .. } => unreachable!("no encoder was supplied"),
+        })
+        .collect()
+}
+
+/// The same, with images encoded in place.
+///
+/// Each image part becomes `<|image>`, a [`Piece::Embeds`] span, `<image|>`.
+/// Everything else is byte-identical to [`build_prompt`], which is why the
+/// text path routes through here too.
+pub fn build_prompt_mm(
+    tok: &Tokenizer,
+    sp: &Special,
+    messages: &[Message],
+    tools: &[Tool],
+    enable_thinking: bool,
+    images: Option<&dyn ImageEncoder>,
+) -> anyhow::Result<Vec<Piece>> {
     let mut b = PromptBuilder::new(tok, sp);
 
     let leading_system = messages
@@ -323,11 +424,35 @@ pub fn build_prompt(
             continue;
         }
 
-        let content = m.text();
-        if m.role == "assistant" {
-            b.text(strip_thinking(&content).trim());
-        } else {
-            b.text(content.trim());
+        match images.filter(|_| has_image(m) && m.role != "assistant") {
+            // Parts in order, so text before and after an image lands on the
+            // correct side of it.
+            Some(enc) => {
+                let Some(Value::Array(parts)) = &m.content else {
+                    unreachable!("has_image implies an array")
+                };
+                for part in parts {
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("image") | Some("image_url") => {
+                            let (rows, n) = enc.encode(part)?;
+                            b.image(rows, n)?;
+                        }
+                        _ => {
+                            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                b.text(t.trim());
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                let content = m.text();
+                if m.role == "assistant" {
+                    b.text(strip_thinking(&content).trim());
+                } else {
+                    b.text(content.trim());
+                }
+            }
         }
         b.close_turn();
     }
@@ -336,7 +461,7 @@ pub fn build_prompt(
     if !enable_thinking && sp.closes_empty_thought {
         b.push(sp.channel_open).text("thought\n").push(sp.channel_close);
     }
-    b.finish()
+    Ok(b.finish_pieces())
 }
 
 /// Drop any `thought` channel from replayed assistant text.

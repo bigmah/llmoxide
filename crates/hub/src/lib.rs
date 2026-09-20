@@ -56,6 +56,14 @@ pub const ALIASES: &[(&str, &str)] = &[
         "gemma4-e4b-q4",
         "https://huggingface.co/lmstudio-community/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf",
     ),
+    // The vision tower for either E4B build above. Kept BF16 rather than the
+    // Q8_0 beside it: it is a fifth of the text model's size, it runs once per
+    // image instead of once per token, and the encoder is the one place where
+    // quantization error lands on every downstream token at once.
+    (
+        "gemma4-e4b-mmproj",
+        "https://huggingface.co/lmstudio-community/gemma-4-E4B-it-GGUF/resolve/main/mmproj-gemma-4-E4B-it-BF16.gguf",
+    ),
     // Small enough to serve from a website. Q8_0 rather than Q4_K_M because at
     // 0.6B the quantization error is what you notice first, and 0.64 GB is
     // already well inside any sane budget.

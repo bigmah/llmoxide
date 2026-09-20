@@ -240,21 +240,49 @@ impl ChatFormat {
         })
     }
 
-    /// Assemble a prompt. Text-only today: one [`Segment::Tokens`].
+    /// Assemble a prompt, encoding any images in place.
     ///
-    /// An image-carrying [`Message`] would encode here, emitting
-    /// [`Segment::Embeds`] between the text runs.
+    /// With `images` supplied, an image-carrying [`Message`] emits a
+    /// [`Segment::Embeds`] between the text runs. Without one, an image is an
+    /// error rather than something quietly dropped — answering about an image
+    /// the model never saw is the worst available outcome.
     pub fn build(
         &self,
         tok: &Tokenizer,
         messages: &[Message],
         tools: &[Tool],
         thinking: bool,
-    ) -> Prompt {
-        Prompt::tokens(match self {
-            Self::Gemma4(sp) => chat::build_prompt(tok, sp, messages, tools, thinking),
-            Self::Qwen35(sp) => chat::qwen::build_prompt(tok, sp, messages, tools, thinking),
-        })
+        images: Option<&dyn chat::ImageEncoder>,
+    ) -> Result<Prompt> {
+        let carries_image = messages.iter().any(chat::has_image);
+        match self {
+            Self::Gemma4(sp) => {
+                if carries_image && images.is_none() {
+                    return Err(Error::Image(
+                        "this request carries an image but no vision tower is loaded;                          pass LoadOptions::mmproj(\"mmproj-….gguf\")"
+                            .into(),
+                    ));
+                }
+                let pieces = chat::build_prompt_mm(tok, sp, messages, tools, thinking, images)?;
+                Ok(Prompt(
+                    pieces
+                        .into_iter()
+                        .map(|p| match p {
+                            chat::Piece::Tokens(ids) => Segment::Tokens(ids),
+                            chat::Piece::Embeds { rows, n } => Segment::Embeds { rows, n },
+                        })
+                        .collect(),
+                ))
+            }
+            Self::Qwen35(sp) => {
+                if carries_image {
+                    return Err(Error::Unsupported("image input on qwen35"));
+                }
+                Ok(Prompt::tokens(chat::qwen::build_prompt(
+                    tok, sp, messages, tools, thinking,
+                )))
+            }
+        }
     }
 
     fn parse(&self, tok: &Tokenizer, generated: &[u32], thinking: bool) -> chat::Completion {
@@ -289,6 +317,10 @@ pub struct Session {
     cache_comparable: bool,
     /// What the checkpoint's own metadata recommends.
     pub default_sampling: Sampling,
+    /// The vision tower, when one was loaded. Image input needs it; text does
+    /// not, and a text-only process should not pay a gigabyte for it.
+    #[cfg(feature = "vision")]
+    vision: Option<vision::Vision>,
 }
 
 impl Session {
@@ -316,7 +348,16 @@ impl Session {
         let default_sampling = Sampling::from_gguf(&g);
         let format = ChatFormat::detect(arch, &tok, g.str("tokenizer.chat_template").ok())?;
         let backend = backend::load(g, opts)?;
-        Ok(Self::new(backend, tok, format, default_sampling))
+        let session = Self::new(backend, tok, format, default_sampling);
+        match &opts.mmproj {
+            None => Ok(session),
+            #[cfg(feature = "vision")]
+            Some(path) => Ok(session.with_vision(vision::Vision::open(path)?)),
+            #[cfg(not(feature = "vision"))]
+            Some(_) => Err(Error::Unsupported(
+                "image input: this build has no `vision` feature",
+            )),
+        }
     }
 
     /// Wrap a backend built some other way — the seam the browser build enters
@@ -334,6 +375,27 @@ impl Session {
             cached: TokenStore::new(),
             cache_comparable: true,
             default_sampling,
+            #[cfg(feature = "vision")]
+            vision: None,
+        }
+    }
+
+    /// Attach a vision tower to a session built with [`Session::new`].
+    #[cfg(feature = "vision")]
+    pub fn with_vision(mut self, v: vision::Vision) -> Self {
+        self.vision = Some(v);
+        self
+    }
+
+    /// Whether this session can accept image input.
+    pub fn supports_images(&self) -> bool {
+        #[cfg(feature = "vision")]
+        {
+            self.vision.is_some()
+        }
+        #[cfg(not(feature = "vision"))]
+        {
+            false
         }
     }
 
@@ -448,9 +510,27 @@ impl Session {
     }
 
     fn run(&mut self, req: Request, sink: &mut dyn Sink) -> Result<Outcome> {
-        let prompt = self
-            .format
-            .build(&self.tok, &req.messages, &req.tools, req.enable_thinking);
+        // Scoped so the immutable borrow of `self.vision` ends before the
+        // prefill below needs `&mut self`.
+        let prompt = {
+            #[cfg(feature = "vision")]
+            let encoder = self.vision.as_ref().map(|v| crate::image_input::Encoder {
+                vision: v,
+                max_tokens: self.backend.info().max_batch,
+            });
+            #[cfg(feature = "vision")]
+            let images = encoder.as_ref().map(|e| e as &dyn chat::ImageEncoder);
+            #[cfg(not(feature = "vision"))]
+            let images: Option<&dyn chat::ImageEncoder> = None;
+
+            self.format.build(
+                &self.tok,
+                &req.messages,
+                &req.tools,
+                req.enable_thinking,
+                images,
+            )?
+        };
 
         let n_ctx = self.context_len();
         if prompt.len() + 8 >= n_ctx {
@@ -571,10 +651,19 @@ impl Session {
                         logits = self.backend.forward(chunk)?;
                     }
                 }
-                Segment::Embeds { rows, .. } => {
-                    for chunk in rows.chunks(batch * d_model) {
-                        logits = self.backend.forward_embeds(chunk)?;
+                Segment::Embeds { rows, n } => {
+                    // Deliberately not chunked. The span attends to itself in
+                    // both directions, so splitting it would leave the first
+                    // half unable to see the second and silently change what
+                    // the model is looking at. An image that does not fit is
+                    // an error the caller can act on.
+                    if *n > batch {
+                        return Err(Error::Unsupported(
+                            "embedding span longer than max_batch; raise LoadOptions::max_batch",
+                        ));
                     }
+                    debug_assert_eq!(rows.len(), n * d_model);
+                    logits = self.backend.forward_embeds(rows)?;
                 }
             }
             pos += len;

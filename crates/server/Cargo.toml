@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 # `private` is what `llmoxide-private` is: locked, self-zeroing conversation
 # memory. Consumers that only want inference leave it off.
-llmoxide = { workspace = true, features = ["gpu", "private"] }
+llmoxide = { workspace = true, features = ["gpu", "private", "vision"] }
 chat.workspace = true
 model.workspace = true
 tokenizer.workspace = true

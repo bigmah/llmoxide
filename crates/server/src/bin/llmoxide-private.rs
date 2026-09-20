@@ -83,8 +83,17 @@ fn main() -> anyhow::Result<()> {
     secret::harden();
     unsafe { signal(SIGINT, on_sigint as *const () as usize) };
 
-    let model = std::env::args()
-        .nth(1)
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mmproj = argv
+        .iter()
+        .position(|a| a == "--mmproj")
+        .and_then(|i| argv.get(i + 1).cloned())
+        .or_else(|| std::env::var("LLMOXIDE_MMPROJ").ok());
+    let model = argv
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .find(|a| Some(a.as_str()) != mmproj.as_deref())
+        .cloned()
         .unwrap_or_else(|| "models/gemma4-v2-Q4_K_M.gguf".to_string());
     let n_ctx: usize = env_usize("LLMOXIDE_CTX", 16384);
     let batch: usize = env_usize("LLMOXIDE_BATCH", 256);
@@ -98,7 +107,7 @@ fn main() -> anyhow::Result<()> {
     let engine_thread = std::thread::Builder::new()
         .name("llmoxide-engine".into())
         .spawn(move || {
-            let opts = LoadOptions::new()
+            let mut opts = LoadOptions::new()
                 .n_ctx(n_ctx)
                 .max_batch(batch)
                 .device(if std::env::var_os("LLMOXIDE_CPU").is_some() {
@@ -106,6 +115,9 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     DevicePref::Gpu
                 });
+            if let Some(path) = &mmproj {
+                opts = opts.mmproj(path);
+            }
             let mut engine = match Session::load(&model, &opts) {
                 Ok(e) => {
                     let _ = tx_ready.send(Ok(()));
@@ -182,9 +194,34 @@ fn main() -> anyhow::Result<()> {
             _ => {}
         }
 
+        // `/image <path> [question]` — the path is the first word, the rest is
+        // the question. Nothing is read from disk here: the engine thread
+        // encodes it, so the pixels never cross back into this thread's heap.
+        let content = if let Some(rest) = input.strip_prefix("/image ") {
+            let rest = rest.trim();
+            let (path, question) = match rest.split_once(char::is_whitespace) {
+                Some((p, q)) => (p, q.trim()),
+                None => (rest, ""),
+            };
+            if path.is_empty() {
+                println!("usage: /image <path> [question]");
+                continue;
+            }
+            let mut parts = vec![serde_json::json!({
+                "type": "image_url",
+                "image_url": {"url": path},
+            })];
+            if !question.is_empty() {
+                parts.push(serde_json::json!({"type": "text", "text": question}));
+            }
+            serde_json::Value::Array(parts)
+        } else {
+            serde_json::Value::String(input.to_string())
+        };
+
         history.push(Message {
             role: "user".into(),
-            content: Some(serde_json::Value::String(input.to_string())),
+            content: Some(content),
             ..Default::default()
         });
 
@@ -283,5 +320,6 @@ fn banner(n_ctx: usize) {
 fn help() {
     println!("  /wipe   overwrite the conversation, device buffers and scrollback");
     println!("  /new    same, but stay in the session");
+    println!("  /image <path> [question]   ask about an image (needs --mmproj)");
     println!("  /quit   wipe and exit  (ctrl-D also works, ctrl-C stops a reply)");
 }

@@ -29,7 +29,8 @@ struct Attn {
     window: u32,       // 0 = global (no wrap, unbounded history)
     max_vis: u32,      // scores stride per (token, head)
     scale: f32,
-    _pad: vec3<u32>,
+    bidi: u32,         // 1 = this batch also attends forward within itself
+    _pad: vec2<u32>,
 };
 
 @group(0) @binding(0) var<storage, read> q: array<vec4<f32>>;
@@ -52,6 +53,16 @@ fn first_visible(pos: u32) -> u32 {
     if (at.window == 0u) { return 0u; }
     if (pos + 1u <= at.window) { return 0u; }
     return pos + 1u - at.window;
+}
+
+// Newest position visible from `pos`. Causally that is `pos` itself; an
+// encoded image is not a causal sequence, so its batch also sees the rest of
+// itself, still bounded by the sliding window.
+fn last_visible(pos: u32) -> u32 {
+    if (at.bidi == 0u) { return pos; }
+    let end = at.base_pos + at.n_tokens - 1u;
+    if (at.window == 0u) { return end; }
+    return min(end, pos + at.window - 1u);
 }
 
 fn cache_slot(pos: u32) -> u32 {
@@ -83,7 +94,7 @@ fn scores_pass(
 
     let pos = at.base_pos + token;
     let lo = first_visible(pos);
-    let n_vis = pos - lo + 1u;
+    let n_vis = last_visible(pos) - lo + 1u;
     let hd4 = at.head_dim / 4u;
 
     let q_base4 = (token * at.n_heads * at.head_dim + head * at.head_dim) / 4u;
@@ -122,7 +133,7 @@ fn softmax_pass(
 
     let tid = lid.x;
     let pos = at.base_pos + token;
-    let n_vis = pos - first_visible(pos) + 1u;
+    let n_vis = last_visible(pos) - first_visible(pos) + 1u;
     let s_base = (token * at.n_heads + head) * at.max_vis;
 
     // f32::MIN, spelled by its bit pattern. The decimal form Rust prints for
@@ -196,7 +207,7 @@ fn weighted_v(
     let tid = lid.x;
     let pos = at.base_pos + token;
     let lo = first_visible(pos);
-    let n_vis = pos - lo + 1u;
+    let n_vis = last_visible(pos) - lo + 1u;
     let hd4 = at.head_dim / 4u;
 
     let kv_head = kv_head_of(head);

@@ -4,6 +4,11 @@ target/
 
 models/
 
+# Scratch image used when checking the vision tower by hand. llama.cpp's own
+# `tools/mtmd/test-1.jpeg` is a good one — it is a newspaper front page, so a
+# correct encoder reads text out of it rather than guessing a scene.
+test-image.*
+
 # Build output of scripts/build-web.sh; the shell it is generated from is
 # tracked, the 1.1 MB page with a wasm module baked into it is not.
 web/llmoxide.html

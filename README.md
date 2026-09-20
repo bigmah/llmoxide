@@ -3,8 +3,14 @@
 A local inference CLI that leaves nothing behind — GGUF loader, k-quant
 decoders, tokenizers, and wgpu compute kernels written from scratch in Rust with
 no ML dependencies. Three architectures: gemma4, qwen35's hybrid delta-net
-stack, and plain dense Qwen3. The same code also compiles to wasm and runs in a
-browser on WebGPU — see [In a browser](#in-a-browser).
+stack, and plain dense Qwen3. gemma4 also takes **image input**, through E4B's
+vision tower — see [Images](#images). The same code also compiles to wasm and
+runs in a browser on WebGPU — see [In a browser](#in-a-browser).
+
+The one thing not written from scratch is image *decoding*: the `vision`
+feature pulls in `image` for PNG/JPEG, which is a container format problem
+rather than an inference one. It is off by default, so a text-only build's
+dependency graph is unchanged.
 
 The point of it is `llmoxide-private`: a session that writes nothing to disk,
 keeps the conversation in locked memory, and can overwrite every trace of it on
@@ -41,6 +47,7 @@ against, not as a fallback.
 | `gemma4` | `gemma4-v2-Q4_K_M.gguf` | gemma4, 12B, 48 layers | 7.38 GB | `0b9506ca…` |
 | `gemma4-e4b` | `gemma-4-E4B-it-Q8_0.gguf` | gemma4, E4B, 42 layers | 8.03 GB | `34be82b1…` |
 | `gemma4-e4b-q4` | `gemma-4-E4B-it-Q4_K_M.gguf` | gemma4, E4B, 42 layers | 5.34 GB | `d35a3aa7…` |
+| `gemma4-e4b-mmproj` | `mmproj-gemma-4-E4B-it-BF16.gguf` | gemma4v vision tower | 0.99 GB | `bdfc4935…` |
 | `qwen35` | `Qwen3.8-27B-OBLITERATED-Q6_K.gguf` | qwen35, 27B hybrid, 64 layers | 22.43 GB | `3535d4a1…` |
 | `qwen3-0.6b` | `Qwen3-0.6B-Q8_0.gguf` | qwen3, 0.6B dense, 28 layers | 0.64 GB | `e150ed54…` |
 | `qwen3-0.6b-q4` | `Qwen3-0.6B-Q4_K_M.gguf` | qwen3, 0.6B dense, 28 layers | 0.40 GB | `ac2d9771…` |
@@ -158,8 +165,13 @@ the heap copies prompt text passes through in between.
 ```
   /wipe   overwrite the conversation, device buffers and scrollback
   /new    same, but stay in the session
+  /image <path> [question]   ask about an image (needs --mmproj)
   /quit   wipe and exit  (ctrl-D also works, ctrl-C stops a reply)
 ```
+
+With `--mmproj models/mmproj-gemma-4-E4B-it-BF16.gguf`, `/image` takes a local
+path and the engine thread reads it, so the pixels never cross into the REPL's
+own heap. See [Images](#images).
 
 What it does that the other entry points do not:
 
@@ -228,6 +240,7 @@ Everything is checked against llama.cpp rather than asserted:
 | gemma4 CPU forward | **byte-identical** greedy output to `llama-completion --temp 0` |
 | gemma4 GPU kernels | every matvec within ~1e-7 of the CPU dequant-dot, on real weights |
 | gemma4 GPU forward | all 773 intermediate tensors match the CPU path across 48 layers (~1e-6) |
+| gemma4v vision tower | written against llama.cpp's `clip_graph_gemma4v`; the GPU text path reproduces the CPU path's answer for an image byte for byte, and a transpose-sensitive test image places both squares correctly |
 | E4B CPU forward | 674 tensors across all 42 layers traced against `llama-eval-callback`; KV-sharing boundary matches exactly (llama.cpp emits `Kcur` for layers 0–23 only) |
 | E4B GPU forward | **471/471** checkpoints match the CPU path across 42 layers (~1e-6), per-layer embeddings included |
 | E4B chat format | `reasoning_content` / `content` split matches `llama-server --jinja` on the same request, thinking on and off |
@@ -452,6 +465,7 @@ yet; the default returns `Error::Unsupported`.
 | `gpu` | default | the wgpu backends. Off, the crate still reads checkpoints and runs the CPU reference paths, and does not build wgpu at all (9 fewer crates). |
 | `hub` | | resumable, hash-verified checkpoint downloads. |
 | `private` | | locked, self-zeroing conversation memory. |
+| `vision` | | image input: the gemma4v tower plus `image` for decoding. Off by default — a text-only caller should not pay for it, and the browser build cannot use it. |
 
 **`private` is off by default, and a plain dependency gets none of the privacy
 machinery** — `llmoxide-secret` does not appear in the tree at all, not even
@@ -485,6 +499,87 @@ The CPU reference backends leak their `Gguf`, config and weights to `'static`
 rather than threading a self-referential borrow through three types, so a
 process gets one CPU model for its lifetime. The GPU backends upload and drop
 the mapping, and have no such limit.
+
+## Images
+
+E4B ships a vision tower in a separate `mmproj` file. Point the session at one
+and `image_url` content parts are encoded in place:
+
+```bash
+./target/release/llmoxide-fetch gemma4-e4b-q4
+./target/release/llmoxide-fetch gemma4-e4b-mmproj
+
+cargo run --release --example image --features vision,gpu -- \
+    models/gemma-4-E4B-it-Q4_K_M.gguf \
+    models/mmproj-gemma-4-E4B-it-BF16.gguf \
+    photo.jpg "What is in this image?"
+```
+
+For checking the tower by hand, llama.cpp's own `tools/mtmd/test-1.jpeg` is
+the useful input: it is a newspaper front page, so a correct encoder reads the
+headline and the date out of it rather than describing a plausible scene.
+
+```rust
+let mut s = Session::load(model, &LoadOptions::new().mmproj(mmproj))?;
+s.complete(Request::new(vec![Message {
+    role: "user".into(),
+    content: Some(serde_json::json!([
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,…"}},
+        {"type": "text", "text": "what is in this image?"},
+    ])),
+    ..Default::default()
+}]))?;
+```
+
+The server takes the same shape (`llmoxide-serve model.gguf --mmproj
+mmproj.gguf`), which is what makes an ordinary OpenAI client work unchanged.
+`data:` URLs and local paths are read; **remote URLs are deliberately not
+fetched**, because a server that dereferences a URL a client hands it is an
+SSRF hole.
+
+An image with no tower loaded is an error rather than a text-only answer —
+quietly answering *about* an image the model never saw is the worst available
+outcome.
+
+### What the tower is
+
+Not the SigLIP the name suggests. Every block is the text stack's block with
+the sequence axis swapped for patches — RMSNorm, per-head Q/K norms, a gated
+GELU feed-forward, post-norms on both residual branches — and the parts that
+are genuinely its own are where the care went:
+
+- **Two positional mechanisms, not one.** A learned `(x, y)` pair of lookup
+  tables is added to the patch embedding, *and* a 2-D rotation runs inside
+  attention, the low half of each head by column and the high half by row
+  (`theta = 100`, against a text model's 1 000 000). Getting the axes backwards
+  survives every content question and fails only on spatial ones, so the test
+  for it is an image whose two coloured squares sit on the anti-diagonal —
+  the diagonal is transpose-symmetric and would pass either way.
+- **Attention is bidirectional**, and so is the text model's over the span the
+  tower produced: llama.cpp clears causal attention for an encoded image and
+  restores it afterwards. That span therefore has to prefill as a *single*
+  batch, which is why an image is capped at 256 positions and why the prefill
+  loop refuses to chunk it rather than silently splitting it in half.
+- **The softmax scale is 1.0**, not `1/sqrt(head_dim)` — the same folded
+  temperature the text stack uses.
+- **The linears clamp.** Each weight may carry calibration ranges beside it
+  (`.input_min`, `.output_max`, …); the input is clamped before the matmul and
+  the result after. Ignoring them is fine on most images and wrong on the ones
+  that saturate, which is the worst failure shape there is.
+
+Two things about how an image enters the text stack are easy to get backwards,
+and both are load-bearing:
+
+- The rows are **not** scaled by `sqrt(d_model)`. Token embeddings are; these
+  are already in the residual stream's space, and scaling them anyway
+  multiplies the image by ~50.
+- The per-layer embedding table has no token id to look up for an image
+  position, so it falls back to **row 0** — the padding row — for every one of
+  them, and only the projected half carries the image.
+
+Resolution is native rather than square: the image is resampled so both sides
+are a multiple of 48 and the area lands inside a token budget, which is why a
+640×488 photo becomes a 13×10 grid of 130 tokens rather than a fixed 256.
 
 ## Serving (afterthought, and not private)
 
@@ -756,6 +851,7 @@ crates/tokenizer  llmoxide-tokenizer  gemma4 BPE (262144 tokens) + qwen35 byte-l
 crates/model      llmoxide-model      architecture configs, CPU reference forward passes, sampling
 crates/gpu        llmoxide-gpu        wgpu device, weight arena, WGSL kernels, both GPU forwards
 crates/chat       llmoxide-chat       prompt assembly: gemma4's tool DSL + qwen's ChatML/XML
+crates/vision     llmoxide-vision     gemma4v: image preprocessing and the vision tower
 crates/secret     llmoxide-secret     locked, self-zeroing memory; the zeroing global allocator
 crates/hub        llmoxide-hub        resumable, verified Hugging Face downloads
 crates/server     llmoxide-server     the private REPL, plus the axum OpenAI-compatible API
@@ -793,8 +889,18 @@ blocking trait.
   needs a KV cache that can rewind on a rejected draft, which is the same gap as
   the entry above.
 - Single request at a time, one GPU context; no batching across clients.
-- Text only — the vocabularies carry image/audio/video tokens and E4B ships an
-  `mmproj` encoder, but no multimodal path is implemented.
+- The vision tower runs on the CPU even when the text model is on the GPU, so
+  an image costs ~6 s on top of the answer. It is 16 blocks of 768 and one
+  image is ~180 G multiply-adds; llama.cpp does the same work on Metal in
+  ~0.2 s. Porting it is the obvious next thing — the kernels it needs
+  (bidirectional attention over patches, a 2-D rotation, average pooling) are
+  close to ones `crates/gpu` already has.
+- Audio input is not implemented, though the same `mmproj` file carries a
+  conformer encoder for it (`a.blk.*`, 12 blocks of 1024) and the vocabulary
+  has the `<|audio>` pair to bracket it.
+- One image per request is what has been exercised; several should work and
+  are not tested. Each is capped at 256 positions so it prefills as one
+  bidirectional batch.
 - The context is capped at `LLMOXIDE_CTX`, well below the models' 262144,
   since attention scratch scales with it.
 - Private mode covers this process, not the machine, and not the server: see

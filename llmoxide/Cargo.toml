@@ -18,17 +18,26 @@ hub = ["dep:hub"]
 # wherever `mlock` is refused. `llmoxide-server` turns it on for the private
 # REPL, which is what it exists for.
 private = ["dep:secret", "model/private"]
+# Image input: the gemma4 vision tower plus an image decoder. Off by default —
+# a text-only caller should not pay for `image` and its transitive crates, and
+# the browser build cannot use it.
+vision = ["dep:vision"]
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
 
 [dependencies]
 gguf.workspace = true
 tokenizer.workspace = true
 model.workspace = true
 chat.workspace = true
+serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 gpu = { workspace = true, optional = true }
+vision = { workspace = true, optional = true }
 hub = { workspace = true, optional = true }
 secret = { workspace = true, optional = true }
 
@@ -40,6 +49,10 @@ required-features = ["gpu"]
 [[test]]
 name = "session"
 required-features = ["gpu"]
+
+[[example]]
+name = "image"
+required-features = ["vision", "gpu"]
 
 [[example]]
 name = "generate"
