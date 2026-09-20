@@ -55,6 +55,10 @@ name = "image"
 required-features = ["vision", "gpu"]
 
 [[example]]
+name = "vision_check"
+required-features = ["vision", "gpu"]
+
+[[example]]
 name = "generate"
 required-features = ["gpu"]
 

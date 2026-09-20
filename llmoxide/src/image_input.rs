@@ -89,9 +89,48 @@ pub fn part_bytes(part: &Value) -> Result<Vec<u8>> {
     std::fs::read(path).map_err(|e| Error::Image(format!("{path}: {e}")))
 }
 
+/// A loaded vision tower, on whichever device the text model is on.
+///
+/// The CPU one is the reference the GPU one is checked against, and stays
+/// reachable through `DevicePref::Cpu` for exactly that reason.
+pub enum Tower {
+    Cpu(vision::Vision),
+    #[cfg(feature = "gpu")]
+    Gpu(Box<gpu::vision::VisionGpu>),
+}
+
+impl Tower {
+    pub fn cfg(&self) -> &model::vision::Config {
+        match self {
+            Self::Cpu(v) => &v.cfg,
+            #[cfg(feature = "gpu")]
+            Self::Gpu(v) => &v.cfg,
+        }
+    }
+
+    /// Encode a prepared image. Returns the rows, how many positions they
+    /// occupy, and the pooled grid.
+    pub fn encode(&self, img: &vision::Planar) -> anyhow::Result<(Vec<f32>, usize, (usize, usize))> {
+        match self {
+            Self::Cpu(v) => {
+                let out = v.encode(img)?;
+                Ok((out.rows, out.n, out.grid))
+            }
+            #[cfg(feature = "gpu")]
+            Self::Gpu(v) => {
+                let c = v.cfg.clone();
+                let (nx, ny) = img.grid(c.patch_size);
+                let (ox, oy) = (nx / c.n_merge, ny / c.n_merge);
+                let rows = v.encode(&img.data, img.w, img.h)?;
+                Ok((rows, ox * oy, (ox, oy)))
+            }
+        }
+    }
+}
+
 /// Adapts the vision tower to the prompt builder's `ImageEncoder`.
 pub struct Encoder<'a> {
-    pub vision: &'a vision::Vision,
+    pub vision: &'a Tower,
     /// Positions one image may occupy. The span attends to itself in both
     /// directions, so it has to prefill in a single batch.
     pub max_tokens: usize,
@@ -100,21 +139,22 @@ pub struct Encoder<'a> {
 impl chat::ImageEncoder for Encoder<'_> {
     fn encode(&self, part: &Value) -> anyhow::Result<(Vec<f32>, usize)> {
         let bytes = part_bytes(part)?;
-        let prepared = vision::prepare(&bytes, &self.vision.cfg)?;
-        let out = self.vision.encode(&prepared)?;
+        let prepared = vision::prepare(&bytes, self.vision.cfg())?;
+        let t0 = std::time::Instant::now();
+        let (rows, n, grid) = self.vision.encode(&prepared)?;
         anyhow::ensure!(
-            out.n <= self.max_tokens,
-            "image encodes to {} positions but max_batch is {}; \
+            n <= self.max_tokens,
+            "image encodes to {n} positions but max_batch is {}; \
              raise LoadOptions::max_batch or send a smaller image",
-            out.n,
             self.max_tokens
         );
         tracing::info!(
-            tokens = out.n,
-            grid = format!("{}x{}", out.grid.0, out.grid.1),
+            tokens = n,
+            grid = format!("{}x{}", grid.0, grid.1),
+            elapsed = ?t0.elapsed(),
             "encoded image"
         );
-        Ok((out.rows, out.n))
+        Ok((rows, n))
     }
 }
 
@@ -127,4 +167,33 @@ mod tests {
         assert_eq!(super::base64("aGVs\nbG8=").unwrap(), b"hello");
         assert!(super::base64("not base64!").is_none());
     }
+}
+
+/// Load the tower onto the same device the text model asked for.
+///
+/// Falls back to the CPU tower with a warning rather than failing the load if
+/// no GPU is available: a slow image is better than no session.
+pub fn open_tower(
+    path: &std::path::Path,
+    device: crate::DevicePref,
+) -> Result<Tower> {
+    let g = gguf::Gguf::open(path)?;
+    let cfg = model::vision::Config::from_gguf(&g).map_err(Error::Other)?;
+    tracing::info!("{}", cfg.summary());
+
+    #[cfg(feature = "gpu")]
+    if matches!(device, crate::DevicePref::Gpu) {
+        match gpu::Gpu::blocking_new() {
+            Ok(dev) => {
+                let v = gpu::vision::VisionGpu::load(dev, g, cfg).map_err(Error::Other)?;
+                return Ok(Tower::Gpu(Box::new(v)));
+            }
+            Err(e) => tracing::warn!(%e, "no GPU for the vision tower; using the CPU one"),
+        }
+        // `g` was moved into the GPU attempt only on the success path.
+        let g = gguf::Gguf::open(path)?;
+        return Ok(Tower::Cpu(vision::Vision::new(g)?));
+    }
+    let _ = device;
+    Ok(Tower::Cpu(vision::Vision::new(g)?))
 }

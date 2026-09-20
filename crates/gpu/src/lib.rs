@@ -2,6 +2,8 @@
 
 pub mod arena;
 pub mod forward;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod vision;
 /// The hybrid delta-net stack, and plain dense Qwen3 with its delta-net layers
 /// and query gate switched off — see `model::qwen35::Config`. The 27B has no
 /// route into a browser tab, but Qwen3 0.6B is 0.6 GB and very much does.

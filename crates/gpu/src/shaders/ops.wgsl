@@ -90,8 +90,9 @@ fn rms_norm(
     }
 }
 
-// out = gelu(a) * b, the gated FFN activation. ggml's GEGLU uses the tanh
-// approximation, not the erf form.
+// out = gelu(out) * b, the gated FFN activation — in place on the gate, so
+// bind the gate as `out` and the up-projection as `b`. ggml's GEGLU uses the
+// tanh approximation, not the erf form.
 @compute @workgroup_size(WG)
 fn geglu(
     @builtin(global_invocation_id) gid: vec3<u32>,
@@ -363,6 +364,108 @@ fn copy_rows(
         let r = i / op.dim;
         let c = i - r * op.dim;
         out[i] = a[op.u1 + r * op.u0 + c];
+        i = i + stride;
+    }
+}
+
+// 2-D rotary for the vision tower. Unlike `rope` above, the position is not
+// the row index: each head's low half rotates by the patch's *column* and its
+// high half by the patch's *row*, so one head carries both axes. NeoX pairing
+// applies within each half independently — element i pairs with i + dim/4, not
+// with i + dim/2.
+//   n_rows = n_patches * n_heads, dim = head_dim
+//   u0 = heads per patch, u1 = patches per grid row, f0 = rope base
+@compute @workgroup_size(WG)
+fn rope_2d(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    var row = wg.x;
+    loop {
+    if (row >= op.n_rows) { break; }
+    let half = op.dim / 2u;
+    let quarter = half / 2u;
+    let base = row * op.dim;
+    // `patch` is a WGSL reserved keyword, hence `pidx`.
+    let pidx = row / op.u0;
+    let col = f32(pidx % op.u1);
+    let py = f32(pidx / op.u1);
+    // Each half is its own NeoX block of `half` dimensions.
+    let theta_scale = pow(op.f0, -2.0 / f32(half));
+
+    var i = lid.x;
+    loop {
+        if (i >= quarter) { break; }
+        let step = pow(theta_scale, f32(i));
+
+        let ac = col * step;
+        let cc = cos(ac);
+        let sc = sin(ac);
+        let x0 = out[base + i];
+        let x1 = out[base + i + quarter];
+        out[base + i] = x0 * cc - x1 * sc;
+        out[base + i + quarter] = x0 * sc + x1 * cc;
+
+        let ar = py * step;
+        let cr = cos(ar);
+        let sr = sin(ar);
+        let y0 = out[base + half + i];
+        let y1 = out[base + half + i + quarter];
+        out[base + half + i] = y0 * cr - y1 * sr;
+        out[base + half + i + quarter] = y0 * sr + y1 * cr;
+
+        i = i + WG;
+    }
+    row = row + nwg.x;
+    }
+}
+
+// out = clamp(out, f0, f1) — the calibration ranges gemma4v's linears carry
+// beside their weights. Dispatched only where a range actually exists.
+@compute @workgroup_size(WG)
+fn clamp_range(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let n = op.n_rows * op.dim;
+    let stride = nwg.x * WG;
+    var i = gid.x;
+    loop {
+        if (i >= n) { break; }
+        out[i] = clamp(out[i], op.f0, op.f1);
+        i = i + stride;
+    }
+}
+
+// Average-pool an [u1 wide] patch grid by u0 on each side, then scale by f0 —
+// the pooler's `sqrt(n_embd)` folded in.
+//   a = [nx*ny, dim] patches, out = [ox*oy, dim] tokens
+//   n_rows = ox*oy, dim = width, u0 = kernel, u1 = nx
+@compute @workgroup_size(WG)
+fn pool_avg(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let n = op.n_rows * op.dim;
+    let stride = nwg.x * WG;
+    let k = op.u0;
+    let nx = op.u1;
+    let ox = nx / k;
+    var i = gid.x;
+    loop {
+        if (i >= n) { break; }
+        let r = i / op.dim;
+        let c = i % op.dim;
+        let bx = r % ox;
+        let by = r / ox;
+        var acc = 0.0;
+        for (var ky = 0u; ky < k; ky = ky + 1u) {
+            for (var kx = 0u; kx < k; kx = kx + 1u) {
+                acc = acc + a[((by * k + ky) * nx + bx * k + kx) * op.dim + c];
+            }
+        }
+        out[i] = acc / f32(k * k) * op.f0;
         i = i + stride;
     }
 }

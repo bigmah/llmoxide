@@ -4,6 +4,7 @@ pub mod cpu;
 pub mod ops;
 pub mod qwen35;
 pub mod sample;
+pub mod vision;
 pub mod weights;
 
 pub use cache::KvCache;

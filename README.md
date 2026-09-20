@@ -240,7 +240,8 @@ Everything is checked against llama.cpp rather than asserted:
 | gemma4 CPU forward | **byte-identical** greedy output to `llama-completion --temp 0` |
 | gemma4 GPU kernels | every matvec within ~1e-7 of the CPU dequant-dot, on real weights |
 | gemma4 GPU forward | all 773 intermediate tensors match the CPU path across 48 layers (~1e-6) |
-| gemma4v vision tower | written against llama.cpp's `clip_graph_gemma4v`; the GPU text path reproduces the CPU path's answer for an image byte for byte, and a transpose-sensitive test image places both squares correctly |
+| gemma4v vision tower (CPU) | written against llama.cpp's `clip_graph_gemma4v`; a transpose-sensitive test image places both squares correctly, and the model reads the headline and date off a newspaper photo |
+| gemma4v vision tower (GPU) | all 332 800 output values within 1.7e-5 of the CPU reference on a real image, at 441, 1 170 and 2 304 patches (`vision_check`) |
 | E4B CPU forward | 674 tensors across all 42 layers traced against `llama-eval-callback`; KV-sharing boundary matches exactly (llama.cpp emits `Kcur` for layers 0–23 only) |
 | E4B GPU forward | **471/471** checkpoints match the CPU path across 42 layers (~1e-6), per-layer embeddings included |
 | E4B chat format | `reasoning_content` / `content` split matches `llama-server --jinja` on the same request, thinking on and off |
@@ -262,6 +263,8 @@ Tools that reproduce this:
 ./target/release/bisect_qwen35  <model> [ids]                  # per-checkpoint GPU vs CPU
 ./target/release/validate_qwen35 <model> <refs.json> <ids>     # vs llama-eval-callback
 ./target/release/upload_check   <model>                        # weight arena readback
+cargo run --release --example vision_check --features vision,gpu -- \
+    models/mmproj-gemma-4-E4B-it-BF16.gguf photo.jpg           # vision tower GPU vs CPU
 ./target/release/wipe_check     <model> [prompt]               # wipe leaves no residue
 ./target/release/tok            <model> [text]                 # ids, vs llama-tokenize
 ./target/release/prompt         <model> < messages.json        # chat ids, vs a jinja render
@@ -581,6 +584,34 @@ Resolution is native rather than square: the image is resampled so both sides
 are a multiple of 48 and the area lands inside a token budget, which is why a
 640×488 photo becomes a 13×10 grid of 130 tokens rather than a fixed 256.
 
+### Where it runs
+
+The tower follows the text model onto the GPU, and falls back to the CPU one
+with a warning rather than failing the load if there is no adapter. Both are
+kept: the CPU tower is written directly against llama.cpp's graph and is the
+oracle the GPU one is checked against — the same relationship `model::cpu`
+has to `crates/gpu`.
+
+| 1170 patches (a 640×488 photo) | |
+|---|---|
+| CPU tower | 6.0 s |
+| GPU tower | 0.87 s |
+| llama.cpp (Metal) | ~0.2 s |
+
+**Attention reuses `attn.wgsl` unchanged.** A tower has no KV cache, but a
+cache with `window = 0` read at `base_pos = 0` *is* a flat
+`[n_patches, kv_dim]` buffer, and the `bidi` flag that image spans already
+needed in the text model opens the mask both ways — so K and V bind straight
+into the cache slots and the mask comes out right. The patch convolution is
+likewise a matmul once the image is lowered to `[n_patches, 16×16×3]`, which
+is what the 4-D filter already looks like in memory; the kernel never consults
+the GGUF's declared shape, only the `MatvecParams` handed to it.
+
+Scratch is allocated per image rather than reserved for the largest one: the
+scores buffer alone is `n² × n_heads` floats — 255 MB at the token ceiling and
+a fifth of that for a typical photo — and this runs once per image, so the
+allocation is not on any hot path.
+
 ## Serving (afterthought, and not private)
 
 ```sh
@@ -849,9 +880,9 @@ llmoxide/         llmoxide            the facade: Session, Backend, and the CLI
 crates/gguf       llmoxide-gguf       GGUF v3 reader, mmap'd; Q4_K / Q6_K / Q8_0 decoders
 crates/tokenizer  llmoxide-tokenizer  gemma4 BPE (262144 tokens) + qwen35 byte-level BPE (248320)
 crates/model      llmoxide-model      architecture configs, CPU reference forward passes, sampling
-crates/gpu        llmoxide-gpu        wgpu device, weight arena, WGSL kernels, both GPU forwards
+crates/gpu        llmoxide-gpu        wgpu device, weight arena, WGSL kernels, GPU forwards + vision tower
 crates/chat       llmoxide-chat       prompt assembly: gemma4's tool DSL + qwen's ChatML/XML
-crates/vision     llmoxide-vision     gemma4v: image preprocessing and the vision tower
+crates/vision     llmoxide-vision     gemma4v: image preprocessing and the CPU reference tower
 crates/secret     llmoxide-secret     locked, self-zeroing memory; the zeroing global allocator
 crates/hub        llmoxide-hub        resumable, verified Hugging Face downloads
 crates/server     llmoxide-server     the private REPL, plus the axum OpenAI-compatible API
@@ -889,12 +920,13 @@ blocking trait.
   needs a KV cache that can rewind on a rejected draft, which is the same gap as
   the entry above.
 - Single request at a time, one GPU context; no batching across clients.
-- The vision tower runs on the CPU even when the text model is on the GPU, so
-  an image costs ~6 s on top of the answer. It is 16 blocks of 768 and one
-  image is ~180 G multiply-adds; llama.cpp does the same work on Metal in
-  ~0.2 s. Porting it is the obvious next thing — the kernels it needs
-  (bidirectional attention over patches, a 2-D rotation, average pooling) are
-  close to ones `crates/gpu` already has.
+- The vision tower is ~3-4x off llama.cpp on Metal (0.87 s against ~0.2 s for
+  a 1 170-patch image). Time grows faster than the patch count — 441 patches
+  take 0.25 s, 2 304 take 2.33 s — because attention over patches is O(n^2)
+  and `weighted_v` is shaped for the text model's 256- and 512-wide heads: at
+  the tower's 64-wide ones it leaves three quarters of each workgroup idle.
+  Fixing that means a second variant of a kernel the text path depends on,
+  which is why it has not been done yet.
 - Audio input is not implemented, though the same `mmproj` file carries a
   conformer encoder for it (`a.blk.*`, 12 blocks of 1024) and the vocabulary
   has the `<|audio>` pair to bracket it.

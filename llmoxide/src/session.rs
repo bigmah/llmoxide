@@ -320,7 +320,7 @@ pub struct Session {
     /// The vision tower, when one was loaded. Image input needs it; text does
     /// not, and a text-only process should not pay a gigabyte for it.
     #[cfg(feature = "vision")]
-    vision: Option<vision::Vision>,
+    vision: Option<crate::image_input::Tower>,
 }
 
 impl Session {
@@ -352,7 +352,10 @@ impl Session {
         match &opts.mmproj {
             None => Ok(session),
             #[cfg(feature = "vision")]
-            Some(path) => Ok(session.with_vision(vision::Vision::open(path)?)),
+            Some(path) => Ok(session.with_vision(crate::image_input::open_tower(
+                path,
+                opts.device,
+            )?)),
             #[cfg(not(feature = "vision"))]
             Some(_) => Err(Error::Unsupported(
                 "image input: this build has no `vision` feature",
@@ -382,7 +385,7 @@ impl Session {
 
     /// Attach a vision tower to a session built with [`Session::new`].
     #[cfg(feature = "vision")]
-    pub fn with_vision(mut self, v: vision::Vision) -> Self {
+    pub fn with_vision(mut self, v: crate::image_input::Tower) -> Self {
         self.vision = Some(v);
         self
     }
