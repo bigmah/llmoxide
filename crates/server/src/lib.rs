@@ -3,8 +3,9 @@
 //! Scoped to what an agentic coding client actually uses: `/v1/models`,
 //! `/v1/chat/completions` with SSE streaming, and tool calling. Requests are
 //! serialized onto one engine thread.
-
-pub mod engine;
+//!
+//! The inference itself lives in `llmoxide`; this crate is only the HTTP
+//! surface over it.
 
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chat::{ApiToolCall, FunctionCall, Message, Tool};
-use engine::{Engine, Event, FinishReason, GenerateRequest};
+use llmoxide::{Event, Request, Session};
 use model::sample::Sampling;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -27,7 +28,7 @@ use tokio::sync::{oneshot, Mutex};
 enum Job {
     /// A queued generation: the request plus where to stream events.
     Generate {
-        req: GenerateRequest,
+        req: Request,
         tx: mpsc::Sender<Event>,
         ready: oneshot::Sender<()>,
     },
@@ -48,7 +49,7 @@ pub struct AppState {
 
 impl AppState {
     /// Move the engine onto its own thread and return a handle to it.
-    pub fn spawn(mut engine: Engine, model_id: String) -> Self {
+    pub fn spawn(mut engine: Session, model_id: String) -> Self {
         let (jobs, mut rx) = tokio::sync::mpsc::unbounded_channel::<Job>();
         let context_len = engine.context_len();
         let default_sampling = Arc::new(engine.default_sampling.clone());
@@ -60,7 +61,7 @@ impl AppState {
                     match job {
                         Job::Generate { req, tx, ready } => {
                             let _ = ready.send(());
-                            engine.generate(req, &tx);
+                            engine.generate_to(req, &tx);
                         }
                         Job::Wipe(done) => {
                             engine.wipe();
@@ -212,7 +213,7 @@ fn api_tool_calls(calls: &[chat::ToolCall]) -> Vec<ApiToolCall> {
         .collect()
 }
 
-fn build_job(s: &AppState, req: ChatRequest) -> (GenerateRequest, bool) {
+fn build_job(s: &AppState, req: ChatRequest) -> (Request, bool) {
     let d = s.default_sampling.as_ref();
     let sampling = Sampling {
         temperature: req.temperature.unwrap_or(d.temperature),
@@ -223,10 +224,10 @@ fn build_job(s: &AppState, req: ChatRequest) -> (GenerateRequest, bool) {
     };
     let stream = req.stream;
     (
-        GenerateRequest {
+        Request {
             messages: req.messages,
             tools: req.tools,
-            sampling,
+            sampling: Some(sampling),
             max_tokens: req.max_tokens.unwrap_or(2048),
             // Thinking costs tokens and opencode does not surface it, so it is
             // off unless asked for.
@@ -237,7 +238,7 @@ fn build_job(s: &AppState, req: ChatRequest) -> (GenerateRequest, bool) {
     )
 }
 
-async fn submit(s: &AppState, req: GenerateRequest) -> mpsc::Receiver<Event> {
+async fn submit(s: &AppState, req: Request) -> mpsc::Receiver<Event> {
     let (tx, rx) = mpsc::channel();
     let (ready, started) = oneshot::channel();
     let _ = s.jobs.send(Job::Generate { req, tx, ready });
@@ -287,7 +288,7 @@ async fn chat_completions(
     }
 }
 
-async fn complete(s: AppState, job: GenerateRequest) -> Result<Value, ApiError> {
+async fn complete(s: AppState, job: Request) -> Result<Value, ApiError> {
     let _guard = s.slot.clone().lock_owned().await;
     let rx = submit(&s, job).await;
 
@@ -359,7 +360,7 @@ async fn complete(s: AppState, job: GenerateRequest) -> Result<Value, ApiError> 
     }))
 }
 
-async fn stream_completion(s: AppState, job: GenerateRequest) -> impl IntoResponse {
+async fn stream_completion(s: AppState, job: Request) -> impl IntoResponse {
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<SseEvent>();
     let model_id = s.model_id.clone();
 

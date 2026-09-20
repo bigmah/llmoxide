@@ -208,18 +208,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
-name = "chat"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gguf",
- "model",
- "serde",
- "serde_json",
- "tokenizer",
-]
-
-[[package]]
 name = "codespan-reporting"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -527,18 +515,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gguf"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "half",
- "memmap2",
- "rayon",
- "thiserror 2.0.19",
-]
-
-[[package]]
 name = "gl_generator"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -568,23 +544,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c4ee00b289aba7a9e5306d57c2d05499b2e5dc427f84ac708bd2c090212cf3e"
 dependencies = [
  "gl_generator",
-]
-
-[[package]]
-name = "gpu"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "futures-channel",
- "gguf",
- "half",
- "model",
- "naga",
- "pollster",
- "tokenizer",
- "tracing",
- "wgpu",
 ]
 
 [[package]]
@@ -725,16 +684,6 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
-
-[[package]]
-name = "hub"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gguf",
- "sha2",
- "ureq",
-]
 
 [[package]]
 name = "hybrid-array"
@@ -891,10 +840,109 @@ name = "llmoxide"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "gguf",
- "gpu",
- "model",
- "tokenizer",
+ "llmoxide-chat",
+ "llmoxide-gguf",
+ "llmoxide-gpu",
+ "llmoxide-hub",
+ "llmoxide-model",
+ "llmoxide-secret",
+ "llmoxide-tokenizer",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
+name = "llmoxide-chat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "llmoxide-gguf",
+ "llmoxide-model",
+ "llmoxide-tokenizer",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "llmoxide-gguf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "half",
+ "memmap2",
+ "rayon",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "llmoxide-gpu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "futures-channel",
+ "half",
+ "llmoxide-gguf",
+ "llmoxide-model",
+ "llmoxide-tokenizer",
+ "naga",
+ "pollster",
+ "tracing",
+ "wgpu",
+]
+
+[[package]]
+name = "llmoxide-hub"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "llmoxide-gguf",
+ "sha2",
+ "ureq",
+]
+
+[[package]]
+name = "llmoxide-model"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "llmoxide-gguf",
+ "llmoxide-secret",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "llmoxide-secret"
+version = "0.1.0"
+
+[[package]]
+name = "llmoxide-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures",
+ "llmoxide",
+ "llmoxide-chat",
+ "llmoxide-model",
+ "llmoxide-secret",
+ "llmoxide-tokenizer",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "llmoxide-tokenizer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "llmoxide-gguf",
 ]
 
 [[package]]
@@ -991,18 +1039,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "model"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gguf",
- "rayon",
- "secret",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1319,10 +1355,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
-name = "secret"
-version = "0.1.0"
-
-[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1386,26 +1418,6 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
-]
-
-[[package]]
-name = "server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chat",
- "futures",
- "gguf",
- "gpu",
- "model",
- "secret",
- "serde",
- "serde_json",
- "tokenizer",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1586,14 +1598,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "tokenizer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gguf",
 ]
 
 [[package]]

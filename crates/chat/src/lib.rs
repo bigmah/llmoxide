@@ -123,6 +123,27 @@ pub struct FunctionDef {
 }
 
 impl Message {
+    /// A plain-text message in `role`.
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: Some(Value::String(content.into())),
+            ..Default::default()
+        }
+    }
+
+    pub fn system(content: impl Into<String>) -> Self {
+        Self::new("system", content)
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::new("user", content)
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::new("assistant", content)
+    }
+
     /// Flatten `content`, which may be a string or an array of content parts.
     pub fn text(&self) -> String {
         match &self.content {

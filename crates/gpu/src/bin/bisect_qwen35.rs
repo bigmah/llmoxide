@@ -4,6 +4,9 @@
 //! checkpoint that disagrees identifies the faulty kernel. Same idea as
 //! `bisect` for gemma4.
 
+// The library of this package is `llmoxide_gpu`; keep the short name in the code.
+use llmoxide_gpu as gpu;
+
 use model::qwen35::{Config, Cpu, State, Weights};
 
 fn main() -> anyhow::Result<()> {

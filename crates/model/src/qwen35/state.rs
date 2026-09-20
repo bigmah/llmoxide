@@ -83,8 +83,8 @@ impl State {
         for l in &mut self.layers {
             match l {
                 LayerState::Linear { conv, s } => {
-                    secret::zero_slice(conv);
-                    secret::zero_slice(s);
+                    crate::zero_slice(conv);
+                    crate::zero_slice(s);
                 }
                 LayerState::Attn(c) => c.wipe(),
             }

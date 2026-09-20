@@ -1,12 +1,15 @@
 [package]
-name = "chat"
+name = "llmoxide-chat"
+description = "Prompt assembly and completion parsing: gemma4's tool DSL, qwen's ChatML/XML."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
 
 [dependencies]
-gguf = { path = "../gguf" }
-tokenizer = { path = "../tokenizer" }
-model = { path = "../model" }
+gguf.workspace = true
+tokenizer.workspace = true
+model.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

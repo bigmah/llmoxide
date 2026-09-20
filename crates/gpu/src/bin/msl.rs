@@ -4,6 +4,9 @@
 //! lands in registers or in `thread` scratch memory, which the WGSL does not
 //! say. Reading the generated MSL is how that gets settled.
 
+// The library of this package is `llmoxide_gpu`; keep the short name in the code.
+use llmoxide_gpu as gpu;
+
 fn main() -> anyhow::Result<()> {
     let src = gpu::quant_shader_source(!std::env::args().any(|a| a == "--barrier"));
     let module = naga::front::wgsl::parse_str(&src).map_err(|e| anyhow::anyhow!("{e:?}"))?;

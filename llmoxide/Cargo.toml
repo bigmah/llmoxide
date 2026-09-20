@@ -1,11 +1,50 @@
 [package]
 name = "llmoxide"
+description = "Local LLM inference from scratch in Rust: GGUF, k-quants, wgpu kernels. The crate to depend on."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[features]
+default = ["gpu"]
+# The wgpu backends. Off, `llmoxide` still loads checkpoints and runs the CPU
+# reference paths, without pulling wgpu and its ~100 transitive crates.
+gpu = ["dep:gpu"]
+# Resumable, hash-verified checkpoint downloads (`ureq` + `sha2`).
+hub = ["dep:hub"]
+# Hold the resident conversation in locked, self-zeroing memory. Off by
+# default: an embedding caller wants inference, and this warns on stderr
+# wherever `mlock` is refused. `llmoxide-server` turns it on for the private
+# REPL, which is what it exists for.
+private = ["dep:secret", "model/private"]
 
 [dependencies]
-gguf = { path = "../crates/gguf" }
-tokenizer = { path = "../crates/tokenizer" }
-model = { path = "../crates/model" }
-gpu = { path = "../crates/gpu" }
+gguf.workspace = true
+tokenizer.workspace = true
+model.workspace = true
+chat.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+gpu = { workspace = true, optional = true }
+hub = { workspace = true, optional = true }
+secret = { workspace = true, optional = true }
+
+[[bin]]
+name = "llmoxide"
+path = "src/main.rs"
+required-features = ["gpu"]
+
+[[test]]
+name = "session"
+required-features = ["gpu"]
+
+[[example]]
+name = "generate"
+required-features = ["gpu"]
+
+[[example]]
+name = "chat_stream"
+required-features = ["gpu"]

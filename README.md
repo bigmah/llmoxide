@@ -11,6 +11,9 @@ keeps the conversation in locked memory, and can overwrite every trace of it on
 demand. There is an OpenAI-compatible server too, but it is a side road and it
 is **not private** — see [Serving](#serving-afterthought-and-not-private).
 
+It is also a library. `llmoxide` is one dependency that re-exports the whole
+workspace — see [Using it from another crate](#using-it-from-another-crate).
+
 Built for one user on one machine (Apple M4 Pro, 48 GB), so it runs one request
 at a time against one GPU context.
 
@@ -319,6 +322,9 @@ Most of that was settled by reading the generated Metal rather than guessing —
 whether an accumulator reaches a register is not visible in the WGSL:
 
 ```sh
+# `msl` pulls in naga, so it is behind a non-default feature rather than in
+# every consumer's dependency tree.
+cargo build --release -p llmoxide-gpu --features tools --bin msl
 ./target/release/msl              # quant kernels as MSL, as wgpu compiles them
 ./target/release/msl --barrier    # ...with the non-subgroup reduction
 ```
@@ -362,6 +368,15 @@ generation prompt that produced those turns *ended* with
 context and the only version that keeps the cache. Single-turn prompts, where
 the question does not arise, match the template id-for-id.
 
+Reproducing the *text* is not enough, and this cost a silent regression: the
+replay emitted the empty block as `text("\n") + text("") + text("\n")`, which
+encodes to `[198, 198]`, while the generation prompt emits `text("\n\n")`,
+which the BPE merges into the single id `271`. Identical strings, different
+ids, and the cached prefix ended at that token — every qwen multi-turn
+conversation re-prefilled from scratch. Prompt pieces have to be encoded in
+the same *groupings*, not just the same order, because merges do not cross a
+call boundary.
+
 ## One-shot generation
 
 ```sh
@@ -373,6 +388,103 @@ the question does not arise, match the template id-for-id.
 Useful for diffing against `llama-completion`, which is what it is there for.
 Note that the prompt is an argument, so it lands in your shell history —
 `llmoxide-private` if that matters.
+
+## Using it from another crate
+
+The workspace is consumable as a library. `llmoxide` is the crate to depend on:
+it re-exports every other one, so a consumer adds a single dependency and gets
+versions that cannot drift apart.
+
+```toml
+[dependencies]
+# Inference, and nothing else.
+llmoxide = { git = "https://github.com/bigmah/llmoxide" }
+
+# ...or with the privacy guarantees `llmoxide-private` is built on.
+llmoxide = { git = "https://github.com/bigmah/llmoxide", features = ["private"] }
+```
+
+```rust
+use llmoxide::{LoadOptions, Request, Session};
+
+let mut session = Session::load("models/Qwen3-0.6B-Q8_0.gguf", &LoadOptions::default())?;
+let out = session.complete(Request::user("what is the capital of France?"))?;
+println!("{}", out.completion.content);
+```
+
+Streaming is the same call with a callback; return `Flow::Stop` to cut a
+generation short:
+
+```rust
+session.generate(Request::user("hello"), |piece| {
+    print!("{piece}");
+    Flow::Continue
+})?;
+```
+
+Two runnable examples, both of which work against the 0.6B checkpoint:
+
+```sh
+cargo run --release --example generate    -- models/Qwen3-0.6B-Q8_0.gguf "hello"
+cargo run --release --example chat_stream -- models/Qwen3-0.6B-Q8_0.gguf
+```
+
+### The layers
+
+| | |
+|---|---|
+| `llmoxide::Session` | tokenizer, chat dialect, sampling, prefix reuse, tool-call filtering |
+| `llmoxide::backend::Backend` | one trait per (architecture, device): token ids in, logits out |
+
+Reach for `Backend` directly when the chat layer is in the way — that is what
+the `llmoxide` binary does, since a sampler between you and the logits defeats
+the point of a reference check. It is also where a new architecture is added,
+and where multimodal input will arrive: `Backend::forward_embeds` takes
+already-projected embedding rows, and `Session` prefills a `Prompt` of
+interleaved `Segment::Tokens` and `Segment::Embeds`, so an `mmproj` encoder
+plugs in without touching the generation loop. No architecture implements it
+yet; the default returns `Error::Unsupported`.
+
+### Features
+
+| feature | | |
+|---|---|---|
+| `gpu` | default | the wgpu backends. Off, the crate still reads checkpoints and runs the CPU reference paths, and does not build wgpu at all (9 fewer crates). |
+| `hub` | | resumable, hash-verified checkpoint downloads. |
+| `private` | | locked, self-zeroing conversation memory. |
+
+**`private` is off by default, and a plain dependency gets none of the privacy
+machinery** — `llmoxide-secret` does not appear in the tree at all, not even
+transitively. That is deliberate rather than an oversight about what this
+project is for. Locked memory is not free for a caller who only wants
+inference: `SecretVec` allocates page-aligned, zeroes on every reallocation,
+and prints a warning to stderr every time `mlock` is refused, which is every
+time under a low `RLIMIT_MEMLOCK` or in a container without `IPC_LOCK`. A
+library has no business writing to stderr on a machine that never asked for
+the guarantee — and an inference dependency that declares `mlock`, `ptrace`
+and `PT_DENY_ATTACH` is a bad surprise in someone else's audit.
+
+What the feature does *not* gate: `Backend::wipe` always clears the KV cache,
+the recurrent state and the device buffers, because prefix reuse depends on
+it. `private` decides whether those overwrites are `memset_s`-with-a-fence
+rather than an ordinary `fill`, and whether the resident token ids — the
+conversation itself, decodable straight back to plaintext — are locked into
+RAM. `llmoxide::PRIVATE_MEMORY` reports which build you have, so a caller that
+needs the guarantee can assert it instead of assuming it. `llmoxide-private`
+does exactly that, as a `const` assertion: the build fails rather than ship a
+banner promising locked memory it does not have.
+
+### What it will not do
+
+One `Session` is one conversation on one GPU context: no batching, and no
+sharing a loaded model between threads. A backend is `Send` but not `Sync`, so
+serving several callers means a queue in front of one session — which is
+exactly what `llmoxide-server` is.
+
+The CPU reference backends leak their `Gguf`, config and weights to `'static`
+rather than threading a self-referential borrow through three types, so a
+process gets one CPU model for its lifetime. The GPU backends upload and drop
+the mapping, and have no such limit.
 
 ## Serving (afterthought, and not private)
 
@@ -631,22 +743,37 @@ visible sign is a reply made of `<unused12><unused35>` ninety seconds later.
 
 ## Layout
 
+Every package is `llmoxide-*`; the directory keeps the short name, and so does
+the code, because each dependency is renamed back at the `Cargo.toml` line that
+declares it. Generic package names like `model` or `gpu` would squat the
+namespace of anything that depends on this.
+
 ```
-crates/gguf       GGUF v3 reader, mmap'd; Q4_K / Q6_K / Q8_0 decoders
-crates/tokenizer  gemma4 BPE (262144 tokens) + qwen35 byte-level BPE (248320)
-crates/model      architecture configs, CPU reference forward passes, sampling
-crates/gpu        wgpu device, weight arena, WGSL kernels, both GPU forwards
-crates/chat       prompt assembly: gemma4's tool DSL + qwen's ChatML/XML
-crates/secret     locked, self-zeroing memory; the zeroing global allocator
-crates/hub        resumable, verified Hugging Face downloads
-crates/server     the private REPL, plus the axum OpenAI-compatible API
-crates/wasm       the browser build: WebGPU, streamed weights, chat REPL
-web/              the page shell; build-web.sh emits llmoxide.html into it
+directory         package             what it is
+llmoxide/         llmoxide            the facade: Session, Backend, and the CLI
+crates/gguf       llmoxide-gguf       GGUF v3 reader, mmap'd; Q4_K / Q6_K / Q8_0 decoders
+crates/tokenizer  llmoxide-tokenizer  gemma4 BPE (262144 tokens) + qwen35 byte-level BPE (248320)
+crates/model      llmoxide-model      architecture configs, CPU reference forward passes, sampling
+crates/gpu        llmoxide-gpu        wgpu device, weight arena, WGSL kernels, both GPU forwards
+crates/chat       llmoxide-chat       prompt assembly: gemma4's tool DSL + qwen's ChatML/XML
+crates/secret     llmoxide-secret     locked, self-zeroing memory; the zeroing global allocator
+crates/hub        llmoxide-hub        resumable, verified Hugging Face downloads
+crates/server     llmoxide-server     the private REPL, plus the axum OpenAI-compatible API
+crates/wasm       llmoxide-web        the browser build: WebGPU, streamed weights, chat REPL
+web/              —                   the page shell; build-web.sh emits llmoxide.html into it
 ```
+
+Dependencies point one way: `gguf` and `secret` at the bottom, `llmoxide` at
+the top, and `llmoxide-server` only on `llmoxide`. Nothing below the facade
+knows about HTTP, and the generation loop no longer lives in the server crate,
+so embedding inference does not compile axum.
 
 `crates/wasm` is deliberately **not** a workspace member — it only ever builds
 for `wasm32-unknown-unknown`, and membership would pull wasm-bindgen and
-web-sys into every native `cargo build`.
+web-sys into every native `cargo build`. It is also the one entry point that
+does not go through `llmoxide::Session`: its forward pass is `async`, because a
+browser's main thread may not block on a buffer map, and `Backend` is a
+blocking trait.
 
 ## Known limitations
 

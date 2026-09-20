@@ -2,6 +2,9 @@
 //! against a fresh CPU-side encode. Diagnoses silent upload failures that only
 //! appear at multi-buffer scale.
 
+// The library of this package is `llmoxide_gpu`; keep the short name in the code.
+use llmoxide_gpu as gpu;
+
 use gpu::arena;
 use gpu::{Gpu, Weights};
 

@@ -1,6 +1,9 @@
 //! Tokenize stdin (or an argument) and print ids, for diffing against
 //! `llama-tokenize --ids`.
 
+// The library of this package is `llmoxide_tokenizer`; keep the short name in the code.
+use llmoxide_tokenizer as tokenizer;
+
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let model = args.next().expect("usage: tok <model.gguf> [text]");

@@ -1,16 +1,25 @@
 [package]
-name = "gpu"
+name = "llmoxide-gpu"
+description = "wgpu device, weight arena, WGSL kernels, and the GPU forward passes."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[features]
+# `naga` is only used by the `msl` shader-dumping tool, and it is a large
+# dependency to hand every consumer of the library. Off by default:
+#   cargo build --release -p llmoxide-gpu --features tools --bin msl
+tools = ["dep:naga"]
 
 [dependencies]
-gguf = { path = "../gguf" }
-model = { path = "../model" }
+gguf.workspace = true
+model.workspace = true
+tokenizer.workspace = true
 anyhow.workspace = true
 wgpu.workspace = true
 bytemuck.workspace = true
 half.workspace = true
-tokenizer = { path = "../tokenizer" }
 tracing.workspace = true
 futures-channel = { version = "0.3", default-features = false, features = ["std"] }
 
@@ -18,11 +27,12 @@ futures-channel = { version = "0.3", default-features = false, features = ["std"
 # `naga` is only here for the `msl` tool. Neither belongs in the wasm build.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster.workspace = true
-naga = { version = "27", features = ["wgsl-in", "msl-out"] }
+naga = { version = "27", features = ["wgsl-in", "msl-out"], optional = true }
 
 [[bin]]
 name = "msl"
 path = "src/bin/msl.rs"
+required-features = ["tools"]
 
 [[bin]]
 name = "probe"

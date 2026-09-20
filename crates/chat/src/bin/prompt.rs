@@ -7,6 +7,9 @@
 //! `build_prompt` produces, plus the text it decodes to, so a divergence can
 //! be read rather than just counted.
 
+// The library of this package is `llmoxide_chat`; keep the short name in the code.
+use llmoxide_chat as chat;
+
 use chat::Message;
 
 fn main() -> anyhow::Result<()> {

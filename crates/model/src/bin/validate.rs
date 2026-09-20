@@ -8,6 +8,9 @@
 //! surprisingly sharp check: any error in shape, ordering, RoPE pairing, or
 //! normalization moves them well outside float tolerance.
 
+// The library of this package is `llmoxide_model`; keep the short name in the code.
+use llmoxide_model as model;
+
 use std::collections::HashMap;
 
 use model::{cache::KvCache, config::Config, cpu::Cpu, weights::Weights};

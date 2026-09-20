@@ -10,8 +10,22 @@ exclude = ["crates/wasm"]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
+repository = "https://github.com/bigmah/llmoxide"
 
 [workspace.dependencies]
+# The crates of this workspace. Packages are `llmoxide-*` so they do not squat
+# generic names in a consumer's dependency graph; the rename here is what keeps
+# `use gguf::...` working unchanged inside the workspace. Members inherit these
+# with a bare `gguf.workspace = true`.
+gguf = { package = "llmoxide-gguf", path = "crates/gguf", version = "0.1.0" }
+tokenizer = { package = "llmoxide-tokenizer", path = "crates/tokenizer", version = "0.1.0" }
+model = { package = "llmoxide-model", path = "crates/model", version = "0.1.0" }
+gpu = { package = "llmoxide-gpu", path = "crates/gpu", version = "0.1.0" }
+chat = { package = "llmoxide-chat", path = "crates/chat", version = "0.1.0" }
+secret = { package = "llmoxide-secret", path = "crates/secret", version = "0.1.0" }
+hub = { package = "llmoxide-hub", path = "crates/hub", version = "0.1.0" }
+llmoxide = { path = "llmoxide", version = "0.1.0" }
+
 anyhow = "1"
 thiserror = "2"
 memmap2 = "0.9"

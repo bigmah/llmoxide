@@ -11,6 +11,9 @@
 //!   --no-adopt     download even if the identical file is already there under
 //!                  a different name
 
+// The library of this package is `llmoxide_hub`; keep the short name in the code.
+use llmoxide_hub as hub;
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {

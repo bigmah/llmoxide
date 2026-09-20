@@ -1,10 +1,13 @@
 [package]
-name = "tokenizer"
+name = "llmoxide-tokenizer"
+description = "gemma4 and qwen35 BPE tokenizers, driven straight off GGUF metadata."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
 
 [dependencies]
-gguf = { path = "../gguf" }
+gguf.workspace = true
 anyhow.workspace = true
 
 [[bin]]

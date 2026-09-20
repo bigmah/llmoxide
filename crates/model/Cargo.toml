@@ -1,11 +1,20 @@
 [package]
-name = "model"
+name = "llmoxide-model"
+description = "Architecture configs, CPU reference forward passes, and sampling."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[features]
+# Guaranteed-not-elided overwrites in the `wipe` paths, via `llmoxide-secret`.
+# Off by default so an inference-only consumer does not link a crate that
+# declares `mlock`, `ptrace` and `PT_DENY_ATTACH`.
+private = ["dep:secret"]
 
 [dependencies]
-gguf = { path = "../gguf" }
-secret = { path = "../secret" }
+gguf.workspace = true
+secret = { workspace = true, optional = true }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1,7 +1,10 @@
 [package]
-name = "gguf"
+name = "llmoxide-gguf"
+description = "GGUF v3 reader (mmap'd) and k-quant decoders: Q4_K, Q6_K, Q8_0."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true

@@ -1,18 +1,22 @@
 [package]
-name = "server"
+name = "llmoxide-server"
+description = "OpenAI-compatible HTTP API and the private REPL, over the llmoxide engine."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
 
 [dependencies]
-gguf = { path = "../gguf" }
-tokenizer = { path = "../tokenizer" }
-model = { path = "../model" }
-gpu = { path = "../gpu" }
-chat = { path = "../chat" }
-secret = { path = "../secret" }
+# `private` is what `llmoxide-private` is: locked, self-zeroing conversation
+# memory. Consumers that only want inference leave it off.
+llmoxide = { workspace = true, features = ["gpu", "private"] }
+chat.workspace = true
+model.workspace = true
+tokenizer.workspace = true
+secret.workspace = true
 anyhow.workspace = true
-axum = "0.8"
-tokio = { workspace = true }
+axum.workspace = true
+tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

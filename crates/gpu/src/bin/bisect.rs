@@ -3,6 +3,9 @@
 //! The CPU path is byte-exact against llama.cpp, so the first checkpoint that
 //! disagrees identifies the faulty kernel.
 
+// The library of this package is `llmoxide_gpu`; keep the short name in the code.
+use llmoxide_gpu as gpu;
+
 use model::{cache::KvCache, config::Config, cpu::Cpu, weights::Weights};
 
 fn main() -> anyhow::Result<()> {

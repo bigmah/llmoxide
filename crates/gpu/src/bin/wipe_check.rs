@@ -11,6 +11,9 @@
 //! Exits non-zero if a single non-zero word survives, which is what makes it
 //! usable from a test script.
 
+// The library of this package is `llmoxide_gpu`; keep the short name in the code.
+use llmoxide_gpu as gpu;
+
 fn main() -> anyhow::Result<()> {
     let model = std::env::args()
         .nth(1)

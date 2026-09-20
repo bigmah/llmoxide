@@ -4,6 +4,9 @@
 //! scales in Q4_K, the interleaved sub-blocks in Q6_K — so this runs against
 //! actual tensors from the checkpoint.
 
+// The library of this package is `llmoxide_gpu`; keep the short name in the code.
+use llmoxide_gpu as gpu;
+
 use gpu::{Gpu, MatvecParams, QuantKernels, Weights};
 use wgpu::util::DeviceExt;
 

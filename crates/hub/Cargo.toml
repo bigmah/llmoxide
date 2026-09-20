@@ -1,10 +1,13 @@
 [package]
-name = "hub"
+name = "llmoxide-hub"
+description = "Resumable, hash-verified Hugging Face checkpoint downloads."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
 
 [dependencies]
-gguf = { path = "../gguf" }
+gguf.workspace = true
 anyhow.workspace = true
 ureq = "3.4"
 sha2 = "0.11"

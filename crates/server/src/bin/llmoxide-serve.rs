@@ -13,7 +13,10 @@
 //! socket changes that. `llmoxide-private` exists because the only way to close
 //! that gap is not to have a client at all.
 
-use server::engine::Engine;
+// The library of this package is `llmoxide_server`; keep the short name.
+use llmoxide_server as server;
+
+use llmoxide::{DevicePref, LoadOptions, Session};
 use server::AppState;
 
 /// Overwrite freed heap blocks once armed. Disable with `LLMOXIDE_NO_ZEROIZE=1`
@@ -58,7 +61,15 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(model, n_ctx, batch, "loading");
     let t0 = std::time::Instant::now();
-    let engine = Engine::load(&model, n_ctx, batch)?;
+    let opts = LoadOptions::new()
+        .n_ctx(n_ctx)
+        .max_batch(batch)
+        .device(if std::env::var_os("LLMOXIDE_CPU").is_some() {
+            DevicePref::Cpu
+        } else {
+            DevicePref::Gpu
+        });
+    let engine = Session::load(&model, &opts)?;
     // Only now: loading stages gigabytes of weights through the heap, and those
     // are not secret. Nothing has been served yet.
     let zeroize = std::env::var_os("LLMOXIDE_NO_ZEROIZE").is_none();

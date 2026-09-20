@@ -20,12 +20,12 @@ codegen-units = 1
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-gguf = { path = "../gguf" }
-tokenizer = { path = "../tokenizer" }
-model = { path = "../model" }
-chat = { path = "../chat" }
-gpu = { path = "../gpu" }
-secret = { path = "../secret" }
+gguf = { package = "llmoxide-gguf", path = "../gguf" }
+tokenizer = { package = "llmoxide-tokenizer", path = "../tokenizer" }
+model = { package = "llmoxide-model", path = "../model", features = ["private"] }
+chat = { package = "llmoxide-chat", path = "../chat" }
+gpu = { package = "llmoxide-gpu", path = "../gpu" }
+secret = { package = "llmoxide-secret", path = "../secret" }
 anyhow = "1"
 serde_json = "1"
 

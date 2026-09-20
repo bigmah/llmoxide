@@ -51,8 +51,8 @@ impl LayerCache {
 
     /// Overwrite this layer's keys and values in full.
     pub fn wipe(&mut self) {
-        secret::zero_slice(&mut self.k);
-        secret::zero_slice(&mut self.v);
+        crate::zero_slice(&mut self.k);
+        crate::zero_slice(&mut self.v);
     }
 
     pub fn store(&mut self, pos: usize, k: &[f32], v: &[f32]) {

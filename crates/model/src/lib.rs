@@ -12,6 +12,26 @@ pub use cpu::Cpu;
 pub use sample::{Sampler, Sampling};
 pub use weights::Weights;
 
+/// Overwrite a buffer that held conversation-derived state.
+///
+/// With the `private` feature this is `llmoxide-secret`'s `memset_s` plus a
+/// compiler fence, which the optimizer is not permitted to elide. Without it,
+/// an ordinary `fill` — which in practice zeroes too, but carries no such
+/// guarantee, and does not drag a crate full of `mlock`/`ptrace` declarations
+/// into a build that only wants inference.
+///
+/// The distinction only affects [`cache::KvCache::wipe`] and
+/// [`qwen35::State::wipe`]. Neither `clear` nor the correctness of prefix
+/// reuse depends on it: those reset a length, and this overwrites what the
+/// length used to cover.
+#[inline]
+pub fn zero_slice<T: Copy + Default>(s: &mut [T]) {
+    #[cfg(feature = "private")]
+    secret::zero_slice(s);
+    #[cfg(not(feature = "private"))]
+    s.fill(T::default());
+}
+
 /// Which architecture a GGUF file carries, for dispatch at the entry points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {

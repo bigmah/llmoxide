@@ -100,6 +100,23 @@ impl<'a> Builder<'a> {
         self.push(self.sp.im_end).text("\n")
     }
 
+    /// The closed, empty thought channel: `<think>\n\n</think>\n\n`.
+    ///
+    /// Called from two places that must agree token-for-token — the
+    /// generation prompt with thinking off, and the replay of an assistant
+    /// turn that prompt produced. If they disagree, the cached prefix ends at
+    /// the first assistant message and every turn re-prefills the whole
+    /// conversation; see "KV cache and prefix reuse" in the README.
+    ///
+    /// Hence one function rather than two matching literals, and hence the
+    /// single `text("\n\n")`: the BPE merges that into one id, where
+    /// `text("\n")` twice yields two. Same string, different ids — merges do
+    /// not cross an `encode` call boundary.
+    fn empty_think(&mut self) -> &mut Self {
+        let (open, close) = (self.sp.think_open, self.sp.think_close);
+        self.push(open).text("\n\n").push(close).text("\n\n")
+    }
+
     /// One `<tool_call>` block for an assistant replay.
     fn tool_call(&mut self, name: &str, arguments: &Value) -> &mut Self {
         let (open, close) = (self.sp.call_open, self.sp.call_close);
@@ -218,12 +235,16 @@ pub fn build_prompt(
                 // The template replays thinking on every assistant turn
                 // (`preserve_thinking` defaults to true).
                 let reasoning = m.reasoning.as_deref().unwrap_or("").trim();
-                b.push(sp.think_open)
-                    .text("\n")
-                    .text(reasoning)
-                    .text("\n")
-                    .push(sp.think_close)
-                    .text("\n\n");
+                if reasoning.is_empty() {
+                    b.empty_think();
+                } else {
+                    b.push(sp.think_open)
+                        .text("\n")
+                        .text(reasoning)
+                        .text("\n")
+                        .push(sp.think_close)
+                        .text("\n\n");
+                }
                 let content = m.text();
                 let content = content.trim();
                 b.text(content);
@@ -268,10 +289,7 @@ pub fn build_prompt(
     if enable_thinking {
         b.push(sp.think_open).text("\n");
     } else {
-        b.push(sp.think_open)
-            .text("\n\n")
-            .push(sp.think_close)
-            .text("\n\n");
+        b.empty_think();
     }
     b.ids
 }

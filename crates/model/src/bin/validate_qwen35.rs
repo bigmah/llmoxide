@@ -8,6 +8,9 @@
 //! the raw projection and the post-RoPE tensor), so like the gemma tool we
 //! compare against the *first* occurrence of each name.
 
+// The library of this package is `llmoxide_model`; keep the short name in the code.
+use llmoxide_model as model;
+
 use std::collections::HashMap;
 
 use model::qwen35::{Config, Cpu, State, Weights};

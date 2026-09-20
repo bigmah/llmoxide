@@ -6,10 +6,15 @@
 //!   llmoxide <model.gguf> <prompt> [n] [--cpu]
 //!
 //! Both architectures run on the GPU by default; `--cpu` selects the
-//! reference path.
+//! reference path. Deliberately greedy and chat-template-free: this is the
+//! tool that answers "do the kernels still produce the right numbers", and a
+//! sampler or a prompt template between you and the logits only gets in the
+//! way. For actual use see `llmoxide-private`, or the `llmoxide` library.
 
-use model::qwen35;
-use model::{cache::KvCache, config::Config, cpu::Cpu, weights::Weights, Arch};
+use std::io::Write;
+
+use llmoxide::backend::{self, DevicePref, LoadOptions};
+use llmoxide::{gguf, tokenizer};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -25,58 +30,21 @@ fn main() -> anyhow::Result<()> {
 
     let t0 = std::time::Instant::now();
     let g = gguf::Gguf::open(model_path)?;
-    let arch = Arch::detect(&g)?;
     let tok = tokenizer::Tokenizer::from_gguf(&g)?;
     let ids = tok.encode(prompt, true);
     let n_ctx = (ids.len() + n_gen + 8).next_power_of_two().max(2048);
 
-    let (mut backend, eog): (Box<dyn Backend>, Vec<u32>) = match arch {
-        Arch::Gemma4 => {
-            let cfg = Config::from_gguf(&g)?;
-            let eog = cfg.eog.clone();
-            let b: Box<dyn Backend> = if use_cpu {
-                Box::new(CpuBackend::new(&g, Box::leak(Box::new(cfg)), n_ctx, ids.len())?)
-            } else {
-                let gpu = gpu::Gpu::blocking_new()?;
-                eprintln!("gpu: {}", gpu.adapter_name);
-                Box::new(gpu::forward::GpuModel::load(
-                    gpu,
-                    &g,
-                    cfg,
-                    n_ctx,
-                    ids.len().max(1),
-                )?)
-            };
-            (b, eog)
-        }
-        Arch::Qwen35 => {
-            let cfg = qwen35::Config::from_gguf(&g)?;
-            eprintln!("{}", cfg.summary());
-            let eog = cfg.eog.clone();
-            let b: Box<dyn Backend> = if use_cpu {
-                // The CPU path re-reads every weight per token; ask the OS to
-                // fault the mapping in up front rather than one page at a time.
-                g.prefault();
-                Box::new(Qwen35Backend::new(
-                    &g,
-                    Box::leak(Box::new(cfg)),
-                    n_ctx,
-                    ids.len(),
-                )?)
-            } else {
-                let gpu = gpu::Gpu::blocking_new()?;
-                eprintln!("gpu: {}", gpu.adapter_name);
-                Box::new(gpu::qwen35::Qwen35Gpu::load(
-                    gpu,
-                    &g,
-                    cfg,
-                    n_ctx,
-                    ids.len().max(1),
-                )?)
-            };
-            (b, eog)
-        }
-    };
+    let opts = LoadOptions::new()
+        .n_ctx(n_ctx)
+        .max_batch(ids.len().max(1))
+        .device(if use_cpu {
+            DevicePref::Cpu
+        } else {
+            DevicePref::Gpu
+        });
+    let mut backend = backend::load(g, &opts)?;
+    let info = backend.info().clone();
+    eprintln!("{:?} on {:?}", info.arch, info.device);
     eprintln!("loaded in {:?}; prompt {} tokens", t0.elapsed(), ids.len());
 
     let t1 = std::time::Instant::now();
@@ -93,7 +61,7 @@ fn main() -> anyhow::Result<()> {
     let t2 = std::time::Instant::now();
     for _ in 0..n_gen {
         let next = argmax(&logits);
-        if eog.contains(&next) {
+        if info.eog.contains(&next) {
             break;
         }
         out.push(next);
@@ -102,7 +70,6 @@ fn main() -> anyhow::Result<()> {
         } else {
             print!("{}", dec.push(next));
         }
-        use std::io::Write;
         std::io::stdout().flush().ok();
         logits = backend.forward(&[next])?;
     }
@@ -118,76 +85,6 @@ fn main() -> anyhow::Result<()> {
     );
     eprintln!("ids: {out:?}");
     Ok(())
-}
-
-trait Backend {
-    fn forward(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>>;
-}
-
-impl Backend for gpu::forward::GpuModel {
-    fn forward(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
-        gpu::forward::GpuModel::forward(self, tokens)
-    }
-}
-
-impl Backend for gpu::qwen35::Qwen35Gpu {
-    fn forward(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
-        gpu::qwen35::Qwen35Gpu::forward(self, tokens)
-    }
-}
-
-/// Owns the mmap-backed weights alongside the executor so the borrow stays
-/// valid for the lifetime of the run.
-struct CpuBackend<'a> {
-    cpu: Cpu<'a>,
-    cache: KvCache,
-}
-
-impl<'a> CpuBackend<'a> {
-    fn new(
-        g: &'a gguf::Gguf,
-        cfg: &'a Config,
-        n_ctx: usize,
-        batch: usize,
-    ) -> anyhow::Result<Self> {
-        let weights: &'a Weights<'a> = Box::leak(Box::new(Weights::load(g, cfg)?));
-        Ok(Self {
-            cpu: Cpu::new(cfg, weights, batch.max(1)),
-            cache: KvCache::new(cfg, n_ctx),
-        })
-    }
-}
-
-impl Backend for CpuBackend<'_> {
-    fn forward(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
-        Ok(self.cpu.forward(tokens, &mut self.cache))
-    }
-}
-
-struct Qwen35Backend<'a> {
-    cpu: qwen35::Cpu<'a>,
-    state: qwen35::State,
-}
-
-impl<'a> Qwen35Backend<'a> {
-    fn new(
-        g: &'a gguf::Gguf,
-        cfg: &'a qwen35::Config,
-        n_ctx: usize,
-        batch: usize,
-    ) -> anyhow::Result<Self> {
-        let weights: &'a qwen35::Weights<'a> = Box::leak(Box::new(qwen35::Weights::load(g, cfg)?));
-        Ok(Self {
-            cpu: qwen35::Cpu::new(cfg, weights, batch.max(1)),
-            state: qwen35::State::new(cfg, n_ctx),
-        })
-    }
-}
-
-impl Backend for Qwen35Backend<'_> {
-    fn forward(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
-        Ok(self.cpu.forward(tokens, &mut self.state))
-    }
 }
 
 fn argmax(v: &[f32]) -> u32 {

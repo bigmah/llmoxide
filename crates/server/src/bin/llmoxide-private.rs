@@ -37,7 +37,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use chat::Message;
-use server::engine::{Engine, Event, GenerateRequest};
+use llmoxide::{DevicePref, Event, LoadOptions, Request, Session};
+
+/// The banner promises locked, self-zeroing conversation memory, and this mode
+/// exists for nothing else. `llmoxide`'s `private` feature is off by default —
+/// consumers of the library want inference — so fail the build rather than let
+/// a stripped-down one ship while still claiming the guarantee.
+const _: () = assert!(
+    llmoxide::PRIVATE_MEMORY,
+    "llmoxide-private needs llmoxide's `private` feature"
+);
 
 /// Overwrite every heap block as it is freed, once armed. Installed process-wide
 /// because prompt text does not stay in one place: it is a `Bytes`, then a
@@ -64,7 +73,7 @@ extern "C" fn on_sigint(_: i32) {
 /// Work for the engine thread; the engine owns wgpu resources that are not
 /// `Sync`, so it stays put and everything reaches it down this channel.
 enum Cmd {
-    Gen(Box<GenerateRequest>, mpsc::Sender<Event>),
+    Gen(Box<Request>, mpsc::Sender<Event>),
     Wipe(mpsc::Sender<()>),
 }
 
@@ -89,13 +98,21 @@ fn main() -> anyhow::Result<()> {
     let engine_thread = std::thread::Builder::new()
         .name("llmoxide-engine".into())
         .spawn(move || {
-            let mut engine = match Engine::load(&model, n_ctx, batch) {
+            let opts = LoadOptions::new()
+                .n_ctx(n_ctx)
+                .max_batch(batch)
+                .device(if std::env::var_os("LLMOXIDE_CPU").is_some() {
+                    DevicePref::Cpu
+                } else {
+                    DevicePref::Gpu
+                });
+            let mut engine = match Session::load(&model, &opts) {
                 Ok(e) => {
                     let _ = tx_ready.send(Ok(()));
                     e
                 }
                 Err(e) => {
-                    let _ = tx_ready.send(Err(e));
+                    let _ = tx_ready.send(Err(e.into()));
                     return;
                 }
             };
@@ -106,7 +123,7 @@ fn main() -> anyhow::Result<()> {
 
             while let Ok(cmd) = rx_cmd.recv() {
                 match cmd {
-                    Cmd::Gen(req, tx) => engine.generate(*req, &tx),
+                    Cmd::Gen(req, tx) => engine.generate_to(*req, &tx),
                     Cmd::Wipe(done) => {
                         engine.wipe();
                         let _ = done.send(());
@@ -202,10 +219,10 @@ fn main() -> anyhow::Result<()> {
 /// Run one turn, streaming to stdout, and return the reply text.
 fn turn(tx_cmd: &mpsc::Sender<Cmd>, history: &[Message]) -> anyhow::Result<String> {
     let (tx_ev, rx_ev) = mpsc::channel();
-    let req = GenerateRequest {
+    let req = Request {
         messages: history.to_vec(),
         tools: Vec::new(),
-        sampling: Default::default(),
+        sampling: Some(Default::default()),
         max_tokens: 2048,
         enable_thinking: false,
         stop: Vec::new(),
