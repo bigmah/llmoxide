@@ -25,6 +25,9 @@ pub struct Gpu {
     pub limits: wgpu::Limits,
     /// Whether subgroup intrinsics are available in WGSL.
     pub subgroups: bool,
+    /// Whether hand-written Metal kernels can be loaded (wgpu's MSL
+    /// passthrough). Only the prefill GEMM uses it; see `shaders/gemm_q6k.metal`.
+    pub msl: bool,
 }
 
 impl Gpu {
@@ -59,15 +62,37 @@ impl Gpu {
         #[cfg(not(target_arch = "wasm32"))]
         let subgroups = adapter.features().contains(wgpu::Features::SUBGROUP)
             && std::env::var_os("LLMOXIDE_NO_SUBGROUP").is_none();
+        // Hand-written MSL, for the simdgroup-matrix GEMM WGSL cannot express.
+        // `LLMOXIDE_NO_MSL` forces the portable WGSL kernel instead, which is
+        // otherwise unreachable on a Mac — and is all the browser build has.
+        #[cfg(target_arch = "wasm32")]
+        let msl = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        let msl = adapter.get_info().backend == wgpu::Backend::Metal
+            && adapter
+                .features()
+                .contains(wgpu::Features::EXPERIMENTAL_PASSTHROUGH_SHADERS)
+            && std::env::var_os("LLMOXIDE_NO_MSL").is_none();
+        let mut required_features = wgpu::Features::empty();
+        if subgroups {
+            required_features |= wgpu::Features::SUBGROUP;
+        }
+        if msl {
+            required_features |= wgpu::Features::EXPERIMENTAL_PASSTHROUGH_SHADERS;
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("llmoxide"),
-                required_features: if subgroups {
-                    wgpu::Features::SUBGROUP
-                } else {
-                    wgpu::Features::empty()
-                },
+                required_features,
                 required_limits: limits.clone(),
+                // SAFETY: the one experimental feature ever requested is MSL
+                // passthrough, whose obligations — the kernel matching its
+                // pipeline layout — are discharged in `QuantKernels::new`.
+                experimental_features: if msl {
+                    unsafe { wgpu::ExperimentalFeatures::enabled() }
+                } else {
+                    wgpu::ExperimentalFeatures::disabled()
+                },
                 ..Default::default()
             })
             .await?;
@@ -117,6 +142,7 @@ impl Gpu {
             queue,
             limits,
             subgroups,
+            msl,
         })
     }
 
@@ -784,6 +810,11 @@ pub struct QuantKernels {
     pub embed: wgpu::ComputePipeline,
     pub embed_f32: wgpu::ComputePipeline,
     pub embed_q8_0: wgpu::ComputePipeline,
+    /// Tiled prefill GEMM: `shaders/gemm_q6k.metal` where MSL passthrough is
+    /// available, `shaders/gemm.wgsl` elsewhere. See [`Self::gemm_for`].
+    pub gemm_q6k: wgpu::ComputePipeline,
+    /// The output tile (rows, tokens) of whichever GEMM was loaded.
+    pub gemm_tile: (u32, u32),
 }
 
 /// The quant shader with its shape constants and row reduction filled in. The
@@ -802,6 +833,61 @@ pub fn quant_shader_source(subgroups: bool) -> String {
         .replace("@@LANES@@", &LANES.to_string())
         .replace("@@ROWS@@", &ROWS_PER_GROUP.to_string())
         .replace("@@TILE@@", &token_tile().to_string())
+}
+
+/// The prefill GEMM with its register block unrolled. The accumulators have
+/// to be individually named variables (see the note in `shaders/gemm.wgsl`),
+/// so the block shape is expanded here rather than looped over in WGSL.
+pub fn gemm_shader_source() -> String {
+    let (rm4, tn) = gemm_shape();
+    let tn4 = tn / 4;
+    let mut decl = String::new();
+    let mut fma = String::new();
+    let mut store = String::new();
+    for kk in 0..4 {
+        fma.push_str(&format!(
+            "{{\nlet wi = (k + {kk}u) * BM4 + tr * RM4;\nlet xi = (k + {kk}u) * BN4 + tc * TN4;\n"
+        ));
+        for r in 0..rm4 {
+            fma.push_str(&format!("let a{r} = ws[wi + {r}u];\n"));
+        }
+        for q in 0..tn4 {
+            fma.push_str(&format!("let b{q} = xs[xi + {q}u];\n"));
+        }
+        for r in 0..rm4 {
+            for t in 0..tn {
+                let (q, c) = (t / 4, ["x", "y", "z", "w"][t as usize % 4]);
+                fma.push_str(&format!("acc{r}_{t} = fma(a{r}, vec4<f32>(b{q}.{c}), acc{r}_{t});\n"));
+            }
+        }
+        fma.push_str("}\n");
+    }
+    for r in 0..rm4 {
+        for t in 0..tn {
+            decl.push_str(&format!("var acc{r}_{t} = vec4<f32>(0.0);\n"));
+            store.push_str(&format!("store4(r + {}u, t + {t}u, acc{r}_{t});\n", r * 4));
+        }
+    }
+    include_str!("shaders/gemm.wgsl")
+        .replace("// @@ACC_DECL@@", &decl)
+        .replace("// @@ACC_FMA@@", &fma)
+        .replace("// @@ACC_STORE@@", &store)
+        .replace("@@RM4@@", &rm4.to_string())
+        .replace("@@TN@@", &tn.to_string())
+        .replace("@@XS@@", &(16 * tn * (4096 / (64 * rm4)) / 4).to_string())
+}
+
+/// The GEMM register block: `LLMOXIDE_GEMM=rm4,tn` overrides the default,
+/// for rerunning the shape sweep on another GPU without a rebuild.
+pub fn gemm_shape() -> (u32, u32) {
+    std::env::var("LLMOXIDE_GEMM")
+        .ok()
+        .and_then(|v| {
+            let (a, b) = v.split_once(',')?;
+            Some((a.parse().ok()?, b.parse().ok()?))
+        })
+        .filter(|&(rm4, tn): &(u32, u32)| [2, 4].contains(&rm4) && [4, 8].contains(&tn))
+        .unwrap_or((GEMM_RM4, GEMM_TN))
 }
 
 /// Tokens per tiled dispatch. `LLMOXIDE_TILE` overrides the default so the
@@ -875,7 +961,40 @@ impl QuantKernels {
                 })
         };
 
+        let (gemm_module, gemm_tile) = if gpu.msl {
+            // SAFETY: the source is ours and its buffer indices follow
+            // `layout` above in entry order, as wgpu's Metal backend assigns
+            // them; the header of gemm_q6k.metal spells out the mapping.
+            let module = unsafe {
+                gpu.device.create_shader_module_passthrough(
+                    wgpu::ShaderModuleDescriptorPassthrough {
+                        entry_point: "gemm_q6k".into(),
+                        label: Some("gemm_q6k.metal"),
+                        num_workgroups: (GEMM_MSL_THREADS, 1, 1),
+                        msl: Some(include_str!("shaders/gemm_q6k.metal").into()),
+                        ..Default::default()
+                    },
+                )
+            };
+            (module, (GEMM_MSL_BM, GEMM_MSL_BN))
+        } else {
+            let (rm4, tn) = gemm_shape();
+            (gpu.shader("gemm", &gemm_shader_source()), (64 * rm4, 16 * tn))
+        };
+        let gemm_q6k = gpu
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("gemm_q6k"),
+                layout: Some(&pipeline_layout),
+                module: &gemm_module,
+                entry_point: Some("gemm_q6k"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
         Self {
+            gemm_q6k,
+            gemm_tile,
             q4k: make("matvec_q4k"),
             q6k: make("matvec_q6k"),
             q8_0: make("matvec_q8_0"),
@@ -915,6 +1034,25 @@ impl QuantKernels {
         }
     }
 
+    /// The tiled GEMM for a weight type, when there is one and the batch is
+    /// wide enough to pay for it. Dispatch with [`Self::gemm_groups`].
+    pub fn gemm_for(&self, ty: GgmlType, n_tokens: u32) -> Option<&wgpu::ComputePipeline> {
+        if n_tokens < GEMM_MIN_TOKENS || std::env::var_os("LLMOXIDE_NO_GEMM").is_some() {
+            return None;
+        }
+        match ty {
+            GgmlType::Q6K => Some(&self.gemm_q6k),
+            _ => None,
+        }
+    }
+
+    /// Workgroup grid for a GEMM dispatch. Unlike the matvec there is no row
+    /// striding, so `out_dim / tile rows` has to fit the dispatch limit.
+    pub fn gemm_groups(&self, out_dim: u32, n_tokens: u32) -> (u32, u32, u32) {
+        let (bm, bn) = self.gemm_tile;
+        (out_dim.div_ceil(bm), n_tokens.div_ceil(bn), 1)
+    }
+
     /// The embedding-gather pipeline for the token_embd type.
     pub fn embed_for(&self, ty: GgmlType) -> anyhow::Result<&wgpu::ComputePipeline> {
         match ty {
@@ -934,6 +1072,21 @@ pub const ROWS_PER_GROUP: u32 = 8;
 /// Default tokens per dispatch of the tiled (prefill) kernels. Read through
 /// [`token_tile`], which honours `LLMOXIDE_TILE`.
 pub const TOKEN_TILE: u32 = 2;
+
+/// Register block of `shaders/gemm.wgsl`: vec4s of rows, and tokens, per
+/// thread. The workgroup is 16 x 16 threads, so these set the output tile.
+pub const GEMM_RM4: u32 = 2;
+pub const GEMM_TN: u32 = 4;
+/// Below this many tokens the matvec kernels win or tie: a GEMM tile would be
+/// mostly padding. Measured with the `gemm` bin on the 27B: at 8 tokens it is
+/// a toss-up per tensor, from 16 the GEMM wins on every shape.
+pub const GEMM_MIN_TOKENS: u32 = 16;
+
+/// Output tile and threadgroup size of `shaders/gemm_q6k.metal`, which has
+/// them as constants of its own.
+pub const GEMM_MSL_BM: u32 = 64;
+pub const GEMM_MSL_BN: u32 = 32;
+pub const GEMM_MSL_THREADS: u32 = 128;
 
 /// Rows are strided across the grid because the output projection has 262 144
 /// of them, well past the 65 535-per-dimension dispatch limit.

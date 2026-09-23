@@ -294,9 +294,52 @@ context it ran at, because attention cost grows with it:
 | prefill, 374 tokens | 23.5 tok/s | **35.0 tok/s** | much higher |
 | prefill, 1490 tokens | 20.7 tok/s | **32.7 tok/s** | |
 
-qwen35 27B decodes at **~9.4 tok/s** on the GPU, against ~1.1 tok/s on the CPU
-reference path — about 9x, and the difference between patient chat and
-correctness work only.
+| qwen35 27B (Q6_K) | before | now |
+|---|---|---|
+| prefill, 301 tokens | 14.0 tok/s | **78.7 tok/s** |
+| decode | 8.9 tok/s | 9.4 tok/s |
+
+The CPU reference path does ~1.1 tok/s decode and ~0.6 tok/s prefill.
+
+Prefill gained 5.6x from a real GEMM. The old prefill path reused the decode
+matvec across 2-token tiles, so a 300-token prompt read all 22 GB of weights 150
+times. Now each workgroup dequantizes a weight tile once into threadgroup memory
+and uses it for a whole tile of tokens. There are two implementations, picked in
+`QuantKernels::new`:
+
+- **`shaders/gemm_q6k.metal`**, on Apple GPUs. It is hand-written MSL, loaded
+  through wgpu's experimental MSL passthrough, and runs the inner product on
+  `simdgroup_float8x8` hardware matrix multiply-accumulates. WGSL cannot express
+  these. It reaches ~4.4 TFLOP/s on an M4 Pro, all in f32. Staging in f16 was
+  measured: it was no faster and 100x less accurate. Nothing checks the kernel
+  against the pipeline layout, so its header spells out the buffer-slot mapping
+  it relies on.
+- **`shaders/gemm.wgsl`**, everywhere else, including the browser. It uses a
+  register-blocked vec4-FMA tile and tops out near 2.5 TFLOP/s on the same GPU.
+  `LLMOXIDE_NO_MSL=1` forces it on a Mac, so it stays tested.
+
+Batches under 16 tokens stay on the matvec, as do the 48-row `ssm_alpha`/`ssm_beta`
+projections. With the GEMM in place, prefill is almost entirely GEMM time:
+16 TFLOP for 301 tokens at 4.4 TFLOP/s.
+
+Decode is memory-bound and was already near the limit. The Q6_K matvec streams
+~215 GB/s. A kernel that does nothing but read the same bytes reaches only
+~225–242 GB/s (`GEMM_READBW=1` in the `gemm` bin). A decode kernel rewrite could
+therefore buy at most ~10%.
+
+`gemm` is the fast loop for this work. It loads only the named tensors, so it
+runs in seconds against the 22 GB checkpoint where a full load takes minutes. It
+times the matvec against the GEMM and checks both against the CPU reference:
+
+```sh
+cargo build --release -p llmoxide-gpu --bin gemm
+./target/release/gemm models/Qwen3.8-27B-Q6_K.gguf 301        # n_tokens
+./target/release/msl --gemm                                   # the WGSL GEMM as Metal
+```
+
+Three things about the WGSL GEMM's generated Metal are easy to trip on and are
+written up at the top of `gemm.wgsl`. The main one: Naga silently drops
+dynamic-component stores into workgroup vectors (`ws[i][c] = v`).
 
 Greedy output is unchanged token-for-token, and `bisect` still matches the CPU
 path at every checkpoint.
@@ -326,9 +369,9 @@ Four things got gemma4 there, in rough order of how much they were worth:
 What is still on the table: decode cost continues to grow with context because
 the three attention passes only have `n_heads` workgroups between them, which
 cannot fill the GPU — splitting the key range across workgroups and reducing the
-partials afterwards is the fix. Prefill wants a real GEMM that stages the
-activation tile in workgroup memory, rather than the current one-row-per-lane
-matvec reused across a small token tile.
+partials afterwards is the fix. gemma4 prefill still uses the matvec. The GEMM
+only has a Q6_K path so far, and gemma4's checkpoints are mostly Q4_K, so
+porting the dequant step is the missing piece.
 
 Two dead ends are written up in `crates/gpu/src/shaders/quant.wgsl` so they
 don't get retried: hoisting the dequantization above the token loop, and
@@ -906,11 +949,14 @@ blocking trait.
 
 - gemma4 decode is ~1.5x slower than llama.cpp, and the gap widens with
   context (see above).
-- qwen35 decode at ~9.4 tok/s is usable but unoptimised. The delta-net
+- qwen35 decode at ~9.4 tok/s is within ~10% of what this GPU's memory
+  bandwidth allows for a 22 GB checkpoint (see Performance). The delta-net
   recurrence is sequential by construction: `delta_recur` loops the whole token
   range inside one dispatch of `n_v_heads` workgroups, so those layers get no
-  token parallelism during prefill and cannot fill the GPU. A chunked
-  formulation is the obvious next thing to attack.
+  token parallelism during prefill and cannot fill the GPU. So far that has
+  cost little: 301-token prefill takes about as long as its GEMM FLOPs alone
+  predict. It will matter more for long prompts, where a chunked formulation is
+  the fix.
 - No architecture here can rewind its cache, so prompt reuse is append-only:
   gemma4's ring buffers have overwritten the positions, and qwen35's recurrent
   state was never a history to begin with.

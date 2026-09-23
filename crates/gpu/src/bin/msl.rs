@@ -8,7 +8,12 @@
 use llmoxide_gpu as gpu;
 
 fn main() -> anyhow::Result<()> {
-    let src = gpu::quant_shader_source(!std::env::args().any(|a| a == "--barrier"));
+    // `--gemm` prints the prefill GEMM instead.
+    let src = if std::env::args().any(|a| a == "--gemm") {
+        gpu::gemm_shader_source()
+    } else {
+        gpu::quant_shader_source(!std::env::args().any(|a| a == "--barrier"))
+    };
     let module = naga::front::wgsl::parse_str(&src).map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),

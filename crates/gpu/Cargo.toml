@@ -57,3 +57,7 @@ path = "src/bin/upload_check.rs"
 [[bin]]
 name = "wipe_check"
 path = "src/bin/wipe_check.rs"
+
+[[bin]]
+name = "gemm"
+path = "src/bin/gemm.rs"

@@ -822,15 +822,26 @@ impl Qwen35Gpu {
                     n_tokens: t as u32,
                 }),
             );
+            // Prefill batches of any width take the tiled GEMM, which reads
+            // each weight once per tile of tokens rather than once per pair.
+            // The tiny ssm_alpha/beta projections (48 rows) stay on the
+            // matvec: a single row tile would leave the GPU idle.
+            let (pipeline, groups) = match self.quant.gemm_for(h.ty, t as u32) {
+                Some(p) if out_dim >= 1024 => (p, self.quant.gemm_groups(out_dim, t as u32)),
+                _ => (
+                    self.quant.pipeline_for(h.ty, t as u32)?,
+                    (
+                        crate::row_groups(out_dim, max_groups),
+                        crate::token_groups(t as u32),
+                        1,
+                    ),
+                ),
+            };
             plan.push(Dispatch {
-                pipeline: self.quant.pipeline_for(h.ty, t as u32)?.clone(),
+                pipeline: pipeline.clone(),
                 bind: self.matvec_bind(h.buffer, x, y),
                 offset: off,
-                groups: (
-                    crate::row_groups(out_dim, max_groups),
-                    crate::token_groups(t as u32),
-                    1,
-                ),
+                groups,
             });
             Ok(())
         };
