@@ -32,7 +32,7 @@
 //! the GGUF's access time still shows that inference ran, and root on a live
 //! machine can still read this process's memory.
 
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
@@ -152,18 +152,28 @@ fn main() -> anyhow::Result<()> {
     banner(n_ctx);
 
     let mut history: Vec<Message> = Vec::new();
-    let stdin = std::io::stdin();
-    let mut line = String::new();
+    // A real line editor rather than the tty's cooked mode, which gets erase
+    // wrong whenever the terminal and `stty erase` disagree about what the
+    // delete key sends, and has no arrows or recall. Input recall lives in
+    // this process's heap only — rustyline is built without file history —
+    // and `/wipe` / `/new` clear it along with the conversation.
+    let mut editor = rustyline::DefaultEditor::with_config(
+        rustyline::Config::builder()
+            .auto_add_history(true)
+            .history_ignore_dups(true)?
+            .build(),
+    )?;
 
     loop {
-        print!("\n\x1b[1m»\x1b[0m ");
-        std::io::stdout().flush().ok();
-
-        line.clear();
-        if stdin.lock().read_line(&mut line)? == 0 {
-            // EOF (ctrl-D).
-            break;
-        }
+        println!();
+        let line = match editor.readline("\x1b[1m»\x1b[0m ") {
+            Ok(line) => line,
+            // ctrl-C at the prompt discards the line, as in a shell.
+            Err(rustyline::error::ReadlineError::Interrupted) => continue,
+            // ctrl-D.
+            Err(rustyline::error::ReadlineError::Eof) => break,
+            Err(e) => return Err(e.into()),
+        };
         let input = line.trim();
         if input.is_empty() {
             continue;
@@ -177,6 +187,7 @@ fn main() -> anyhow::Result<()> {
             }
             "/wipe" => {
                 history.clear();
+                editor.clear_history()?;
                 wipe(&tx_cmd);
                 // Ask the terminal to drop its scrollback too. Honoured by
                 // Terminal.app and iTerm2; harmless where it is not.
@@ -187,6 +198,7 @@ fn main() -> anyhow::Result<()> {
             }
             "/new" => {
                 history.clear();
+                editor.clear_history()?;
                 wipe(&tx_cmd);
                 println!("new conversation.");
                 continue;

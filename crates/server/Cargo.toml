@@ -22,6 +22,9 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 futures = "0.3"
+# Line editing for the private REPL. Default features off: no file history
+# support is even compiled in, so there is no code path that could write one.
+rustyline = { version = "18", default-features = false }
 
 [[bin]]
 name = "llmoxide-private"
