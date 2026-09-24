@@ -16,6 +16,12 @@ futures = "0.3"
 # common dialog, the XDG portal on Linux). Used directly rather than through
 # dioxus-native's `file_dialog`, which is for `<input type=file>`.
 rfd = "0.17"
+# Replies are Markdown; this turns them into elements (see md.rs). Parsing
+# only — no HTML output, no raw HTML passed through.
+pulldown-cmark = { version = "0.13", default-features = false }
+# The Copy button under replies (see clip.rs) — an explicit press, unlike
+# the input box's Cmd+C/V below. Without image support.
+arboard = { version = "3.6", default-features = false }
 # The native renderer (Blitz: winit + vello), not the webview one. With a
 # webview the conversation would be rendered by WebKit's own processes —
 # outside this process's locked, self-zeroing memory, and free to keep caches
@@ -37,7 +43,8 @@ rfd = "0.17"
 dioxus-native = { version = "0.7.10", default-features = false, features = ["prelude", "system-fonts", "autofocus", "hot-reload"] }
 
 [features]
-# System clipboard in the input box. Off by default: whatever is copied lands
+# System clipboard in the input box (the Copy button is separate and always
+# there; see clip.rs). Off by default: whatever is copied lands
 # on the shared pasteboard, which every other app can read and clipboard
 # managers keep a history of.
 clipboard = ["dioxus-native/clipboard"]

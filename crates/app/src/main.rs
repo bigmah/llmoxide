@@ -26,7 +26,9 @@
 //! still shows that inference ran, and root on a live machine can read this
 //! process's memory.
 
+mod clip;
 mod engine;
+mod md;
 mod ui;
 
 use std::any::Any;
@@ -70,6 +72,7 @@ extern "C" fn on_signal(_: i32) {
 }
 
 extern "C" fn on_exit() {
+    clip::forget();
     if let Some(engine) = ENGINE.get() {
         if engine.shutdown() {
             eprintln!("wiped and exited.");
@@ -130,6 +133,7 @@ fn main() {
     }
     std::thread::spawn(|| loop {
         if SIGNALLED.load(Ordering::SeqCst) {
+            clip::forget();
             // Wipe here, then exit. Leaving it to `on_exit` would run it on
             // this thread after its thread-locals are destroyed, and waiting
             // for the engine needs them.
@@ -159,6 +163,7 @@ fn main() {
     // The window is closed. Closing is the only way out that returns here;
     // Quit and signals go through `on_exit` instead, and all of them end in
     // the same `shutdown`.
+    clip::forget();
     if engine.shutdown() {
         eprintln!("wiped and exited.");
     }

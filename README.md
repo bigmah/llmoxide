@@ -21,8 +21,10 @@ single-file browser build.
 in one process, and nothing in it talks to the network.
 
 - **Enter** sends. **Shift+Enter** adds a new line. **Stop** cuts a reply short.
-- **Wipe** overwrites the conversation, the model's cache and the GPU buffers.
-- **Model…** opens the system file dialog to switch checkpoints. The current
+- Replies are rendered as Markdown. **Copy** under a reply puts its text on
+  the clipboard.
+- **New chat** overwrites the conversation, the model's cache and the GPU buffers.
+- The model name in the header opens the system file dialog to switch checkpoints. The current
   model is wiped and dropped before the next one loads. The conversation
   carries over and is replayed into the new model.
 - With no argument, it opens `models/gemma-4-E4B-it-Q4_K_M.gguf`. If that file
@@ -45,10 +47,11 @@ llmoxide is built so that none of those copies exist in the first place.
 | a webview's helper processes and caches under `~/Library` | the UI is Dioxus's **native** renderer (Blitz on wgpu), not a webview. It lays out and paints in-process, and no JavaScript runs |
 | swap and `/var/vm/sleepimage` | the prompt ids and the reply are `mlock`ed, so these pages are never swapped out |
 | freed heap blocks | a zeroing global allocator overwrites every allocation when it is freed, including `realloc`'s old block |
-| GPU memory | Wipe clears every device buffer. `wipe_check` reads them back to prove it: 41 million non-zero words on the 27B before a wipe, **0 after** |
+| GPU memory | New chat clears every device buffer. `wipe_check` reads them back to prove it: 41 million non-zero words on the 27B before a wipe, **0 after** |
 | shell history | prompts are typed into the window, never passed as arguments |
 | core dumps, debuggers, crash reports | `RLIMIT_CORE=0` and `PT_DENY_ATTACH` are set. A panic wipes, then calls `_exit`, so macOS never writes a crash report |
-| the pasteboard, the accessibility tree | the renderer's clipboard, accessibility and network features are compiled out. `nm` on the release binary finds no `reqwest`, `hyper`, `tungstenite`, `arboard` or `accesskit` |
+| the accessibility tree, the network | the renderer's accessibility and network features are compiled out. `nm` on the release binary finds no `reqwest`, `hyper`, `tungstenite` or `accesskit` |
+| the pasteboard | text reaches it only when you press **Copy**. The copy is marked `org.nspasteboard.ConcealedType` so clipboard managers skip it, and New chat or quitting clears it again unless you have copied something else since |
 
 Every exit path wipes before the process ends. That covers closing the window,
 Cmd+Q, Ctrl-C, `SIGTERM`, and a panic.

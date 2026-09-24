@@ -93,9 +93,11 @@ exactly, so the vision crate decodes with it too (it had 0.25.10, and zune-jpeg
 values differ, none by more than 2 levels; PNG decodes identically. The
 newspaper still reads "MEN WALK ON MOON", and `vision_check` still passes.
 
-Enter sends, Shift+Enter is a new line, **Stop** cuts a reply short, **Wipe**
-overwrites the conversation, the model's cache and the device buffers.
-**Model…** opens the platform's file dialog (NSOpenPanel, the Windows common
+Enter sends, Shift+Enter is a new line, **Stop** cuts a reply short, **New
+chat** overwrites the conversation, the model's cache and the device buffers.
+Replies are rendered as Markdown by folding `pulldown-cmark`'s events into
+elements; no HTML string is built, and raw HTML in a reply shows as text.
+Clicking the model name opens the platform's file dialog (NSOpenPanel, the Windows common
 dialog, the XDG portal) on `models/`. Switching wipes and drops the current
 model before loading the next, since two large ones rarely fit side by side,
 and keeps the conversation: it is text on the UI side, and the next turn
@@ -116,15 +118,24 @@ on the heap `ZeroizingAlloc` zeroes on free. No JavaScript runs.
 
 The renderer is built with most of its default features **off**, and each one
 is a capability the binary does not have. `nm` on the release build finds no
-`reqwest`, `hyper`, `tungstenite`, `arboard` or `accesskit`:
+`reqwest`, `hyper`, `tungstenite` or `accesskit`:
 
 | feature | why it is off |
 |---|---|
 | `net` | an HTTP client for fetching remote resources |
 | `accessibility` | publishes every message to the OS accessibility tree, readable by any app granted accessibility access |
-| `clipboard` | copied text lands on the shared pasteboard, which clipboard managers keep. Opt back in with `--features clipboard` |
+| `clipboard` | Cmd+C/Cmd+V in the input box. Copied text lands on the shared pasteboard, which clipboard managers keep. Opt back in with `--features clipboard` |
 | `file_dialog` | nothing here opens files |
 | `hot-reload` | **on**, because dioxus-native 0.7.10 does not compile without it. Its devserver client is compiled only with `debug_assertions`, so release builds have none; debug builds only dial out when `DIOXUS_DEVSERVER_PORT` is set, and `main` unsets it |
+
+The **Copy** button under a reply is separate from that feature: it uses
+`arboard` directly, so `arboard` is in the binary, but it only touches the
+pasteboard when pressed. The copy carries `org.nspasteboard.ConcealedType`
+(`ExcludeClipboardContentFromMonitorProcessing` on Windows,
+`x-kde-passwordManagerHint` on Linux), the convention clipboard managers use to
+skip passwords. New chat, closing the window, Cmd+Q and signals clear the
+pasteboard if it still holds that copy. A panic does not, and anything that
+read the pasteboard in between has its own copy.
 
 On top of [the REPL's list](#what-this-does-not-cover), the app does not cover:
 
