@@ -1,1087 +1,134 @@
 # llmoxide
 
-A local inference CLI that leaves nothing behind — GGUF loader, k-quant
-decoders, tokenizers, and wgpu compute kernels written from scratch in Rust with
-no ML dependencies. Three architectures: gemma4, qwen35's hybrid delta-net
-stack, and plain dense Qwen3. gemma4 also takes **image input**, through E4B's
-vision tower — see [Images](#images). The same code also compiles to wasm and
-runs in a browser on WebGPU — see [In a browser](#in-a-browser).
-
-The one thing not written from scratch is image *decoding*: the `vision`
-feature pulls in `image` for PNG/JPEG, which is a container format problem
-rather than an inference one. It is off by default, so a text-only build's
-dependency graph is unchanged.
-
-The point of it is `llmoxide-private`: a session that writes nothing to disk,
-keeps the conversation in locked memory, and can overwrite every trace of it on
-demand. There is an OpenAI-compatible server too, but it is a side road and it
-is **not private** — see [Serving](#serving-afterthought-and-not-private).
-
-It is also a library. `llmoxide` is one dependency that re-exports the whole
-workspace — see [Using it from another crate](#using-it-from-another-crate).
-
-Built for one user on one machine (Apple M4 Pro, 48 GB), so it runs one request
-at a time against one GPU context.
+A private, local chat app for open-weight LLMs. The conversation never leaves
+the machine and never touches the disk. When you close the window, it is
+overwritten.
 
 ```sh
-cargo run --release                                 # the chat window, on gemma4 E4B
-cargo run --release -- models/Qwen3.8-27B-Q6_K.gguf # ...or any other checkpoint
+cargo run --release -p llmoxide-hub --bin llmoxide-fetch -- gemma4-e4b-q4   # 5.3 GB, once
+cargo run --release                                                        # opens the chat window
 ```
 
-The window is the workspace's only default member (see
-[The desktop app](#the-desktop-app)), so everything else — the fetch tool, the
-REPL, the server — builds with `--workspace`:
+Everything is written from scratch in Rust with no ML dependencies: the GGUF
+loader, k-quant decoders, tokenizers, and wgpu compute kernels. It runs
+Gemma 4 (12B and E4B, with image input), Qwen 3.8 27B (hybrid delta-net), and
+dense Qwen3. The same engine drives a terminal REPL, a library crate, and a
+single-file browser build.
 
-```sh
-cargo build --release --workspace
-./target/release/llmoxide-fetch                                # get the models
-./target/release/llmoxide-private models/Qwen3.8-27B-Q6_K.gguf # or use them in a terminal
-```
+## The chat window
 
-```
-»  what is the capital of France?
-Paris
-»  /wipe
-wiped: conversation, device buffers, locked pages.
-```
+`llmoxide-app` is a native window over the inference engine. Everything runs
+in one process, and nothing in it talks to the network.
+
+- **Enter** sends. **Shift+Enter** adds a new line. **Stop** cuts a reply short.
+- **Wipe** overwrites the conversation, the model's cache and the GPU buffers.
+- **Model…** opens the system file dialog to switch checkpoints. The current
+  model is wiped and dropped before the next one loads. The conversation
+  carries over and is replayed into the new model.
+- With no argument, it opens `models/gemma-4-E4B-it-Q4_K_M.gguf`. If that file
+  isn't there, it opens on the picker. You can pass any other checkpoint:
+
+  ```sh
+  cargo run --release -- models/Qwen3.8-27B-Q6_K.gguf   # or LLMOXIDE_MODEL=...
+  ```
+
+## Privacy
+
+Most local LLM setups are private only in the sense that inference is local.
+The conversation still ends up somewhere: in a client's SQLite history, in
+shell history, in terminal scrollback, in a webview cache, or in swap.
+llmoxide is built so that none of those copies exist in the first place.
+
+| where a conversation usually persists | here |
+|---|---|
+| a chat client's history database | there is no client; the UI is the engine's own process |
+| a webview's helper processes and caches under `~/Library` | the UI is Dioxus's **native** renderer (Blitz on wgpu), not a webview. It lays out and paints in-process, and no JavaScript runs |
+| swap and `/var/vm/sleepimage` | the prompt ids and the reply are `mlock`ed, so these pages are never swapped out |
+| freed heap blocks | a zeroing global allocator overwrites every allocation when it is freed, including `realloc`'s old block |
+| GPU memory | Wipe clears every device buffer. `wipe_check` reads them back to prove it: 41 million non-zero words on the 27B before a wipe, **0 after** |
+| shell history | prompts are typed into the window, never passed as arguments |
+| core dumps, debuggers, crash reports | `RLIMIT_CORE=0` and `PT_DENY_ATTACH` are set. A panic wipes, then calls `_exit`, so macOS never writes a crash report |
+| the pasteboard, the accessibility tree | the renderer's clipboard, accessibility and network features are compiled out. `nm` on the release binary finds no `reqwest`, `hyper`, `tungstenite`, `arboard` or `accesskit` |
+
+Every exit path wipes before the process ends. That covers closing the window,
+Cmd+Q, Ctrl-C, `SIGTERM`, and a panic.
+
+Some things are out of scope. The window cannot hide that inference happened:
+the model file's access time and the process launch are still recorded. It
+cannot protect against root on a live machine. Pixels stay in the compositor
+until they are repainted. The file dialog remembers the last folder it opened.
+[docs/privacy.md](docs/privacy.md) has the full threat model, what is not
+covered, and how each claim is verified.
+
+## Portability
+
+- **A single binary.** The release build of the app is one ~24 MB executable.
+  It links only the system frameworks: no Python, no CUDA, no runtime to
+  install.
+- **A single model file.** Each checkpoint is a single GGUF.
+  [`llmoxide-fetch`](docs/models.md) downloads it with resume, checks it
+  against its SHA-256, and parses it before the download counts as complete.
+  After that, nothing needs the network.
+- **A GPU through wgpu.** The WGSL kernels are standard compute shaders. On
+  Apple GPUs, a hand-written Metal GEMM speeds up prefill, and the WGSL
+  version is used everywhere else.
+- **A browser tab.** The same engine compiles to wasm and runs on WebGPU in
+  Chrome, Edge and Safari. `scripts/build-web.sh --embed <model>` bakes the
+  checkpoint into **one HTML file** that works offline from `file://`, with no
+  server. The browser build cannot `mlock`, so it zeroes memory but does not
+  lock it. See [docs/browser.md](docs/browser.md).
+- **A library.** `llmoxide` is one dependency that re-exports the whole
+  workspace. The `private` feature adds the same locked, self-zeroing memory
+  the app uses. See [docs/library.md](docs/library.md).
+
+The desktop builds are developed and verified on macOS (Apple M4 Pro, 48 GB).
+The privacy layer calls `memset_s` and `PT_DENY_ATTACH` directly, so Linux and
+Windows need ports of those calls before the app builds there.
 
 ## Models
 
-Five checkpoints, each validated against tensor-by-tensor. All run on the GPU;
-the CPU forward passes stay in the tree as the reference every kernel is checked
-against, not as a fallback.
-
-| alias | file | arch | size | sha256 |
-|---|---|---|---|---|
-| `gemma4` | `gemma4-v2-Q4_K_M.gguf` | gemma4, 12B, 48 layers | 7.38 GB | `0b9506ca…` |
-| `gemma4-e4b` | `gemma-4-E4B-it-Q8_0.gguf` | gemma4, E4B, 42 layers | 8.03 GB | `34be82b1…` |
-| `gemma4-e4b-q4` | `gemma-4-E4B-it-Q4_K_M.gguf` | gemma4, E4B, 42 layers | 5.34 GB | `d35a3aa7…` |
-| `gemma4-e4b-mmproj` | `mmproj-gemma-4-E4B-it-BF16.gguf` | gemma4v vision tower | 0.99 GB | `bdfc4935…` |
-| `qwen35` | `Qwen3.8-27B-OBLITERATED-Q6_K.gguf` | qwen35, 27B hybrid, 64 layers | 22.43 GB | `3535d4a1…` |
-| `qwen3-0.6b` | `Qwen3-0.6B-Q8_0.gguf` | qwen3, 0.6B dense, 28 layers | 0.64 GB | `e150ed54…` |
-| `qwen3-0.6b-q4` | `Qwen3-0.6B-Q4_K_M.gguf` | qwen3, 0.6B dense, 28 layers | 0.40 GB | `ac2d9771…` |
-
-From [`yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF`](https://huggingface.co/yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF)
-and [`OBLITERATUS/Qwen3.8-27B-OBLITERATED`](https://huggingface.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED)
-respectively, and `gemma4-e4b` from
-[`ggml-org/gemma-4-E4B-it-GGUF`](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF).
-`qwen3-0.6b` is the one small enough to *serve*: 0.64 GB, from
-[`unsloth/Qwen3-0.6B-GGUF`](https://huggingface.co/unsloth/Qwen3-0.6B-GGUF).
-It is Q8_0 rather than a Q4 because at 0.6B the quantization error is the first
-thing you notice, and 0.64 GB is already inside any sane download budget. There
-is nothing smaller worth having in either family — see
-[Why not a smaller Gemma](#why-not-a-smaller-gemma).
-
-`gemma4-e4b-q4` is the same E4B at a size a browser tab will actually allocate,
-from [`lmstudio-community`](https://huggingface.co/lmstudio-community/gemma-4-E4B-it-GGUF) —
-that repo rather than the obvious ones because a GGUF is only loadable here if
-*every* tensor is a type the decoders handle. ggml-org publishes E4B as Q8_0 or
-Q4_0, and there is no Q4_0 decoder; bartowski's Q4_K_M mixes in 84 Q5_K
-tensors, which there is also no decoder for. Both are rejected at load rather
-than part-way through a forward pass, which is what the structure check in
-`llmoxide-fetch` is for — it caught the second one after the download had
-already passed its SHA-256.
-`qwen35` is the interesting one architecturally: a hybrid stack where three
-quarters of the layers are gated delta-net rather than attention.
-
-Plain **qwen3** is not a separate implementation. Read as a config, it *is*
-qwen35 with two things switched off: every layer is full attention rather than
-delta-net, and `attn_q` carries no fused output gate, so it is `head_dim` wide
-per head instead of `2 * head_dim`. Everything else — RMSNorm, GQA, per-dim
-query and key norms, NeoX RoPE, SwiGLU — is the same code, so `qwen3` costs one
-`Config::query_gate` flag and three branches rather than a second copy of an
-attention block that already worked. The 27B is re-checked against the CPU path
-at all 771 checkpoints after every change to it.
-
-Two Qwen traps came with that. Its vocabulary uses the **classic `qwen2`
-pre-tokenizer split**, which is the qwen35 one with every `\p{M}` term removed —
-so combining marks no longer travel with the letters they modify. Picking the
-wrong split does not fail, it just tokenizes subtly differently everywhere;
-`pre::Marks` makes it one function with marks switched off rather than two
-hand-ports that could drift. And Qwen3 ships **no `general.sampling.*`
-metadata**, so a single hard-coded fallback would sample it with Gemma's
-temperature of 1.0 against Qwen's published 0.7 — which on a 0.6B model reads
-as the model being weak rather than the sampler being wrong.
-`Sampling::family_default` picks per family.
-
-One chat-format trap comes with it. The two checkpoints disagree on how to turn
-*off* reasoning: the 12B's template suppresses it by making the generation prompt
-open and immediately close an empty `thought` channel, and E4B's template has no
-such suppressor. Emitting the 12B's form to E4B does not disable thinking — the
-model finds the channel already closed, never opens another, and writes its
-reasoning into the visible answer. `Special::closes_empty_thought` reads which
-convention a checkpoint uses off its embedded template rather than assuming.
-
-`gemma4-e4b` is the same architecture as the 12B only in name. The E-series
-keeps a narrow 2560-wide residual stream and spends its parameters on a
-*per-layer embedding* table instead — a 256-wide vector looked up per token per
-layer, gated into the stream at the end of every block. That is what "E4B"
-means: 4.5B effective parameters out of 8B on disk. It also shares KV across
-the top of the stack, so layers 24–41 project Q only and attend into the cache
-of layer 22 (sliding) or 23 (global), and it writes `head_count_kv` as a scalar
-where the 12B writes a 48-entry array. Config reads all of this out of the GGUF;
-see [`crates/model/src/config.rs`](crates/model/src/config.rs).
-
-```sh
-./target/release/llmoxide-fetch            # all three, into models/
-./target/release/llmoxide-fetch gemma4     # or one
-./target/release/llmoxide-fetch hf:owner/repo/file.gguf
-./target/release/llmoxide-fetch https://huggingface.co/owner/repo/blob/main/f.gguf
-```
-
-Transfers **resume** — interrupt one, run the same command again, and it picks
-up from the byte it stopped at. Everything reports progress, the SHA-256 passes
-included, because at 21 GB a verification with no output is indistinguishable
-from a hang.
-
-Nothing is called finished until three things agree: the size matches
-`x-linked-size`, the SHA-256 matches `x-linked-etag`, and `gguf::Gguf::open`
-parses the result — which walks the tensor table and rejects any tensor running
-past the end of the file. Only then does the `.part` file take its real name, so
-an interrupted fetch can never be mistaken for a complete one. This repo already
-lost time to a download that stopped at 17.8 of 20.9 GiB and wrote a
-plausible-looking file; that is the check which would have caught it.
-
-If the same checkpoint is already in the directory under a different name it is
-hashed and hard-linked rather than downloaded again (`--no-adopt` to disable).
-Re-uploads get renamed constantly, and re-fetching 21 GB you already have is the
-most expensive mistake available here.
-
-Two traps worth knowing if you touch `crates/hub`:
-
-- A `/blob/` URL — what the website's copy button gives you — returns HTML. It
-  is rewritten to `/resolve/`, otherwise you download a few kilobytes of markup
-  that looks like a corrupt model.
-- A resolve URL 302s to a CDN, and `x-linked-size` / `x-linked-etag` live on
-  *that 302*, not on what it points at. Follow the redirect and you get the
-  CDN's `etag` instead — the xet content hash, which is also 64 hex characters
-  and is not the SHA-256 of the file. Verifying against it fails every honest
-  download, at the end, after 21 GB. `probe` stops at the redirect for exactly
-  this reason.
-
-## Private mode
-
-`llmoxide-private` exists because an engine that writes nothing to disk is not
-the same thing as a session being unrecoverable afterwards. Three things hold
-the conversation, and `reset` touches none of them: the resident prompt ids kept
-for prefix reuse, the device buffers holding everything derived from them, and
-the heap copies prompt text passes through in between.
-
-```sh
-./target/release/llmoxide-private models/Qwen3.8-27B-Q6_K.gguf
-```
-
-```
-  /wipe   overwrite the conversation, device buffers and scrollback
-  /new    same, but stay in the session
-  /image <path> [question]   ask about an image (needs --mmproj)
-  /quit   wipe and exit  (ctrl-D also works, ctrl-C stops a reply)
-```
-
-With `--mmproj models/mmproj-gemma-4-E4B-it-BF16.gguf`, `/image` takes a local
-path and the engine thread reads it, so the pixels never cross into the REPL's
-own heap. See [Images](#images).
-
-What it does that the other entry points do not:
-
-- **Prompts are typed, never passed as arguments.** `llmoxide model "..."` puts
-  the prompt verbatim into your shell history — and a history configured with
-  `SAVEHIST` raised and `EXTENDED_HISTORY` set keeps it, timestamped,
-  indefinitely. Reading stdin skips the shell entirely.
-- **No client, so no client-side archive.** This is the one that matters most in
-  practice, and the reason this mode exists at all rather than a flag on the
-  server.
-- **The heap is zeroed as it is freed.** `secret::ZeroizingAlloc` is installed
-  as the global allocator, so the copies no wipe could chase — the chat
-  template's strings, decoded token pieces, per-token logit vectors — never
-  outlive their allocation. `realloc` deliberately falls through to
-  alloc + copy + dealloc rather than the system's, which would hand back a
-  growing `String`'s old block with the plaintext intact.
-- **The prompt ids and the response are `mlock`ed.** This matters more than the
-  wipe itself: zeroing a page *after* it has reached swap or
-  `/var/vm/sleepimage` does not unwrite it. Locked pages never go there.
-- **`secret::harden()`** drops `RLIMIT_CORE` to zero and sets `PT_DENY_ATTACH`,
-  closing the two ways this memory is read without touching disk at all.
-
-`wipe` clears device memory as well as host memory, and the engine now wipes
-rather than resets whenever a prompt misses the cache — that costs a buffer
-clear per miss, tens of milliseconds against a prefill measured in seconds.
-
-### Verifying it
-
-`wipe` is exactly the kind of claim that looks true and isn't: `reset` appears
-to clear the KV cache and does not, and a `clear_buffer` that was queued but
-never submitted is indistinguishable from the host side. So it is checked:
-
-```sh
-./target/release/wipe_check <model.gguf> [prompt]   # exits non-zero on any residue
-```
-
-It prefills a prompt, confirms the device buffers are full of it, wipes, and
-reads every buffer back. Measured: **4 019 403 non-zero words across 108 buffers
-on gemma4, and 41 487 330 across 147 on the 27B — 0 after the wipe on both.** It
-refuses to pass vacuously if nothing was resident to begin with.
-
-### What this does not cover
-
-- **Terminal scrollback.** `/wipe` asks the emulator to clear it, which
-  Terminal.app and iTerm2 honour, but that is a request, not a guarantee.
-  Closing the window is the reliable version.
-- **That inference happened.** The GGUF's access time, the GPU at full tilt for
-  twenty minutes, the process-launch record in the unified log. What was asked
-  can be made unrecoverable; that something was asked cannot.
-- **Root on a live machine**, which can read process memory regardless.
-- **A `SIGKILL` before the wipe runs** — though `mlock` covers the disk side of
-  that case, and the kernel zeroes freed physical pages before reissuing them.
-- **Any client you put in front of the server.** See below.
-
-### The desktop app
-
-`llmoxide-app` is the same session with a chat window instead of a terminal,
-which also removes the one residue the REPL could only ask about: scrollback.
-
-```sh
-cargo run --release -- models/Qwen3.8-27B-Q6_K.gguf  # or LLMOXIDE_MODEL=...
-```
-
-It is `default-members`, which is what makes a bare `cargo run` open it — and
-also means a bare `cargo build`, `cargo test` or `cargo clippy` covers only the
-app. Add `--workspace` for the rest, or `-p` for one package.
-
-One side effect of sharing the lockfile: blitz-dom pins `image = "=0.25.6"`
-exactly, so the vision crate decodes with it too (it had 0.25.10, and zune-jpeg
-0.5 rather than 0.4). Measured on `test-image.jpg`: 108 of 936 960 channel
-values differ, none by more than 2 levels; PNG decodes identically. The
-newspaper still reads "MEN WALK ON MOON", and `vision_check` still passes.
-
-Enter sends, Shift+Enter is a new line, **Stop** cuts a reply short, **Wipe**
-overwrites the conversation, the model's cache and the device buffers.
-**Model…** opens the platform's file dialog (NSOpenPanel, the Windows common
-dialog, the XDG portal) on `models/`. Switching wipes and drops the current
-model before loading the next, since two large ones rarely fit side by side,
-and keeps the conversation: it is text on the UI side, and the next turn
-replays it into the new model. With no model argument and no
-`models/gemma-4-E4B-it-Q4_K_M.gguf`, the window opens on the picker.
-Closing the window, Cmd+Q, Ctrl-C and `SIGTERM` all wipe before the process
-exits, and a panic wipes and leaves by `_exit` so it never becomes a macOS
-crash report. `LLMOXIDE_CTX`, `LLMOXIDE_BATCH` and `LLMOXIDE_CPU` work as in the
-REPL.
-
-The UI is Dioxus with its **native** renderer (Blitz: winit + vello on wgpu),
-not the webview one. That choice is the privacy argument. A webview renders in
-WebKit's own helper processes, so every message would have a copy outside this
-process's zeroed heap, and WebKit keeps its own caches under `~/Library`. Blitz
-lays out and paints inside this process, so the text goes from the engine's
-channel into a signal, then a DOM node, then shaped glyphs, and each copy sits
-on the heap `ZeroizingAlloc` zeroes on free. No JavaScript runs.
-
-The renderer is built with most of its default features **off**, and each one
-is a capability the binary does not have. `nm` on the release build finds no
-`reqwest`, `hyper`, `tungstenite`, `arboard` or `accesskit`:
-
-| feature | why it is off |
-|---|---|
-| `net` | an HTTP client for fetching remote resources |
-| `accessibility` | publishes every message to the OS accessibility tree, readable by any app granted accessibility access |
-| `clipboard` | copied text lands on the shared pasteboard, which clipboard managers keep. Opt back in with `--features clipboard` |
-| `file_dialog` | nothing here opens files |
-| `hot-reload` | **on**, because dioxus-native 0.7.10 does not compile without it. Its devserver client is compiled only with `debug_assertions`, so release builds have none; debug builds only dial out when `DIOXUS_DEVSERVER_PORT` is set, and `main` unsets it |
-
-On top of [the REPL's list](#what-this-does-not-cover), the app does not cover:
-
-- **The UI's copy of the conversation is zeroed when freed but not `mlock`ed**,
-  the same as the REPL's history `Vec`. The engine's copy is locked.
-- **Pixels.** Rendered text is in the window's GPU surfaces and the
-  compositor's buffers until it is repainted. Wipe repaints.
-- **Native crashes** (a GPU driver fault, say) still produce a report in
-  `~/Library/Logs/DiagnosticReports`. The report holds a stack and machine
-  details, not memory contents, but it is a dated record that the app ran.
-- **Input methods.** Keystrokes pass through the OS text input system like
-  any app's.
-- **The file dialog remembers the last folder.** macOS stores it as a bookmark
-  under `NSOSPLastRootDirectory` in
-  `~/Library/Preferences/com.apple.ViewBridge.masquerading-service-lacks-host-bundle-identifier.plist`,
-  shared by every app without a bundle id. The folder, not the file, and
-  nothing from a conversation — but a record of where the models live.
-  `defaults delete com.apple.ViewBridge.masquerading-service-lacks-host-bundle-identifier NSOSPLastRootDirectory`
-  removes it; passing the model as an argument avoids the dialog entirely.
-
-## Correctness
-
-Both architectures are genuinely unusual — see [ARCHITECTURE.md](ARCHITECTURE.md)
-for the four things that will silently produce garbage if you assume the
-Gemma 2/3 shape, and [ARCHITECTURE-qwen35.md](ARCHITECTURE-qwen35.md) for the
-hybrid stack's own traps (head tiling, l2-norm eps, the fused query gate).
-Everything is checked against llama.cpp rather than asserted:
-
-| what | check |
-|---|---|
-| gemma4 tokenizer | exact id-for-id match with `llama-tokenize` on 13 cases + a 3547-token file |
-| gemma4 CPU forward | **byte-identical** greedy output to `llama-completion --temp 0` |
-| gemma4 GPU kernels | every matvec within ~1e-7 of the CPU dequant-dot, on real weights |
-| gemma4 GPU forward | all 773 intermediate tensors match the CPU path across 48 layers (~1e-6) |
-| gemma4v vision tower (CPU) | written against llama.cpp's `clip_graph_gemma4v`; a transpose-sensitive test image places both squares correctly, and the model reads the headline and date off a newspaper photo |
-| gemma4v vision tower (GPU) | all 332 800 output values within 1.7e-5 of the CPU reference on a real image, at 441, 1 170 and 2 304 patches (`vision_check`) |
-| E4B CPU forward | 674 tensors across all 42 layers traced against `llama-eval-callback`; KV-sharing boundary matches exactly (llama.cpp emits `Kcur` for layers 0–23 only) |
-| E4B GPU forward | **471/471** checkpoints match the CPU path across 42 layers (~1e-6), per-layer embeddings included |
-| E4B chat format | `reasoning_content` / `content` split matches `llama-server --jinja` on the same request, thinking on and off |
-| qwen35 tokenizer | exact id-for-id match with `llama-tokenize` on 18 cases + 3 files (~11k tokens) |
-| qwen35 CPU forward | 567 tensors across all 64 layers match `llama-eval-callback` within 4e-4 on a real 27B; **byte-identical** greedy output to `llama-completion --temp 0` |
-| qwen35 GPU forward | **771/771** checkpoints match the CPU path on the 27B (logits rel 1.3e-6, same argmax) |
-| qwen35 chat format | prompt ids match a jinja2 rendering of the embedded template, with and without tools |
-| qwen3 tokenizer | exact id-for-id match with `llama-tokenize` on 21 cases and 6 files (30 610 tokens), with `--no-escape`; the only divergences are literal `<think>`/`<tool_call>` spellings in raw text, which are deliberately not matched as control tokens and which the validated qwen35 path treats the same way |
-| qwen3 CPU forward | **byte-identical** greedy output to `llama-completion --temp 0` on 6 prompts / 288 tokens, code and prose |
-| qwen3 GPU forward | **339/339** checkpoints match the CPU path across 28 layers, same argmax |
-| qwen3 chat format | single-turn prompt ids match a jinja2 rendering of the embedded template exactly; multi-turn deliberately differs, see below |
-| browser kernels | the WGSL rewrites for Tint leave `bisect` at **all checkpoints match** on E4B Q4_K_M, and `kernels` matching the CPU dequant-dot on *both* reduction paths (`LLMOXIDE_NO_SUBGROUP=1` is the one the browser takes) |
-
-Tools that reproduce this:
-
-```sh
-./target/release/kernels        models/gemma4-v2-Q4_K_M.gguf   # per-kernel vs CPU
-./target/release/bisect         models/gemma4-v2-Q4_K_M.gguf   # per-layer GPU vs CPU
-./target/release/bisect_qwen35  <model> [ids]                  # per-checkpoint GPU vs CPU
-./target/release/validate_qwen35 <model> <refs.json> <ids>     # vs llama-eval-callback
-./target/release/upload_check   <model>                        # weight arena readback
-cargo run --release -p llmoxide --example vision_check --features vision,gpu -- \
-    models/mmproj-gemma-4-E4B-it-BF16.gguf photo.jpg           # vision tower GPU vs CPU
-./target/release/wipe_check     <model> [prompt]               # wipe leaves no residue
-./target/release/tok            <model> [text]                 # ids, vs llama-tokenize
-./target/release/prompt         <model> < messages.json        # chat ids, vs a jinja render
-```
-
-`bisect` reports the *first* diverging checkpoint, which is how the NaN in
-GeGLU and the attention-scale error were both found. The qwen35 workflow
-(including a synthetic-checkpoint generator for fast whole-graph checks) is in
-[ARCHITECTURE-qwen35.md](ARCHITECTURE-qwen35.md) and `scripts/`.
-
-One caveat on provenance: the tensor-level qwen35 numbers above were measured
-against `Qwen3.8-27B-Uncensored-Cyber-Q6_K.gguf`, which carries no NextN block.
-The checkpoint in `models/` is SHA-256 identical to the OBLITERATED build in the
-table above — same architecture plus one NextN block, which the loader skips —
-but has not been put back through `validate_qwen35` since.
-
-## Performance
-
-On an M4 Pro (20 GPU cores), measured, not projected. Decode is quoted with the
-context it ran at, because attention cost grows with it:
-
-| gemma4 | before | now | llama.cpp (Metal) |
+| alias | checkpoint | size | notes |
 |---|---|---|---|
-| decode @ 128 ctx | 12.7 tok/s | **22.3 tok/s** | 32.6 tok/s |
-| decode @ 512 ctx | 8.6 tok/s | **18.4 tok/s** | |
-| decode @ 2048 ctx | 5.0 tok/s | **12.9 tok/s** | |
-| prefill, 374 tokens | 23.5 tok/s | **35.0 tok/s** | much higher |
-| prefill, 1490 tokens | 20.7 tok/s | **32.7 tok/s** | |
+| `gemma4-e4b-q4` | Gemma 4 E4B, Q4_K_M | 5.3 GB | the app's default |
+| `gemma4-e4b` | Gemma 4 E4B, Q8_0 | 8.0 GB | |
+| `gemma4-e4b-mmproj` | Gemma 4 vision tower | 1.0 GB | image input, see [docs/images.md](docs/images.md) |
+| `gemma4` | Gemma 4 12B, Q4_K_M | 7.4 GB | |
+| `qwen35` | Qwen 3.8 27B, Q6_K | 22.4 GB | hybrid delta-net / attention |
+| `qwen3-0.6b` | Qwen3 0.6B, Q8_0 | 0.6 GB | small enough for a browser download |
 
-| qwen35 27B (Q6_K) | before | now |
-|---|---|---|
-| prefill, 301 tokens | 14.0 tok/s | **78.7 tok/s** |
-| decode | 8.9 tok/s | 9.4 tok/s |
+Each model is checked tensor by tensor against llama.cpp. The GPU path matches
+the CPU reference at every checkpoint, and greedy output is byte-identical to
+`llama-completion`. See [docs/correctness.md](docs/correctness.md). On the M4
+Pro, gemma4 decodes at 22 tok/s. The 27B prefills at 79 tok/s and decodes at
+9.4 tok/s, within ~10% of the memory-bandwidth limit. See
+[docs/performance.md](docs/performance.md).
 
-The CPU reference path does ~1.1 tok/s decode and ~0.6 tok/s prefill.
+## Other ways in
 
-Prefill gained 5.6x from a real GEMM. The old prefill path reused the decode
-matvec across 2-token tiles, so a 300-token prompt read all 22 GB of weights 150
-times. Now each workgroup dequantizes a weight tile once into threadgroup memory
-and uses it for a whole tile of tokens. There are two implementations, picked in
-`QuantKernels::new`:
-
-- **`shaders/gemm_q6k.metal`**, on Apple GPUs. It is hand-written MSL, loaded
-  through wgpu's experimental MSL passthrough, and runs the inner product on
-  `simdgroup_float8x8` hardware matrix multiply-accumulates. WGSL cannot express
-  these. It reaches ~4.4 TFLOP/s on an M4 Pro, all in f32. Staging in f16 was
-  measured: it was no faster and 100x less accurate. Nothing checks the kernel
-  against the pipeline layout, so its header spells out the buffer-slot mapping
-  it relies on.
-- **`shaders/gemm.wgsl`**, everywhere else, including the browser. It uses a
-  register-blocked vec4-FMA tile and tops out near 2.5 TFLOP/s on the same GPU.
-  `LLMOXIDE_NO_MSL=1` forces it on a Mac, so it stays tested.
-
-Batches under 16 tokens stay on the matvec, as do the 48-row `ssm_alpha`/`ssm_beta`
-projections. With the GEMM in place, prefill is almost entirely GEMM time:
-16 TFLOP for 301 tokens at 4.4 TFLOP/s.
-
-Decode is memory-bound and was already near the limit. The Q6_K matvec streams
-~215 GB/s. A kernel that does nothing but read the same bytes reaches only
-~225–242 GB/s (`GEMM_READBW=1` in the `gemm` bin). A decode kernel rewrite could
-therefore buy at most ~10%.
-
-`gemm` is the fast loop for this work. It loads only the named tensors, so it
-runs in seconds against the 22 GB checkpoint where a full load takes minutes. It
-times the matvec against the GEMM and checks both against the CPU reference:
+The window is the workspace's only default member, so a bare `cargo build` or
+`cargo test` covers only the app. Add `--workspace` to build everything else:
 
 ```sh
-cargo build --release -p llmoxide-gpu --bin gemm
-./target/release/gemm models/Qwen3.8-27B-Q6_K.gguf 301        # n_tokens
-./target/release/msl --gemm                                   # the WGSL GEMM as Metal
+cargo build --release --workspace
+./target/release/llmoxide-fetch                  # all models, into models/
+./target/release/llmoxide-private <model.gguf>   # the same private session, in a terminal
+./target/release/wipe_check <model.gguf>         # prove a wipe leaves no residue
+./target/release/llmoxide-serve <model.gguf>     # OpenAI-compatible API — not private
 ```
 
-Three things about the WGSL GEMM's generated Metal are easy to trip on and are
-written up at the top of `gemm.wgsl`. The main one: Naga silently drops
-dynamic-component stores into workgroup vectors (`ws[i][c] = v`).
-
-Greedy output is unchanged token-for-token, and `bisect` still matches the CPU
-path at every checkpoint.
-
-Four things got gemma4 there, in rough order of how much they were worth:
-
-- **Naga's loop-termination counters are off** (`Gpu::shader`). Naga wraps every
-  loop in a decrementing 64-bit guard, which costs ALU in the innermost loop and
-  hides constant trip counts from the Metal compiler. Bounds checks stay on;
-  only the guard is dropped, and every loop here is bounded by a tensor
-  dimension.
-- **The token tile is small, not large.** `acc` is indexed by a loop variable,
-  so it lives in per-thread scratch rather than registers, and its footprint is
-  what caps occupancy. Going from 32 tokens to 2 made prefill 2.5x faster while
-  multiplying weight traffic by 16 — so the matvec is bound by occupancy, not
-  bandwidth, which is the opposite of what this file used to claim.
-- **Attention reads Q/K/V as `vec4`**, with Q staged in workgroup memory instead
-  of re-read per key. Those passes are one FMA per element; a scalar load per
-  element doubled the work. Worth ~2x on decode at 2048 context.
-- **`subgroupAdd` replaces the barrier tree** in the matvec row reduction. Worth
-  a few percent on its own — the earlier note that Naga can't do this is wrong.
-  Naga rejects `enable subgroups;`, but the builtins compile without the
-  directive and the Metal backend emits `simd_sum`. `Gpu::new` still probes the
-  hardware for the subgroup width and falls back to the barrier tree if it
-  isn't 32; `LLMOXIDE_NO_SUBGROUP=1` forces that path so it stays tested.
-
-What is still on the table: decode cost continues to grow with context because
-the three attention passes only have `n_heads` workgroups between them, which
-cannot fill the GPU — splitting the key range across workgroups and reducing the
-partials afterwards is the fix. gemma4 prefill still uses the matvec. The GEMM
-only has a Q6_K path so far, and gemma4's checkpoints are mostly Q4_K, so
-porting the dequant step is the missing piece.
-
-Two dead ends are written up in `crates/gpu/src/shaders/quant.wgsl` so they
-don't get retried: hoisting the dequantization above the token loop, and
-widening the tile. Both look like obvious wins and both lose.
-
-Most of that was settled by reading the generated Metal rather than guessing —
-whether an accumulator reaches a register is not visible in the WGSL:
-
-```sh
-# `msl` pulls in naga, so it is behind a non-default feature rather than in
-# every consumer's dependency tree.
-cargo build --release -p llmoxide-gpu --features tools --bin msl
-./target/release/msl              # quant kernels as MSL, as wgpu compiles them
-./target/release/msl --barrier    # ...with the non-subgroup reduction
-```
-
-### Two silent failures at 27B scale
-
-Both return all-zero buffers with no error, and both are guarded now — details
-in [ARCHITECTURE-qwen35.md](ARCHITECTURE-qwen35.md):
-
-- **Uploads past the working set.** Mapping every arena buffer at once doubles a
-  25 GB model with staging shadows and the writes are simply dropped.
-  `Weights::upload` fills and flushes one buffer at a time and reads sampled
-  spans back; `upload_check` sweeps every tensor head.
-- **Over-long command buffers.** A whole forward pass is ~1500 dispatches, which
-  trips Metal's GPU watchdog on cold pipelines and long prefills.
-  `Qwen35Gpu::run` chunks at 64 dispatches per submit, and a device-lost
-  callback in `Gpu::new` turns any future watchdog kill into a printed message.
-
-### KV cache and prefix reuse
-
-Sliding-window layers get a 1024-slot ring instead of a full-context
-allocation — with 40 of 48 layers windowed, that is the difference between
-~2 GB and ~90 GB at gemma4's full 262144-token context. qwen35's recurrent
-layers carry state of a fixed size instead: a conv window plus one s_dim ×
-s_dim matrix per v-head, regardless of context length.
-
-The cache is reused when a new prompt strictly extends what is resident.
-Rewinding is deliberately not attempted: the ring has already overwritten the
-positions a rewind would need, and the delta-net state has no history to roll
-back to at all. To make the common agentic case hit this path, replayed
-assistant turns reproduce the empty thought channel the generation prompt
-emits — otherwise every turn diverges from the cache at the first assistant
-message and re-prefills the whole conversation.
-
-This is the one place the prompt deliberately departs from the checkpoints'
-own templates, and it applies to Qwen too. Qwen3's template strips the think
-block from assistant turns before the last user message; the 27B's emits none
-at all. Both would diverge from what the model actually generated, because the
-generation prompt that produced those turns *ended* with
-`<think>\n\n</think>\n\n`. Replaying it is both closer to the model's real
-context and the only version that keeps the cache. Single-turn prompts, where
-the question does not arise, match the template id-for-id.
-
-Reproducing the *text* is not enough, and this cost a silent regression: the
-replay emitted the empty block as `text("\n") + text("") + text("\n")`, which
-encodes to `[198, 198]`, while the generation prompt emits `text("\n\n")`,
-which the BPE merges into the single id `271`. Identical strings, different
-ids, and the cached prefix ended at that token — every qwen multi-turn
-conversation re-prefilled from scratch. Prompt pieces have to be encoded in
-the same *groupings*, not just the same order, because merges do not cross a
-call boundary.
-
-## One-shot generation
-
-```sh
-./target/release/llmoxide models/gemma4-v2-Q4_K_M.gguf "The capital of France is" 8
-./target/release/llmoxide models/Qwen3.8-27B-Q6_K.gguf "..." 8
-./target/release/llmoxide models/Qwen3.8-27B-Q6_K.gguf "..." 8 --cpu   # reference path
-```
-
-Useful for diffing against `llama-completion`, which is what it is there for.
-Note that the prompt is an argument, so it lands in your shell history —
-`llmoxide-private` if that matters.
-
-## Using it from another crate
-
-The workspace is consumable as a library. `llmoxide` is the crate to depend on:
-it re-exports every other one, so a consumer adds a single dependency and gets
-versions that cannot drift apart.
-
-```toml
-[dependencies]
-# Inference, and nothing else.
-llmoxide = { git = "https://github.com/bigmah/llmoxide" }
-
-# ...or with the privacy guarantees `llmoxide-private` is built on.
-llmoxide = { git = "https://github.com/bigmah/llmoxide", features = ["private"] }
-```
-
-```rust
-use llmoxide::{LoadOptions, Request, Session};
-
-let mut session = Session::load("models/Qwen3-0.6B-Q8_0.gguf", &LoadOptions::default())?;
-let out = session.complete(Request::user("what is the capital of France?"))?;
-println!("{}", out.completion.content);
-```
-
-Streaming is the same call with a callback; return `Flow::Stop` to cut a
-generation short:
-
-```rust
-session.generate(Request::user("hello"), |piece| {
-    print!("{piece}");
-    Flow::Continue
-})?;
-```
-
-Two runnable examples, both of which work against the 0.6B checkpoint:
-
-```sh
-cargo run --release -p llmoxide --example generate    -- models/Qwen3-0.6B-Q8_0.gguf "hello"
-cargo run --release -p llmoxide --example chat_stream -- models/Qwen3-0.6B-Q8_0.gguf
-```
-
-### The layers
-
-| | |
-|---|---|
-| `llmoxide::Session` | tokenizer, chat dialect, sampling, prefix reuse, tool-call filtering |
-| `llmoxide::backend::Backend` | one trait per (architecture, device): token ids in, logits out |
-
-Reach for `Backend` directly when the chat layer is in the way — that is what
-the `llmoxide` binary does, since a sampler between you and the logits defeats
-the point of a reference check. It is also where a new architecture is added,
-and where multimodal input will arrive: `Backend::forward_embeds` takes
-already-projected embedding rows, and `Session` prefills a `Prompt` of
-interleaved `Segment::Tokens` and `Segment::Embeds`, so an `mmproj` encoder
-plugs in without touching the generation loop. No architecture implements it
-yet; the default returns `Error::Unsupported`.
-
-### Features
-
-| feature | | |
-|---|---|---|
-| `gpu` | default | the wgpu backends. Off, the crate still reads checkpoints and runs the CPU reference paths, and does not build wgpu at all (9 fewer crates). |
-| `hub` | | resumable, hash-verified checkpoint downloads. |
-| `private` | | locked, self-zeroing conversation memory. |
-| `vision` | | image input: the gemma4v tower plus `image` for decoding. Off by default — a text-only caller should not pay for it, and the browser build cannot use it. |
-
-**`private` is off by default, and a plain dependency gets none of the privacy
-machinery** — `llmoxide-secret` does not appear in the tree at all, not even
-transitively. That is deliberate rather than an oversight about what this
-project is for. Locked memory is not free for a caller who only wants
-inference: `SecretVec` allocates page-aligned, zeroes on every reallocation,
-and prints a warning to stderr every time `mlock` is refused, which is every
-time under a low `RLIMIT_MEMLOCK` or in a container without `IPC_LOCK`. A
-library has no business writing to stderr on a machine that never asked for
-the guarantee — and an inference dependency that declares `mlock`, `ptrace`
-and `PT_DENY_ATTACH` is a bad surprise in someone else's audit.
-
-What the feature does *not* gate: `Backend::wipe` always clears the KV cache,
-the recurrent state and the device buffers, because prefix reuse depends on
-it. `private` decides whether those overwrites are `memset_s`-with-a-fence
-rather than an ordinary `fill`, and whether the resident token ids — the
-conversation itself, decodable straight back to plaintext — are locked into
-RAM. `llmoxide::PRIVATE_MEMORY` reports which build you have, so a caller that
-needs the guarantee can assert it instead of assuming it. `llmoxide-private`
-does exactly that, as a `const` assertion: the build fails rather than ship a
-banner promising locked memory it does not have.
-
-### What it will not do
-
-One `Session` is one conversation on one GPU context: no batching, and no
-sharing a loaded model between threads. A backend is `Send` but not `Sync`, so
-serving several callers means a queue in front of one session — which is
-exactly what `llmoxide-server` is.
-
-The CPU reference backends leak their `Gguf`, config and weights to `'static`
-rather than threading a self-referential borrow through three types, so a
-process gets one CPU model for its lifetime. The GPU backends upload and drop
-the mapping, and have no such limit.
-
-## Images
-
-E4B ships a vision tower in a separate `mmproj` file. Point the session at one
-and `image_url` content parts are encoded in place:
-
-```bash
-./target/release/llmoxide-fetch gemma4-e4b-q4
-./target/release/llmoxide-fetch gemma4-e4b-mmproj
-
-cargo run --release -p llmoxide --example image --features vision,gpu -- \
-    models/gemma-4-E4B-it-Q4_K_M.gguf \
-    models/mmproj-gemma-4-E4B-it-BF16.gguf \
-    photo.jpg "What is in this image?"
-```
-
-For checking the tower by hand, llama.cpp's own `tools/mtmd/test-1.jpeg` is
-the useful input: it is a newspaper front page, so a correct encoder reads the
-headline and the date out of it rather than describing a plausible scene.
-
-```rust
-let mut s = Session::load(model, &LoadOptions::new().mmproj(mmproj))?;
-s.complete(Request::new(vec![Message {
-    role: "user".into(),
-    content: Some(serde_json::json!([
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,…"}},
-        {"type": "text", "text": "what is in this image?"},
-    ])),
-    ..Default::default()
-}]))?;
-```
-
-The server takes the same shape (`llmoxide-serve model.gguf --mmproj
-mmproj.gguf`), which is what makes an ordinary OpenAI client work unchanged.
-`data:` URLs and local paths are read; **remote URLs are deliberately not
-fetched**, because a server that dereferences a URL a client hands it is an
-SSRF hole.
-
-An image with no tower loaded is an error rather than a text-only answer —
-quietly answering *about* an image the model never saw is the worst available
-outcome.
-
-### What the tower is
-
-Not the SigLIP the name suggests. Every block is the text stack's block with
-the sequence axis swapped for patches — RMSNorm, per-head Q/K norms, a gated
-GELU feed-forward, post-norms on both residual branches — and the parts that
-are genuinely its own are where the care went:
-
-- **Two positional mechanisms, not one.** A learned `(x, y)` pair of lookup
-  tables is added to the patch embedding, *and* a 2-D rotation runs inside
-  attention, the low half of each head by column and the high half by row
-  (`theta = 100`, against a text model's 1 000 000). Getting the axes backwards
-  survives every content question and fails only on spatial ones, so the test
-  for it is an image whose two coloured squares sit on the anti-diagonal —
-  the diagonal is transpose-symmetric and would pass either way.
-- **Attention is bidirectional**, and so is the text model's over the span the
-  tower produced: llama.cpp clears causal attention for an encoded image and
-  restores it afterwards. That span therefore has to prefill as a *single*
-  batch, which is why an image is capped at 256 positions and why the prefill
-  loop refuses to chunk it rather than silently splitting it in half.
-- **The softmax scale is 1.0**, not `1/sqrt(head_dim)` — the same folded
-  temperature the text stack uses.
-- **The linears clamp.** Each weight may carry calibration ranges beside it
-  (`.input_min`, `.output_max`, …); the input is clamped before the matmul and
-  the result after. Ignoring them is fine on most images and wrong on the ones
-  that saturate, which is the worst failure shape there is.
-
-Two things about how an image enters the text stack are easy to get backwards,
-and both are load-bearing:
-
-- The rows are **not** scaled by `sqrt(d_model)`. Token embeddings are; these
-  are already in the residual stream's space, and scaling them anyway
-  multiplies the image by ~50.
-- The per-layer embedding table has no token id to look up for an image
-  position, so it falls back to **row 0** — the padding row — for every one of
-  them, and only the projected half carries the image.
-
-Resolution is native rather than square: the image is resampled so both sides
-are a multiple of 48 and the area lands inside a token budget, which is why a
-640×488 photo becomes a 13×10 grid of 130 tokens rather than a fixed 256.
-
-### Where it runs
-
-The tower follows the text model onto the GPU, and falls back to the CPU one
-with a warning rather than failing the load if there is no adapter. Both are
-kept: the CPU tower is written directly against llama.cpp's graph and is the
-oracle the GPU one is checked against — the same relationship `model::cpu`
-has to `crates/gpu`.
-
-| 1170 patches (a 640×488 photo) | |
-|---|---|
-| CPU tower | 6.0 s |
-| GPU tower | 0.87 s |
-| llama.cpp (Metal) | ~0.2 s |
-
-**Attention reuses `attn.wgsl` unchanged.** A tower has no KV cache, but a
-cache with `window = 0` read at `base_pos = 0` *is* a flat
-`[n_patches, kv_dim]` buffer, and the `bidi` flag that image spans already
-needed in the text model opens the mask both ways — so K and V bind straight
-into the cache slots and the mask comes out right. The patch convolution is
-likewise a matmul once the image is lowered to `[n_patches, 16×16×3]`, which
-is what the 4-D filter already looks like in memory; the kernel never consults
-the GGUF's declared shape, only the `MatvecParams` handed to it.
-
-Scratch is allocated per image rather than reserved for the largest one: the
-scores buffer alone is `n² × n_heads` floats — 255 MB at the token ceiling and
-a fifth of that for a typical photo — and this runs once per image, so the
-allocation is not on any hot path.
-
-## Serving (afterthought, and not private)
-
-```sh
-./target/release/llmoxide-serve models/gemma4-v2-Q4_K_M.gguf   # http://127.0.0.1:8080
-```
-
-`LLMOXIDE_CTX` (default 16384), `LLMOXIDE_PORT` (8080), `LLMOXIDE_BATCH` (256).
-`LLMOXIDE_CPU=1` puts qwen35 on its CPU reference path; `LLMOXIDE_NO_SUBGROUP=1`
-forces the barrier-tree row reduction.
-
-**This is not a private session, and cannot be made into one from this side of
-the socket.** The server keeps its own hands clean — locked and zeroed prompt
-ids, the zeroing allocator (`LLMOXIDE_NO_ZEROIZE=1` to disable), no core dumps,
-`POST /v1/wipe` to overwrite the resident conversation, and no request body in
-the log. But whatever you point at it usually keeps a transcript, and that is
-where the conversation actually persists. opencode writes every message in
-plaintext to `~/.local/share/opencode/opencode.db`, has no option to turn that
-off, and builds `export` / `import` / `stats` on top of it.
-
-If you want the server anyway, put the client's store somewhere that does not
-survive a reboot — opencode honours `XDG_DATA_HOME`, so a RAM disk works:
-
-```sh
-DISK=$(hdiutil attach -nomount ram://1048576)      # 512 MB
-newfs_hfs -v ocram "$DISK" && mkdir -p /tmp/ocram
-mount -t hfs "$DISK" /tmp/ocram
-XDG_DATA_HOME=/tmp/ocram opencode
-```
-
-`hdiutil detach "$DISK"` ends it. This is a weaker guarantee than private mode
-gives: those are ordinary pages, not `mlock`ed, so they can still reach
-(encrypted) swap.
-
-Two smaller notes. `PT_DENY_ATTACH` is opt-in here (`LLMOXIDE_PRIVATE=1`) rather
-than automatic, because it blocks profilers and a server is the thing you
-profile. And removing the request-body log was not enough on its own:
-`serde_json` quotes the offending value inside its own error message, so
-`ApiError` carries a detailed message for the client and a sanitized one —
-category, line, column — for the log.
-
-### opencode
-
-`opencode.json` in this repo points opencode at the local server (port 8081 —
-start the server with `LLMOXIDE_PORT=8081` or edit the `baseURL`). It needs the
-provider package once:
-
-```sh
-cd ~/.config/opencode && npm install @ai-sdk/openai-compatible
-```
-
-Then `opencode run --model llmoxide/Qwen3.8-27B-Q6_K "..."`, or copy the
-`provider` block into `~/.config/opencode/opencode.json` to use it anywhere.
-
-### API
-
-`GET /v1/models`, `POST /v1/chat/completions` (streaming and not), `POST /v1/wipe`,
-`GET /health`.
-
-Supports `tools`, `temperature`, `top_p`, `top_k`, `seed`, `max_tokens`,
-`stop`, and a non-standard `enable_thinking` for the model's thought channel
-(off by default).
-
-Tool calls are the interesting part, and each model has its own wire format.
-gemma4 does not emit JSON — it uses a custom DSL where strings are delimited
-by the single token `<|"|>`:
-
-```
-<|tool_call>call:read_file{path:<|"|>src/main.rs<|"|>,limit:20}<tool_call|>
-```
-
-qwen35 wraps an XML-ish block in `<tool_call>` control tokens
-(`<function=read_file>` / `<parameter=path>`); `crates/chat/src/qwen.rs`
-translates that, `crates/chat/src/dsl.rs` the gemma4 DSL. Two deliberate
-behaviours shared by both:
-
-- Parsing works on **token ids**, not decoded text, because the quote marker and
-  channel markers are control tokens a text decoder drops.
-- Calls naming a tool the request never declared are **rejected**. The model
-  will occasionally invent one, and a client that dispatched it would either
-  error out or run something unintended.
-
-## In a browser
-
-The same engine, compiled to wasm32 and pointed at WebGPU instead of Metal.
-One self-contained HTML file — the wasm module is baked into it — and the
-checkpoint either downloads once and caches, or is read off your own disk.
-Either way it goes straight into GPU memory and is never uploaded anywhere.
-
-```sh
-scripts/build-web.sh              # -> web/llmoxide.html, ~1.2 MB
-open web/llmoxide.html            # or serve it; both work
-```
-
-To host it, put `llmoxide.html` and a `.gguf` on any static host and point
-`MODEL_URL` at the checkpoint (it defaults to `./Qwen3-0.6B-Q8_0.gguf`, i.e.
-the file sitting next to the page). The download is one ordinary GET — no Range
-support needed — so a plain bucket or CDN is enough, and it lands in the Cache
-API so a repeat visit starts instantly. `?model=<url>` overrides it for
-testing.
-
-| checkpoint | delivery | load | decode |
-|---|---|---|---|
-| `qwen3-0.6b` | 0.64 GB download | 3.0 s | 32–115 tok/s |
-| `gemma4-e4b-q4` | 5.34 GB local file | 5.0 s | 24–30 tok/s |
-
-Verified in **Chrome 141 and Safari 26.6** on the M4 Pro. Safari matters
-architecturally, not just as a checkbox: it reports `maxBufferSize` of 2.15 GB
-against Chrome's 4.29, which is exactly why `Gpu::arena_buffer_bytes` takes the
-number from the device rather than a constant. Its WGSL compiler is also a
-third implementation after Naga and Tint, and it accepts the kernels unchanged.
-
-### One file, model included
-
-```sh
-scripts/build-web.sh --embed models/Qwen3-0.6B-Q4_K_M.gguf
-```
-
-Bakes the checkpoint into the page. Nothing else is needed at runtime: no
-server, no network, no second file. Verified by running Chrome with DNS
-blackholed (`--host-resolver-rules=MAP * 0.0.0.0`) against a `file://` URL, and
-in Safari 26.6.
-
-| embedded checkpoint | page | ready |
-|---|---|---|
-| `qwen3-0.6b-q4` (0.40 GB) | 530 MB | 1.0 s |
-| `qwen3-0.6b` (0.64 GB) | 854 MB | 2.1 s |
-
-The base64 has to arrive in pieces. V8 caps a single string at 536,870,888
-characters and the Q8_0 model's base64 is 852,596,992 — so one blob is not
-slow, it is unbuildable. `build-web.sh` emits 48 MB chunks either way and the
-page drops each from the DOM as it decodes, since those strings are the largest
-objects on it.
-
-**Compressing the model buys nothing.** Quantized weights are close to random:
-measured on this Q8_0, `gzip -9` gets 4.5% off and `zstd -19` 4.8%, which does
-not pay for a decompressor in the page. What *is* worth doing is serving the
-page with `Content-Encoding: gzip`, which takes the Q8_0 embedded build from
-854 MB to **638 MB over the wire** — the base64 tax refunded almost exactly,
-for one line of server config and no code.
-
-Even so, prefer two files for a website. The embedded build cannot show
-download progress (nothing runs until the whole document is parsed), re-parses
-854 MB on every visit, and puts the model outside the Cache API. It is for
-handing someone a single file that works offline.
-
-```
-»  My favourite colour is teal. Just acknowledge that briefly.
-Teal is a lovely colour!
-»  What is my favourite colour?
-Your favourite colour is teal.
-»  /wipe
-wiped: conversation, device buffers, locked pages.
-»  What is my favourite colour?
-I do not know your favorite color.
-```
-
-Measured in Chrome on the M4 Pro. `gemma4-e4b-q4` puts **5.54 GB of weights
-resident in 5.0 s** — 1.1–1.2 GB/s from disk through the browser to the GPU —
-and decodes at the same order as the native build's 22.3 tok/s, which is less
-surprising than it sounds: the kernels are identical. WGSL is WebGPU's own
-shading language, so `crates/gpu/src/shaders` ships to the browser unchanged
-rather than being translated.
-
-Needs WebGPU: Chrome or Edge 113+, or Safari 26+. There is no fallback, and
-that is not laziness — see below.
-
-### Why not a smaller Gemma
-
-There isn't one. The smallest Gemma 4 is E2B, and its smallest GGUF at any
-quantization is 2.29 GB; **66% of that file is embeddings**, because the vocab
-is 262144 and the E-series multiplies it by depth — its per-layer embedding
-table alone is 262144 x 256 x 35 = 2.35 B parameters. Push every weight in E2B
-to two bits and the floor is still 1.16 GB. The E-series spends bytes to save
-FLOPs, which is the right trade for a phone and the wrong one for a download.
-
-Qwen3 0.6B is the way under a gigabyte, and it is why `qwen3` is supported at
-all. Do not expect much of it — it is a 0.6B model, fine for short exchanges
-and visibly limited beyond that — but it is coherent, it streams fast, and it
-fits.
-
-### Why the weights never enter wasm memory
-
-wasm32 addresses 4 GB. The checkpoint is 5.3. So a CPU forward pass in the
-browser is not slow, it is *impossible* — there is nowhere to put the weights,
-at any quantization that leaves the model worth running.
-
-The loader is therefore split. `gguf::Header` is everything but the tensor
-payload, and parses from a **prefix** of the file: a few megabytes gives every
-tensor's type, shape and offset, which is enough to plan the whole upload
-before a weight byte has moved. `Weights::upload_streaming` then walks that
-table pulling 32 MB at a time out of the JS `File` and writing each chunk
-straight into a GPU buffer. Peak host usage is one chunk. `gguf::Source::Sparse`
-holds the handful of F32 norms that model construction actually reads by name,
-and returns a *typed error* for anything else rather than a wrong slice — which
-is how the one place that read an 800 MB tensor merely to learn its `ne[1]`
-turned up on the first run.
-
-Two things follow from that split, and both are load-bearing:
-
-- `Blob::slice` must be the `f64` overload. The `i32` one saturates past 2 GB —
-  a third of the way in — and every tensor after that point would load from the
-  clamped offset with no error anywhere.
-- Buffer sizes come from the device, not from a constant. Native adapters here
-  report a 30 GB `max_buffer_size`; WebGPU's *default* is 256 MB, and the
-  adapter maximum is commonly 2 GB. (This M4 Pro offers 4.29 GB, so the model
-  lands in two buffers.)
-
-### Two shaders that compile natively and not in a browser
-
-Both were found by running it, both produced no error at the point of failure,
-and both are now caught up front by `Gpu::check_shaders` — which asks for
-compilation messages *before* the 5.5 GB upload rather than after.
-
-- **Naga and Tint disagree about uniformity.** The matvec kernels stride rows
-  across the grid with `if (row - row_in_wg >= p.out_dim) { break; }`. The
-  `row_in_wg` cancels, so every thread runs the same number of iterations and
-  reaches the reduction's `workgroupBarrier` together — which is what makes the
-  barrier legal. Naga accepts this. Tint will not do the algebra, sees a bound
-  derived from `local_invocation_id`, and rejects the whole module. Keeping the
-  loop variable as the workgroup's *base* row fixes it and changes nothing.
-  Native never noticed because native takes the `subgroupAdd` path, which has
-  no barrier at all; the barrier fallback is only reached with
-  `LLMOXIDE_NO_SUBGROUP=1`.
-- **`-3.4028235e38` is not a valid f32 literal in WGSL.** It is what Rust
-  prints for `f32::MIN`, and it round-trips in Rust. WGSL parses literals as
-  abstract float first, where `3.4028235e38` is larger than `f32::MAX`, so the
-  conversion overflows. `bitcast<f32>(0xff7fffffu)` means one thing everywhere.
-
-The symptom in both cases was the same and is worth recognising: WebGPU does
-not fail `create_shader_module`, it reports asynchronously. So pipelines are
-created invalid, every dispatch against them is silently dropped, and the first
-visible sign is a reply made of `<unused12><unused35>` ninety seconds later.
-
-### What does not survive the port
-
-- **`mlock` does not.** A wasm module's memory is a JS `ArrayBuffer` the host
-  may move, page or snapshot at will, and nothing inside the sandbox can pin
-  it. `secret::sys`'s wasm shims say so rather than quietly returning success
-  for a lock that never happened. The zeroing allocator *is* real — `memset_s`
-  becomes a volatile write loop, which is the same guarantee by another route —
-  so `/wipe` still overwrites the conversation, the heap blocks it passed
-  through, and every device buffer. It cannot reach the tab's own heap
-  snapshot, and devtools can read this memory regardless.
-- **The 27B does not** — not for any code reason, it simply will not fit. The
-  qwen35 module itself compiles to wasm and is what runs Qwen3 0.6B there.
-- **The CPU reference path does not** — see above. It still compiles (rayon
-  swapped for a serial shim, since real wasm threads need `SharedArrayBuffer`
-  and so COOP/COEP headers, which a local file has no way to set), but there is
-  no memory for it to run in.
-- **Checkpoint capture does not.** `bisect` and `wipe_check` read buffers back
-  synchronously, and a browser's main thread may not block on a buffer map.
-  Everything on the hot path went async instead: `GpuModel::forward_async` is
-  the same dispatch as `forward`, differing only in how it waits — which is
-  also what keeps the page responsive and lets tokens paint as they arrive.
-
-## Layout
-
-Every package is `llmoxide-*`; the directory keeps the short name, and so does
-the code, because each dependency is renamed back at the `Cargo.toml` line that
-declares it. Generic package names like `model` or `gpu` would squat the
-namespace of anything that depends on this.
-
-```
-directory         package             what it is
-llmoxide/         llmoxide            the facade: Session, Backend, and the CLI
-crates/gguf       llmoxide-gguf       GGUF v3 reader, mmap'd; Q4_K / Q6_K / Q8_0 decoders
-crates/tokenizer  llmoxide-tokenizer  gemma4 BPE (262144 tokens) + qwen35 byte-level BPE (248320)
-crates/model      llmoxide-model      architecture configs, CPU reference forward passes, sampling
-crates/gpu        llmoxide-gpu        wgpu device, weight arena, WGSL kernels, GPU forwards + vision tower
-crates/chat       llmoxide-chat       prompt assembly: gemma4's tool DSL + qwen's ChatML/XML
-crates/vision     llmoxide-vision     gemma4v: image preprocessing and the CPU reference tower
-crates/secret     llmoxide-secret     locked, self-zeroing memory; the zeroing global allocator
-crates/hub        llmoxide-hub        resumable, verified Hugging Face downloads
-crates/server     llmoxide-server     the private REPL, plus the axum OpenAI-compatible API
-crates/app        llmoxide-app        the private chat window: Dioxus, native renderer, in-process
-crates/wasm       llmoxide-web        the browser build: WebGPU, streamed weights, chat REPL
-web/              —                   the page shell; build-web.sh emits llmoxide.html into it
-```
-
-Dependencies point one way: `gguf` and `secret` at the bottom, `llmoxide` at
-the top, and `llmoxide-server` only on `llmoxide`. Nothing below the facade
-knows about HTTP, and the generation loop no longer lives in the server crate,
-so embedding inference does not compile axum.
-
-`crates/wasm` is deliberately **not** a workspace member — it only ever builds
-for `wasm32-unknown-unknown`, and membership would pull wasm-bindgen and
-web-sys into every native `cargo build`. It is also the one entry point that
-does not go through `llmoxide::Session`: its forward pass is `async`, because a
-browser's main thread may not block on a buffer map, and `Backend` is a
-blocking trait.
-
-## Known limitations
-
-- gemma4 decode is ~1.5x slower than llama.cpp, and the gap widens with
-  context (see above).
-- qwen35 decode at ~9.4 tok/s is within ~10% of what this GPU's memory
-  bandwidth allows for a 22 GB checkpoint (see Performance). The delta-net
-  recurrence is sequential by construction: `delta_recur` loops the whole token
-  range inside one dispatch of `n_v_heads` workgroups, so those layers get no
-  token parallelism during prefill and cannot fill the GPU. So far that has
-  cost little: 301-token prefill takes about as long as its GEMM FLOPs alone
-  predict. It will matter more for long prompts, where a chunked formulation is
-  the fix.
-- No architecture here can rewind its cache, so prompt reuse is append-only:
-  gemma4's ring buffers have overwritten the positions, and qwen35's recurrent
-  state was never a history to begin with.
-- No speculative decoding, though two of the checkpoints ship a drafter for it:
-  qwen35's MTP/NextN head (`blk.64`) is skipped at load, and Gemma 4 publishes a
-  separate MTP drafter (`google/gemma-4-E4B-it-assistant`). Wiring either up
-  needs a KV cache that can rewind on a rejected draft, which is the same gap as
-  the entry above.
-- Single request at a time, one GPU context; no batching across clients.
-- The vision tower is ~3-4x off llama.cpp on Metal (0.87 s against ~0.2 s for
-  a 1 170-patch image). Time grows faster than the patch count — 441 patches
-  take 0.25 s, 2 304 take 2.33 s — because attention over patches is O(n^2)
-  and `weighted_v` is shaped for the text model's 256- and 512-wide heads: at
-  the tower's 64-wide ones it leaves three quarters of each workgroup idle.
-  Fixing that means a second variant of a kernel the text path depends on,
-  which is why it has not been done yet.
-- Audio input is not implemented, though the same `mmproj` file carries a
-  conformer encoder for it (`a.blk.*`, 12 blocks of 1024) and the vocabulary
-  has the `<|audio>` pair to bracket it.
-- One image per request is what has been exercised; several should work and
-  are not tested. Each is capped at 256 positions so it prefills as one
-  bidirectional batch.
-- The context is capped at `LLMOXIDE_CTX`, well below the models' 262144,
-  since attention scratch scales with it.
-- Private mode covers this process, not the machine, and not the server: see
-  "What this does not cover" and "Serving" above.
-- The embedded (`--embed`) build is a 530 MB HTML file (854 MB at Q8_0) with no
-  download progress and no separate caching of the model. It exists for offline
-  distribution; hosting wants the two-file form.
-- The browser build needs WebGPU and has no CPU fallback — wasm32's 4 GB
-  address space cannot hold the weights at any useful quantization. It also
-  cannot `mlock`, so it is the one entry point where "leaves nothing behind" is
-  a weaker claim than elsewhere. See "In a browser".
-- Qwen3 0.6B is the only checkpoint here small enough to serve over the web,
-  and it is a 0.6B model: fine for short exchanges, visibly limited past that,
-  and prone to answering *about* your question rather than answering it. There
-  is no larger option under a gigabyte in either family — see "Why not a
-  smaller Gemma".
-- `qwen3` support is dense-attention only. The delta-net path it shares a module
-  with is exercised by the 27B, not by any small checkpoint, so a regression
-  there needs the 22 GB file to catch.
-- The browser build's correctness rests on the native `bisect`, not on a check
-  that runs in a browser: comparing per-checkpoint tensors there would mean
-  shipping the CPU reference path, which is exactly what does not fit. The
-  kernels are byte-identical WGSL and `Gpu::check_shaders` proves they compiled,
-  but nothing verifies the browser's *numerics* against the CPU the way
-  `bisect` does natively.
+The server is a side feature, and it is **not private**. Any client you point
+at it keeps its own transcript. See [docs/serving.md](docs/serving.md).
+
+## Docs
+
+- [privacy.md](docs/privacy.md): private mode, the desktop app, and what they do not cover
+- [models.md](docs/models.md): checkpoints, `llmoxide-fetch`, and per-architecture traps
+- [correctness.md](docs/correctness.md): validation against llama.cpp, and the tools that reproduce it
+- [performance.md](docs/performance.md): measurements, the GEMM, and KV cache reuse
+- [images.md](docs/images.md): the gemma4 vision tower
+- [browser.md](docs/browser.md): the wasm/WebGPU build and the single-file page
+- [library.md](docs/library.md): `Session`, `Backend`, and feature flags
+- [serving.md](docs/serving.md): the HTTP API, tool calls, and opencode
+- [layout.md](docs/layout.md): crates and their dependencies
+- [limitations.md](docs/limitations.md): known limitations
+- [ARCHITECTURE.md](ARCHITECTURE.md) and [ARCHITECTURE-qwen35.md](ARCHITECTURE-qwen35.md): the architectures' traps
