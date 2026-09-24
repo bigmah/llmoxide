@@ -1,3 +1,5 @@
+<p align="center"><img src="crates/app/assets/icon.svg" width="112" alt=""></p>
+
 # llmoxide
 
 A private, local chat app for open-weight LLMs. The conversation never leaves

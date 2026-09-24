@@ -42,6 +42,18 @@ arboard = { version = "3.6", default-features = false }
 #                   directly
 dioxus-native = { version = "0.7.10", default-features = false, features = ["prelude", "system-fonts", "autofocus", "hot-reload"] }
 
+# The app icon (assets/icon.svg, rendered to icon-512.png). macOS takes it as
+# the Dock icon through AppKit; elsewhere it is the window icon, which winit
+# wants as raw RGBA. Both crates are already in the tree through the renderer.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSImage"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+winit = { version = "0.30", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 [features]
 # System clipboard in the input box (the Copy button is separate and always
 # there; see clip.rs). Off by default: whatever is copied lands

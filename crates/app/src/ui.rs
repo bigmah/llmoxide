@@ -44,8 +44,24 @@ body {
 .badge {
     display: flex; align-items: center; gap: 5px;
     padding: 4px 9px; border-radius: 999px;
-    border: 1px solid #2f4a3a; color: #7fcf9a; font-size: 12px;
+    border: 1px solid #5a3322; color: #e8956a; font-size: 12px;
 }
+/* The padlock, in oxide orange. Drawn with boxes because Blitz paints an
+   RSX-built <svg> empty; sized in em, so font-size sets its size. */
+.padlock { position: relative; width: 1em; height: 1.2em; flex-shrink: 0; }
+.padlock .shackle {
+    position: absolute; left: 0.2em; top: 0; width: 0.6em; height: 0.66em;
+    border: 0.13em solid #c65a2e; border-bottom: none;
+    border-radius: 0.3em 0.3em 0 0;
+}
+.padlock .body {
+    position: absolute; left: 0; bottom: 0; width: 1em; height: 0.7em;
+    border-radius: 0.16em;
+    background: linear-gradient(160deg, #e5733a, #a8431c);
+    display: flex; flex-direction: column; align-items: center; padding-top: 0.17em;
+}
+.padlock .hole { width: 0.19em; height: 0.19em; border-radius: 0.1em; background: #2a160d; }
+.padlock .slot { width: 0.08em; height: 0.17em; background: #2a160d; }
 .ghost {
     display: flex; align-items: center; gap: 6px;
     padding: 6px 10px; border-radius: 8px;
@@ -83,7 +99,7 @@ body {
 .avatar {
     width: 28px; height: 28px; border-radius: 14px; flex-shrink: 0;
     display: flex; align-items: center; justify-content: center;
-    border: 1px solid #3a3a3a; color: #bdbdbd; font-size: 10px; font-weight: 600;
+    border: 1px solid #4a2c1f; background: #2a1d17; font-size: 13px;
 }
 .reply { flex: 1; min-width: 0; line-height: 1.6; padding-top: 2px; }
 .thinking { color: #8e8e8e; }
@@ -188,6 +204,8 @@ pub fn app() -> Element {
     // Bumped to give the input box focus back. Blitz has no focus API, but it
     // honours `autofocus` on mount, and a new key is a new mount.
     let mut focus = use_signal(|| 0u32);
+
+    use_hook(crate::icon::set_dock_icon);
 
     let e = engine.clone();
     use_future(move || {
@@ -338,7 +356,7 @@ pub fn app() -> Element {
                 }
                 span { class: "detail", "{model_detail}" }
                 div { class: "spacer" }
-                span { class: "badge", "● Private" }
+                span { class: "badge", span { style: "font-size: 11px", Padlock {} } "Private" }
                 button { class: "ghost", onclick: wipe, span { class: "glyph", "+" } "New chat" }
             }
             if let Some(e) = failed {
@@ -372,7 +390,7 @@ pub fn app() -> Element {
                                 div { key: "{i}", class: "user", "{t.text}" }
                             } else {
                                 div { key: "{i}", class: "assistant",
-                                    div { class: "avatar", "AI" }
+                                    div { class: "avatar", Padlock {} }
                                     div { class: "reply",
                                         if t.text.is_empty() {
                                             span { class: "thinking", "Thinking…" }
@@ -474,6 +492,20 @@ async fn sleep_ms(ms: u64) {
         let _ = tx.send(());
     });
     let _ = rx.await;
+}
+
+/// The app's mark: a padlock in oxide orange.
+#[component]
+fn Padlock() -> Element {
+    rsx! {
+        div { class: "padlock",
+            div { class: "shackle" }
+            div { class: "body",
+                div { class: "hole" }
+                div { class: "slot" }
+            }
+        }
+    }
 }
 
 /// The file name without `.gguf`, which is all anyone needs to recognise it.

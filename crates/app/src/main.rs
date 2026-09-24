@@ -28,6 +28,7 @@
 
 mod clip;
 mod engine;
+mod icon;
 mod md;
 mod ui;
 
@@ -153,9 +154,7 @@ fn main() {
         vec![Box::new(move || Box::new(ctx.clone()) as Box<dyn Any>)],
         vec![Box::new(
             Config::new().with_window_attributes(
-                WindowAttributes::default()
-                    .with_title("llmoxide")
-                    .with_inner_size(LogicalSize::new(820.0, 900.0)),
+                window_attributes(),
             ),
         )],
     );
@@ -167,6 +166,15 @@ fn main() {
     if engine.shutdown() {
         eprintln!("wiped and exited.");
     }
+}
+
+fn window_attributes() -> WindowAttributes {
+    let attrs = WindowAttributes::default()
+        .with_title("llmoxide")
+        .with_inner_size(LogicalSize::new(820.0, 900.0));
+    #[cfg(not(target_os = "macos"))]
+    let attrs = attrs.with_window_icon(icon::window_icon());
+    attrs
 }
 
 fn env_usize(key: &str, default: usize) -> usize {

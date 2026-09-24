@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2e2e2e"/>
+      <stop offset="1" stop-color="#151515"/>
+    </linearGradient>
+    <linearGradient id="oxide" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#ee8045"/>
+      <stop offset="1" stop-color="#a23d18"/>
+    </linearGradient>
+    <linearGradient id="steel" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#d9693a"/>
+      <stop offset="1" stop-color="#b24a20"/>
+    </linearGradient>
+    <clipPath id="bodyclip"><rect x="292" y="450" width="440" height="330" rx="58"/></clipPath>
+  </defs>
+  <!-- The macOS icon grid: an 824-unit tile inset 100 from each edge. -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <rect x="101" y="101" width="822" height="822" rx="184" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="2"/>
+  <!-- Shackle -->
+  <path d="M372 470 V380 a140 140 0 0 1 280 0 V470" fill="none" stroke="url(#steel)" stroke-width="64" stroke-linecap="round"/>
+  <!-- Body -->
+  <rect x="292" y="450" width="440" height="330" rx="58" fill="url(#oxide)"/>
+  <rect x="292" y="450" width="440" height="36" fill="#ffffff" fill-opacity="0.14" clip-path="url(#bodyclip)"/>
+  <!-- Keyhole -->
+  <circle cx="512" cy="590" r="40" fill="#2a140a"/>
+  <path d="M494 610 h36 l14 86 h-64 z" fill="#2a140a"/>
+</svg>
