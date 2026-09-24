@@ -29,6 +29,13 @@ cargo build --release
 ./target/release/llmoxide-private models/Qwen3.8-27B-Q6_K.gguf # use them
 ```
 
+...or in a window (a separate package; see [The desktop app](#the-desktop-app)):
+
+```sh
+cargo build --release --manifest-path crates/app/Cargo.toml
+./crates/app/target/release/llmoxide-app models/Qwen3.8-27B-Q6_K.gguf
+```
+
 ```
 »  what is the capital of France?
 Paris
@@ -225,6 +232,60 @@ refuses to pass vacuously if nothing was resident to begin with.
 - **A `SIGKILL` before the wipe runs** — though `mlock` covers the disk side of
   that case, and the kernel zeroes freed physical pages before reissuing them.
 - **Any client you put in front of the server.** See below.
+
+### The desktop app
+
+`llmoxide-app` is the same session with a chat window instead of a terminal,
+which also removes the one residue the REPL could only ask about: scrollback.
+
+```sh
+cargo build --release --manifest-path crates/app/Cargo.toml
+./crates/app/target/release/llmoxide-app models/Qwen3.8-27B-Q6_K.gguf  # or LLMOXIDE_MODEL=...
+```
+
+It is not a workspace member, and has its own lockfile, for the same reason
+`crates/wasm` is not: blitz-dom pins `image = "=0.25.6"` exactly, and in the
+shared lockfile that would have moved the vision crate's JPEG and PNG
+decoders back to match.
+
+Enter sends, Shift+Enter is a new line, **Stop** cuts a reply short, **Wipe**
+overwrites the conversation, the model's cache and the device buffers.
+Closing the window, Cmd+Q, Ctrl-C and `SIGTERM` all wipe before the process
+exits, and a panic wipes and leaves by `_exit` so it never becomes a macOS
+crash report. `LLMOXIDE_CTX`, `LLMOXIDE_BATCH` and `LLMOXIDE_CPU` work as in the
+REPL.
+
+The UI is Dioxus with its **native** renderer (Blitz: winit + vello on wgpu),
+not the webview one. That choice is the privacy argument. A webview renders in
+WebKit's own helper processes, so every message would have a copy outside this
+process's zeroed heap, and WebKit keeps its own caches under `~/Library`. Blitz
+lays out and paints inside this process, so the text goes from the engine's
+channel into a signal, then a DOM node, then shaped glyphs, and each copy sits
+on the heap `ZeroizingAlloc` zeroes on free. No JavaScript runs.
+
+The renderer is built with most of its default features **off**, and each one
+is a capability the binary does not have. `nm` on the release build finds no
+`reqwest`, `hyper`, `tungstenite`, `arboard` or `accesskit`:
+
+| feature | why it is off |
+|---|---|
+| `net` | an HTTP client for fetching remote resources |
+| `accessibility` | publishes every message to the OS accessibility tree, readable by any app granted accessibility access |
+| `clipboard` | copied text lands on the shared pasteboard, which clipboard managers keep. Opt back in with `--features clipboard` |
+| `file_dialog` | nothing here opens files |
+| `hot-reload` | **on**, because dioxus-native 0.7.10 does not compile without it. Its devserver client is compiled only with `debug_assertions`, so release builds have none; debug builds only dial out when `DIOXUS_DEVSERVER_PORT` is set, and `main` unsets it |
+
+On top of [the REPL's list](#what-this-does-not-cover), the app does not cover:
+
+- **The UI's copy of the conversation is zeroed when freed but not `mlock`ed**,
+  the same as the REPL's history `Vec`. The engine's copy is locked.
+- **Pixels.** Rendered text is in the window's GPU surfaces and the
+  compositor's buffers until it is repainted. Wipe repaints.
+- **Native crashes** (a GPU driver fault, say) still produce a report in
+  `~/Library/Logs/DiagnosticReports`. The report holds a stack and machine
+  details, not memory contents, but it is a dated record that the app ran.
+- **Input methods.** Keystrokes pass through the OS text input system like
+  any app's.
 
 ## Correctness
 
@@ -929,6 +990,7 @@ crates/vision     llmoxide-vision     gemma4v: image preprocessing and the CPU r
 crates/secret     llmoxide-secret     locked, self-zeroing memory; the zeroing global allocator
 crates/hub        llmoxide-hub        resumable, verified Hugging Face downloads
 crates/server     llmoxide-server     the private REPL, plus the axum OpenAI-compatible API
+crates/app        llmoxide-app        the private chat window: Dioxus, native renderer, in-process
 crates/wasm       llmoxide-web        the browser build: WebGPU, streamed weights, chat REPL
 web/              —                   the page shell; build-web.sh emits llmoxide.html into it
 ```
