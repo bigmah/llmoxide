@@ -3,7 +3,7 @@
 //! This is the correctness oracle for the GPU path, so it favours transparency
 //! over speed. Every intermediate is handed to a [`Trace`] hook under the same
 //! name llama.cpp's `eval-callback` uses, which is what lets
-//! `cargo run --bin validate` diff the two implementations tensor by tensor.
+//! `cargo run -p llmoxide-model --bin validate` diff the two implementations tensor by tensor.
 //!
 //! The block, in the order the graph actually runs:
 //!

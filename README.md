@@ -24,16 +24,18 @@ Built for one user on one machine (Apple M4 Pro, 48 GB), so it runs one request
 at a time against one GPU context.
 
 ```sh
-cargo build --release
-./target/release/llmoxide-fetch                                # get the models
-./target/release/llmoxide-private models/Qwen3.8-27B-Q6_K.gguf # use them
+cargo run --release                                 # the chat window, on gemma4 E4B
+cargo run --release -- models/Qwen3.8-27B-Q6_K.gguf # ...or any other checkpoint
 ```
 
-...or in a window (a separate package; see [The desktop app](#the-desktop-app)):
+The window is the workspace's only default member (see
+[The desktop app](#the-desktop-app)), so everything else — the fetch tool, the
+REPL, the server — builds with `--workspace`:
 
 ```sh
-cargo build --release --manifest-path crates/app/Cargo.toml
-./crates/app/target/release/llmoxide-app models/Qwen3.8-27B-Q6_K.gguf
+cargo build --release --workspace
+./target/release/llmoxide-fetch                                # get the models
+./target/release/llmoxide-private models/Qwen3.8-27B-Q6_K.gguf # or use them in a terminal
 ```
 
 ```
@@ -239,17 +241,27 @@ refuses to pass vacuously if nothing was resident to begin with.
 which also removes the one residue the REPL could only ask about: scrollback.
 
 ```sh
-cargo build --release --manifest-path crates/app/Cargo.toml
-./crates/app/target/release/llmoxide-app models/Qwen3.8-27B-Q6_K.gguf  # or LLMOXIDE_MODEL=...
+cargo run --release -- models/Qwen3.8-27B-Q6_K.gguf  # or LLMOXIDE_MODEL=...
 ```
 
-It is not a workspace member, and has its own lockfile, for the same reason
-`crates/wasm` is not: blitz-dom pins `image = "=0.25.6"` exactly, and in the
-shared lockfile that would have moved the vision crate's JPEG and PNG
-decoders back to match.
+It is `default-members`, which is what makes a bare `cargo run` open it — and
+also means a bare `cargo build`, `cargo test` or `cargo clippy` covers only the
+app. Add `--workspace` for the rest, or `-p` for one package.
+
+One side effect of sharing the lockfile: blitz-dom pins `image = "=0.25.6"`
+exactly, so the vision crate decodes with it too (it had 0.25.10, and zune-jpeg
+0.5 rather than 0.4). Measured on `test-image.jpg`: 108 of 936 960 channel
+values differ, none by more than 2 levels; PNG decodes identically. The
+newspaper still reads "MEN WALK ON MOON", and `vision_check` still passes.
 
 Enter sends, Shift+Enter is a new line, **Stop** cuts a reply short, **Wipe**
 overwrites the conversation, the model's cache and the device buffers.
+**Model…** opens the platform's file dialog (NSOpenPanel, the Windows common
+dialog, the XDG portal) on `models/`. Switching wipes and drops the current
+model before loading the next, since two large ones rarely fit side by side,
+and keeps the conversation: it is text on the UI side, and the next turn
+replays it into the new model. With no model argument and no
+`models/gemma-4-E4B-it-Q4_K_M.gguf`, the window opens on the picker.
 Closing the window, Cmd+Q, Ctrl-C and `SIGTERM` all wipe before the process
 exits, and a panic wipes and leaves by `_exit` so it never becomes a macOS
 crash report. `LLMOXIDE_CTX`, `LLMOXIDE_BATCH` and `LLMOXIDE_CPU` work as in the
@@ -286,6 +298,13 @@ On top of [the REPL's list](#what-this-does-not-cover), the app does not cover:
   details, not memory contents, but it is a dated record that the app ran.
 - **Input methods.** Keystrokes pass through the OS text input system like
   any app's.
+- **The file dialog remembers the last folder.** macOS stores it as a bookmark
+  under `NSOSPLastRootDirectory` in
+  `~/Library/Preferences/com.apple.ViewBridge.masquerading-service-lacks-host-bundle-identifier.plist`,
+  shared by every app without a bundle id. The folder, not the file, and
+  nothing from a conversation — but a record of where the models live.
+  `defaults delete com.apple.ViewBridge.masquerading-service-lacks-host-bundle-identifier NSOSPLastRootDirectory`
+  removes it; passing the model as an argument avoids the dialog entirely.
 
 ## Correctness
 
@@ -324,7 +343,7 @@ Tools that reproduce this:
 ./target/release/bisect_qwen35  <model> [ids]                  # per-checkpoint GPU vs CPU
 ./target/release/validate_qwen35 <model> <refs.json> <ids>     # vs llama-eval-callback
 ./target/release/upload_check   <model>                        # weight arena readback
-cargo run --release --example vision_check --features vision,gpu -- \
+cargo run --release -p llmoxide --example vision_check --features vision,gpu -- \
     models/mmproj-gemma-4-E4B-it-BF16.gguf photo.jpg           # vision tower GPU vs CPU
 ./target/release/wipe_check     <model> [prompt]               # wipe leaves no residue
 ./target/release/tok            <model> [text]                 # ids, vs llama-tokenize
@@ -545,8 +564,8 @@ session.generate(Request::user("hello"), |piece| {
 Two runnable examples, both of which work against the 0.6B checkpoint:
 
 ```sh
-cargo run --release --example generate    -- models/Qwen3-0.6B-Q8_0.gguf "hello"
-cargo run --release --example chat_stream -- models/Qwen3-0.6B-Q8_0.gguf
+cargo run --release -p llmoxide --example generate    -- models/Qwen3-0.6B-Q8_0.gguf "hello"
+cargo run --release -p llmoxide --example chat_stream -- models/Qwen3-0.6B-Q8_0.gguf
 ```
 
 ### The layers
@@ -616,7 +635,7 @@ and `image_url` content parts are encoded in place:
 ./target/release/llmoxide-fetch gemma4-e4b-q4
 ./target/release/llmoxide-fetch gemma4-e4b-mmproj
 
-cargo run --release --example image --features vision,gpu -- \
+cargo run --release -p llmoxide --example image --features vision,gpu -- \
     models/gemma-4-E4B-it-Q4_K_M.gguf \
     models/mmproj-gemma-4-E4B-it-BF16.gguf \
     photo.jpg "What is in this image?"

@@ -1,36 +1,21 @@
-# Deliberately outside the workspace (see the root `exclude`), with its own
-# lockfile: blitz-dom pins `image = "=0.25.6"`, and sharing a lockfile would
-# move the vision crate's decoders to match. No field inheritance, hence the
-# literals below.
 [package]
 name = "llmoxide-app"
 description = "Private desktop chat over the llmoxide engine: Dioxus UI rendered in-process, nothing written to disk."
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.85"
-repository = "https://github.com/bigmah/llmoxide"
-
-# Standalone package, not a member of the workspace above it.
-[workspace]
-
-# The root's profiles, which do not reach a package outside the workspace.
-# Dev keeps opt-level 1 for the same reason as there: an unoptimised engine
-# is too slow to talk to.
-[profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-debug = 1
-
-[profile.dev]
-opt-level = 1
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
 
 [dependencies]
-llmoxide = { path = "../../llmoxide", features = ["gpu", "private"] }
-chat = { package = "llmoxide-chat", path = "../chat" }
-secret = { package = "llmoxide-secret", path = "../secret" }
-serde_json = "1"
+llmoxide = { workspace = true, features = ["gpu", "private"] }
+chat.workspace = true
+secret.workspace = true
+serde_json.workspace = true
 futures = "0.3"
+# The model picker: the platform's own open dialog (NSOpenPanel, the Windows
+# common dialog, the XDG portal on Linux). Used directly rather than through
+# dioxus-native's `file_dialog`, which is for `<input type=file>`.
+rfd = "0.17"
 # The native renderer (Blitz: winit + vello), not the webview one. With a
 # webview the conversation would be rendered by WebKit's own processes —
 # outside this process's locked, self-zeroing memory, and free to keep caches
@@ -47,7 +32,8 @@ futures = "0.3"
 #   accessibility — publishes every message to the OS accessibility tree,
 #                   readable by any app granted accessibility access
 #   clipboard     — see the `clipboard` feature below
-#   file_dialog   — nothing here opens files
+#   file_dialog   — for `<input type=file>`; the model picker uses rfd
+#                   directly
 dioxus-native = { version = "0.7.10", default-features = false, features = ["prelude", "system-fonts", "autofocus", "hot-reload"] }
 
 [features]

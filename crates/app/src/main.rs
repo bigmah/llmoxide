@@ -2,6 +2,8 @@
 //!
 //!   llmoxide-app [model.gguf]
 //!
+//! Without a model it opens on the picker; **Model…** swaps one at any time.
+//!
 //! The same guarantees as `llmoxide-private`, with a window instead of a
 //! terminal — which also removes the terminal's scrollback, the one residue
 //! the REPL could only ask to have cleared.
@@ -84,16 +86,26 @@ fn main() {
     // that; see `Cargo.toml` for why the client is linked at all.
     std::env::remove_var("DIOXUS_DEVSERVER_PORT");
 
+    // A model named on the command line or in the environment is loaded
+    // even if missing, so the error says why. The default only if present:
+    // without it the window opens on the model picker instead.
     let model = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("LLMOXIDE_MODEL").ok())
-        .unwrap_or_else(|| "models/gemma-4-E4B-it-Q4_K_M.gguf".to_string());
-    let engine = Engine::spawn(Settings {
+        .or_else(|| {
+            let default = "models/gemma-4-E4B-it-Q4_K_M.gguf";
+            std::path::Path::new(default)
+                .exists()
+                .then(|| default.to_string())
+        });
+    let engine = Engine::spawn(
+        Settings {
+            n_ctx: env_usize("LLMOXIDE_CTX", 16384),
+            batch: env_usize("LLMOXIDE_BATCH", 256),
+            cpu: std::env::var_os("LLMOXIDE_CPU").is_some(),
+        },
         model,
-        n_ctx: env_usize("LLMOXIDE_CTX", 16384),
-        batch: env_usize("LLMOXIDE_BATCH", 256),
-        cpu: std::env::var_os("LLMOXIDE_CPU").is_some(),
-    });
+    );
     let _ = ENGINE.set(engine.clone());
 
     // A panic that reaches abort becomes SIGABRT, and macOS's ReportCrash
@@ -135,11 +147,13 @@ fn main() {
     dioxus_native::launch_cfg(
         ui::app,
         vec![Box::new(move || Box::new(ctx.clone()) as Box<dyn Any>)],
-        vec![Box::new(Config::new().with_window_attributes(
-            WindowAttributes::default()
-                .with_title("llmoxide")
-                .with_inner_size(LogicalSize::new(820.0, 900.0)),
-        ))],
+        vec![Box::new(
+            Config::new().with_window_attributes(
+                WindowAttributes::default()
+                    .with_title("llmoxide")
+                    .with_inner_size(LogicalSize::new(820.0, 900.0)),
+            ),
+        )],
     );
 
     // The window is closed. Closing is the only way out that returns here;

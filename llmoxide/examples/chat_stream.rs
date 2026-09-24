@@ -1,6 +1,6 @@
 //! A multi-turn conversation, streamed token by token.
 //!
-//!   cargo run --release --example chat_stream -- models/Qwen3-0.6B-Q8_0.gguf
+//!   cargo run --release -p llmoxide --example chat_stream -- models/Qwen3-0.6B-Q8_0.gguf
 //!
 //! Shows the two things a chat client needs beyond `complete`: a callback that
 //! sees text as it is produced, and an append-only history that lets the

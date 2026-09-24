@@ -1,6 +1,6 @@
 //! Diff the GPU vision tower against the CPU reference, on a real image.
 //!
-//!   cargo run --release --example vision_check --features vision,gpu -- \
+//!   cargo run --release -p llmoxide --example vision_check --features vision,gpu -- \
 //!       models/mmproj-gemma-4-E4B-it-BF16.gguf photo.jpg
 //!
 //! The CPU tower is the oracle — it is the one written directly against

@@ -1,6 +1,6 @@
 //! Ask a question about an image.
 //!
-//!   cargo run --release --example image --features vision,gpu -- \
+//!   cargo run --release -p llmoxide --example image --features vision,gpu -- \
 //!       models/gemma-4-E4B-it-Q4_K_M.gguf \
 //!       models/mmproj-gemma-4-E4B-it-BF16.gguf \
 //!       photo.jpg "what is in this image?" [--cpu]

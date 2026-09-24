@@ -66,6 +66,7 @@ button {
     background: #2a2c33; color: #e6e6e9; font-size: 14px;
 }
 button:hover { background: #33363f; }
+button:disabled { opacity: 0.5; }
 button.primary { background: #3d6bb3; border-color: #3d6bb3; }
 button.primary:hover { background: #4a78c0; }
 button.danger { color: #f08a7e; }
@@ -85,29 +86,31 @@ struct Turn {
 
 #[derive(Clone, PartialEq)]
 enum Status {
-    Loading,
+    NoModel,
+    Loading(String),
     Ready(String),
     Failed(String),
 }
 
 pub fn app() -> Element {
     let engine = use_context::<Engine>();
-    let mut status = use_signal(|| Status::Loading);
+    let mut status = use_signal(|| Status::NoModel);
     let mut turns = use_signal(Vec::<Turn>::new);
     let mut draft = use_signal(String::new);
     let mut error = use_signal(|| None::<String>);
     let mut running = use_signal(|| None::<Task>);
+    // Bumped to give the input box focus back. Blitz has no focus API, but it
+    // honours `autofocus` on mount, and a new key is a new mount.
+    let mut focus = use_signal(|| 0u32);
 
     let e = engine.clone();
     use_future(move || {
         let e = e.clone();
         async move {
-            let Some(ready) = e.take_ready() else { return };
-            status.set(match ready.await {
-                Ok(Ok(desc)) => Status::Ready(desc),
-                Ok(Err(e)) => Status::Failed(e),
-                Err(_) => Status::Failed("engine thread died while loading".into()),
-            });
+            if let Some(loaded) = e.take_initial() {
+                status.set(Status::Loading("model".into()));
+                status.set(finish_load(loaded).await);
+            }
         }
     });
 
@@ -174,6 +177,32 @@ pub fn app() -> Element {
         }
     };
 
+    // The conversation survives a switch: it is text on this side, and the
+    // next turn replays it into the new model.
+    let e = engine.clone();
+    let pick = move |_| {
+        if matches!(*status.read(), Status::Loading(_)) {
+            return;
+        }
+        let e = e.clone();
+        spawn(async move {
+            let mut dialog = rfd::AsyncFileDialog::new()
+                .set_title("Choose a model")
+                .add_filter("GGUF model", &["gguf"]);
+            if let Ok(dir) = std::path::Path::new("models").canonicalize() {
+                dialog = dialog.set_directory(dir);
+            }
+            let Some(file) = dialog.pick_file().await else {
+                return;
+            };
+            stop();
+            let path = file.path().to_string_lossy().into_owned();
+            status.set(Status::Loading(file.file_name()));
+            status.set(finish_load(e.load(path)).await);
+            focus += 1;
+        });
+    };
+
     let e = engine.clone();
     let wipe = move |_| {
         stop();
@@ -182,14 +211,18 @@ pub fn app() -> Element {
         error.set(None);
         let e = e.clone();
         spawn(async move { e.wipe().await });
+        focus += 1;
     };
 
     let busy = running.read().is_some();
     let (status_class, status_text) = match &*status.read() {
-        Status::Loading => ("status", "loading model…".to_string()),
+        Status::NoModel => ("status", "no model loaded".to_string()),
+        Status::Loading(name) => ("status", format!("loading {name}…")),
         Status::Ready(d) => ("status", d.clone()),
         Status::Failed(e) => ("status err", format!("failed to load: {e}")),
     };
+    let loading = matches!(*status.read(), Status::Loading(_));
+    let no_model = matches!(*status.read(), Status::NoModel | Status::Failed(_));
 
     rsx! {
         style { {CSS} }
@@ -197,14 +230,24 @@ pub fn app() -> Element {
             div { class: "bar",
                 span { class: "lock", "● private" }
                 span { class: "{status_class}", "{status_text}" }
+                button {
+                    class: if no_model { "primary" } else { "" },
+                    disabled: loading,
+                    onclick: pick,
+                    "Model…"
+                }
                 button { class: "danger", onclick: wipe, "Wipe" }
             }
             div { class: "log",
                 div { class: "turns",
                     if turns.read().is_empty() {
                         div { class: "empty",
-                            "Nothing here is written to disk. Wipe overwrites the conversation, "
-                            "the model's cache and device buffers; closing the window does the same."
+                            if no_model {
+                                "Choose a model (.gguf) to start."
+                            } else {
+                                "Nothing here is written to disk. Wipe overwrites the conversation, "
+                                "the model's cache and device buffers; closing the window does the same."
+                            }
                         }
                     }
                     for (i, t) in turns.read().iter().enumerate() {
@@ -220,22 +263,25 @@ pub fn app() -> Element {
                 }
             }
             div { class: "compose",
-                textarea {
-                    autofocus: true,
-                    placeholder: "Message  (Enter to send, Shift+Enter for a new line)",
-                    value: "{draft}",
-                    oninput: move |ev| draft.set(ev.value()),
-                    onkeydown: move |ev| {
-                        if ev.key() == Key::Enter && !ev.modifiers().shift() {
-                            ev.prevent_default();
-                            send.call(());
-                        }
-                    },
+                for epoch in std::iter::once(focus()) {
+                    textarea {
+                        key: "{epoch}",
+                        autofocus: true,
+                        placeholder: "Message  (Enter to send, Shift+Enter for a new line)",
+                        value: "{draft}",
+                        oninput: move |ev| draft.set(ev.value()),
+                        onkeydown: move |ev| {
+                            if ev.key() == Key::Enter && !ev.modifiers().shift() {
+                                ev.prevent_default();
+                                send.call(());
+                            }
+                        },
+                    }
                 }
                 if busy {
                     button { onclick: move |_| stop(), "Stop" }
                 } else {
-                    button { class: "primary", onclick: move |_| send.call(()), "Send" }
+                    button { class: "primary", onclick: move |_| { send.call(()); focus += 1; }, "Send" }
                 }
             }
         }
@@ -251,5 +297,13 @@ fn to_message(t: &Turn) -> Message {
         .into(),
         content: Some(serde_json::Value::String(t.text.clone())),
         ..Default::default()
+    }
+}
+
+async fn finish_load(loaded: crate::engine::Loaded) -> Status {
+    match loaded.await {
+        Ok(Ok(desc)) => Status::Ready(desc),
+        Ok(Err(e)) => Status::Failed(e),
+        Err(_) => Status::Failed("engine thread died while loading".into()),
     }
 }

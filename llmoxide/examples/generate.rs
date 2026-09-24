@@ -1,6 +1,6 @@
 //! The smallest thing another program can do with this crate.
 //!
-//!   cargo run --release --example generate -- models/Qwen3-0.6B-Q8_0.gguf "hello"
+//!   cargo run --release -p llmoxide --example generate -- models/Qwen3-0.6B-Q8_0.gguf "hello"
 
 use llmoxide::{LoadOptions, Request, Session};
 
