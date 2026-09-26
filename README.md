@@ -11,6 +11,8 @@ cargo run --release -p llmoxide-hub --bin llmoxide-fetch -- gemma4-e4b-q4   # 5.
 cargo run --release                                                        # opens the chat window
 ```
 
+<p align="center"><img src="docs/screenshot.png" width="640" alt="The llmoxide chat window: a Gemma 4 E4B conversation with a Markdown list and a Rust code block"></p>
+
 Everything is written from scratch in Rust with no ML dependencies: the GGUF
 loader, k-quant decoders, tokenizers, and wgpu compute kernels. It runs
 Gemma 4 (12B and E4B, with image input), Qwen 3.8 27B (hybrid delta-net), and
