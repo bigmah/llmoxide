@@ -6,13 +6,16 @@
 //! armed allocator zeroes on free. Wiping clears the signals, which drops the
 //! nodes, which frees the text.
 
+use std::sync::Arc;
+
 use chat::Message;
 use dioxus_native::prelude::dioxus_core::Task;
 use dioxus_native::prelude::*;
 use futures::StreamExt;
 
-use crate::engine::{Engine, Reply};
+use crate::engine::{Engine, Reply, ToolRow};
 use crate::md::Markdown;
+use crate::read::Grant;
 
 const CSS: &str = r#"
 * { box-sizing: border-box; }
@@ -37,6 +40,8 @@ body {
     font-size: 16px; font-weight: 600; color: #ececec;
 }
 .model:hover { background: #2f2f2f; }
+.model, .ghost, .badge { white-space: nowrap; flex-shrink: 0; }
+.detail { white-space: nowrap; overflow: hidden; min-width: 0; }
 .model .chev { color: #8e8e8e; font-size: 12px; }
 .model.cta { background: #ececec; color: #212121; font-size: 14px; }
 .detail { color: #8e8e8e; font-size: 12px; }
@@ -68,6 +73,50 @@ body {
     color: #ececec; font-size: 14px;
 }
 .ghost:hover { background: #2f2f2f; }
+/* The folder grant: a form under the header, and a chip in it once granted. */
+.grant {
+    display: flex; align-items: center; gap: 4px;
+    padding: 4px 4px 4px 10px; border-radius: 999px;
+    background: #2a2a2a; color: #c5c5c5; font-size: 12px;
+    white-space: nowrap; overflow: hidden; min-width: 0;
+}
+.grant .x { color: #8e8e8e; padding: 0 6px; font-size: 14px; border-radius: 999px; }
+.grant .x:hover { color: #ececec; background: #3a3a3a; }
+.folder {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 10px 16px; border-bottom: 1px solid #2c2c2c; background: #262626;
+    font-size: 13px;
+}
+.folder .label { color: #c5c5c5; }
+.folder input {
+    flex: 1; min-width: 200px; padding: 6px 10px; border-radius: 8px;
+    border: 1px solid #3a3a3a; background: #303030; color: #ececec;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13px;
+    overflow: hidden; white-space: nowrap;
+}
+.folder .opt { color: #8e8e8e; display: flex; align-items: center; gap: 6px; }
+.folder .opt:hover { color: #ececec; }
+.folder .box {
+    width: 14px; height: 14px; border-radius: 3px; border: 1px solid #6a6a6a;
+    display: flex; align-items: center; justify-content: center; font-size: 11px; color: #212121;
+}
+.folder .box.on { background: #e8956a; border-color: #e8956a; }
+.folder .go { padding: 6px 12px; border-radius: 8px; background: #ececec; color: #212121; font-size: 13px; }
+.folder .note { width: 100%; color: #8e8e8e; font-size: 12px; }
+.folder .err { width: 100%; color: #f08a7e; font-size: 12px; }
+.tools { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }
+.tool { color: #8e8e8e; font-size: 13px; display: flex; gap: 6px; padding: 2px 0; }
+.tool:hover { color: #c5c5c5; }
+.tool.bad { color: #d08a7e; }
+.tool .icode, .grant .icode {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px;
+}
+.tooldetail {
+    margin: 2px 0 6px 0; padding: 8px 10px; border-radius: 8px; background: #171717;
+    border: 1px solid #2c2c2c; color: #c5c5c5;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px;
+    white-space: pre-wrap; max-height: 240px; overflow-y: auto;
+}
 .banner {
     padding: 8px 16px; font-size: 13px;
     background: #3a2020; color: #f5b1a8;
@@ -180,10 +229,25 @@ enum Role {
     Assistant,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 struct Turn {
     role: Role,
     text: String,
+    /// Tool calls made while answering, for the rows above the reply.
+    tools: Vec<ToolRow>,
+    /// The calls and their results as messages, replayed ahead of `text`.
+    context: Vec<Message>,
+}
+
+impl Turn {
+    fn new(role: Role, text: String) -> Self {
+        Self {
+            role,
+            text,
+            tools: Vec::new(),
+            context: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -204,6 +268,12 @@ pub fn app() -> Element {
     // Bumped to give the input box focus back. Blitz has no focus API, but it
     // honours `autofocus` on mount, and a new key is a new mount.
     let mut focus = use_signal(|| 0u32);
+    // The folder the model may read, only ever in memory. `None` is no tools.
+    let mut grant = use_signal(|| None::<Arc<Grant>>);
+    let mut folder_open = use_signal(|| false);
+    let mut folder_draft = use_signal(String::new);
+    let mut allow_protected = use_signal(|| false);
+    let mut folder_error = use_signal(|| None::<String>);
 
     use_hook(crate::icon::set_dock_icon);
 
@@ -229,23 +299,31 @@ pub fn app() -> Element {
         }
         let text = draft.take();
         error.set(None);
-        turns.write().push(Turn {
-            role: Role::User,
-            text: text.trim().to_string(),
-        });
-        let history = turns.read().iter().map(to_message).collect();
-        turns.write().push(Turn {
-            role: Role::Assistant,
-            text: String::new(),
-        });
+        turns.write().push(Turn::new(Role::User, text.trim().to_string()));
+        let history = turns.read().iter().flat_map(to_messages).collect();
+        turns
+            .write()
+            .push(Turn::new(Role::Assistant, String::new()));
 
-        let mut rx = e.generate(history);
+        let mut rx = e.generate(history, grant.read().clone());
         let task = spawn(async move {
             while let Some(reply) = rx.next().await {
                 match reply {
                     Reply::Token(t) => {
                         if let Some(last) = turns.write().last_mut() {
                             last.text.push_str(&t);
+                        }
+                    }
+                    Reply::Tools {
+                        assistant,
+                        results,
+                        rows,
+                    } => {
+                        if let Some(last) = turns.write().last_mut() {
+                            last.context.push(assistant);
+                            last.context.extend(results);
+                            last.tools.extend(rows);
+                            last.text.clear();
                         }
                     }
                     Reply::Done(full) => {
@@ -314,12 +392,38 @@ pub fn app() -> Element {
         turns.write().clear();
         draft.set(String::new());
         error.set(None);
+        // The grant goes with the conversation: nothing remembers a folder.
+        grant.set(None);
+        folder_open.set(false);
+        folder_draft.set(String::new());
+        folder_error.set(None);
+        allow_protected.set(false);
         let e = e.clone();
         spawn(async move { e.wipe().await });
         focus += 1;
     };
 
+    let mut grant_folder = move || {
+        let opened = Grant::open(&folder_draft.read(), allow_protected());
+        match opened {
+            Ok(g) => {
+                grant.set(Some(Arc::new(g)));
+                folder_open.set(false);
+                folder_draft.set(String::new());
+                folder_error.set(None);
+                focus += 1;
+            }
+            Err(e) => folder_error.set(Some(e)),
+        }
+    };
+
     let busy = running.read().is_some();
+    let granted = grant.read().as_ref().map(|g| g.display());
+    // The chip shows the folder's own name; the full path is in the welcome
+    // text, where it has room.
+    let granted_name = granted
+        .as_deref()
+        .map(|p| p.rsplit('/').find(|s| !s.is_empty()).unwrap_or(p).to_string());
     let n_turns = turns.read().len();
     let loading = matches!(*status.read(), Status::Loading(_));
     let ready = matches!(*status.read(), Status::Ready(_));
@@ -356,8 +460,69 @@ pub fn app() -> Element {
                 }
                 span { class: "detail", "{model_detail}" }
                 div { class: "spacer" }
+                if let Some(dir) = granted_name {
+                    span { class: "grant",
+                        "Reading "
+                        span { class: "icode", "{dir}" }
+                        // Revoking mid-reply would pull the folder out from
+                        // under a tool call; the engine holds its own handle
+                        // until the turn ends either way.
+                        button { class: "x", onclick: move |_| grant.set(None), "×" }
+                    }
+                } else if !no_model {
+                    button {
+                        class: "ghost",
+                        onclick: move |_| {
+                            let open = !folder_open();
+                            folder_open.set(open);
+                            folder_error.set(None);
+                        },
+                        "Folder…"
+                    }
+                }
                 span { class: "badge", span { style: "font-size: 11px", Padlock {} } "Private" }
                 button { class: "ghost", onclick: wipe, span { class: "glyph", "+" } "New chat" }
+            }
+            if folder_open() && granted.is_none() {
+                div { class: "folder",
+                    span { class: "label", "Let the model read files in" }
+                    // Typed, not picked: the system folder dialog saves the
+                    // last folder it showed to a preferences file.
+                    input {
+                        r#type: "text",
+                        autofocus: true,
+                        value: "{folder_draft}",
+                        oninput: move |ev| folder_draft.set(ev.value()),
+                        onkeydown: move |ev| {
+                            if ev.key() == Key::Enter {
+                                ev.prevent_default();
+                                grant_folder();
+                            } else if ev.key() == Key::Escape {
+                                folder_open.set(false);
+                            }
+                        },
+                    }
+                    button { class: "go", onclick: move |_| grant_folder(), "Allow reading" }
+                    button {
+                        class: "opt",
+                        onclick: move |_| allow_protected.set(!allow_protected()),
+                        span { class: if allow_protected() { "box on" } else { "box" },
+                            if allow_protected() { "✓" }
+                        }
+                        "Allow protected folders"
+                    }
+                    if allow_protected() {
+                        div { class: "note",
+                            "Documents, Desktop, Downloads, Library and external drives are protected by macOS, which keeps a lasting record that this app was allowed in (the folder, not the files)."
+                        }
+                    }
+                    div { class: "note",
+                        "Type a full path, such as ~/projects/foo. Read-only: the model can list, read and search files there, and nothing is written or sent. Reads leave no trace on disk, and New chat forgets the folder."
+                    }
+                    if let Some(e) = folder_error.read().as_ref() {
+                        div { class: "err", "{e}" }
+                    }
+                }
             }
             if let Some(e) = failed {
                 div { class: "banner", "Couldn't load the model: {e}" }
@@ -379,6 +544,8 @@ pub fn app() -> Element {
                                 div { class: "sub",
                                     if no_model {
                                         "Pick a .gguf file with the button in the top left."
+                                    } else if let Some(dir) = granted.as_ref() {
+                                        "The model can read files in {dir}. Reading leaves no trace on disk; nothing is written or sent."
                                     } else {
                                         "Runs entirely on this machine. Nothing is sent anywhere or written to disk."
                                     }
@@ -392,6 +559,13 @@ pub fn app() -> Element {
                                 div { key: "{i}", class: "assistant",
                                     div { class: "avatar", Padlock {} }
                                     div { class: "reply",
+                                        if !t.tools.is_empty() {
+                                            div { class: "tools",
+                                                for (j, row) in t.tools.iter().enumerate() {
+                                                    ToolLine { key: "{j}", row: row.clone() }
+                                                }
+                                            }
+                                        }
                                         if t.text.is_empty() {
                                             span { class: "thinking", "Thinking…" }
                                         } else {
@@ -459,6 +633,33 @@ pub fn app() -> Element {
     }
 }
 
+/// One tool call under a reply: its summary, and what the model was given
+/// when clicked.
+#[component]
+fn ToolLine(row: ToolRow) -> Element {
+    let mut open = use_signal(|| false);
+    rsx! {
+        button {
+            class: if row.ok { "tool" } else { "tool bad" },
+            onclick: move |_| open.set(!open()),
+            span { if open() { "▾" } else { "▸" } }
+            span {
+                // `name` in a summary is a path or pattern: show it as code.
+                for (k, part) in row.summary.split('`').enumerate() {
+                    if k % 2 == 1 {
+                        span { class: "icode", "{part}" }
+                    } else {
+                        "{part}"
+                    }
+                }
+            }
+        }
+        if open() {
+            div { class: "tooldetail", "{row.detail}" }
+        }
+    }
+}
+
 /// Copies a reply's Markdown source, and says so for a moment.
 #[component]
 fn CopyButton(text: String) -> Element {
@@ -513,8 +714,10 @@ fn short_name(file: &str) -> String {
     file.strip_suffix(".gguf").unwrap_or(file).to_string()
 }
 
-fn to_message(t: &Turn) -> Message {
-    Message {
+/// A turn as the model sees it: any tool calls and results, then the text.
+fn to_messages(t: &Turn) -> Vec<Message> {
+    let mut v = t.context.clone();
+    v.push(Message {
         role: match t.role {
             Role::User => "user",
             Role::Assistant => "assistant",
@@ -522,7 +725,8 @@ fn to_message(t: &Turn) -> Message {
         .into(),
         content: Some(serde_json::Value::String(t.text.clone())),
         ..Default::default()
-    }
+    });
+    v
 }
 
 async fn finish_load(loaded: crate::engine::Loaded) -> Status {

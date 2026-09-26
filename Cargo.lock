@@ -2694,6 +2694,7 @@ dependencies = [
  "dioxus-native",
  "futures",
  "image",
+ "libc",
  "llmoxide",
  "llmoxide-chat",
  "llmoxide-secret",

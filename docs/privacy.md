@@ -155,3 +155,87 @@ On top of [the REPL's list](#what-this-does-not-cover), the app does not cover:
   nothing from a conversation — but a record of where the models live.
   `defaults delete com.apple.ViewBridge.masquerading-service-lacks-host-bundle-identifier NSOSPLastRootDirectory`
   removes it; passing the model as an argument avoids the dialog entirely.
+
+### Reading files
+
+**Folder…** in the header lets the model read files in one folder, read-only.
+It has three tools: `list_dir`, `read_file` (text only, 16 KB per call) and
+`search` (a literal string, 50 matches). A turn may make up to 8 rounds of
+calls and add up to 48 KB of results. Each call shows as a row above the
+reply, and clicking the row shows what the model was given. The design and
+the measurements behind it are in
+[private-reading-plan.md](private-reading-plan.md).
+
+The guarantee is the same as for the rest of the app: after New chat or
+exit, nothing on disk shows what was read, or that anything was. Reading a
+file changes one thing on disk, its access time (and a folder's, when it is
+listed). Measured on APFS, Darwin 25.6:
+
+| action | trace |
+|---|---|
+| reading a file | its access time moves (only the first read after a change) |
+| listing a folder | the folder's access time moves |
+| `open`, `stat`, path lookup | none |
+| putting the access time back with `futimens` | none: mtime and ctime unchanged, to the nanosecond |
+| any of the above | no FSEvents, so nothing reaches `/.fseventsd` |
+
+So every read saves the access time first and puts it back afterwards, then
+checks that it took. A failed restore is reported to the model as an error
+and shown in the row. The folder is typed into the app, not picked:
+NSOpenPanel would record it (see the model picker above), and a command-line
+argument would land in shell history. The grant lives only in memory, and New
+chat drops it.
+
+Before anything is read, it must pass these checks, or the call is refused:
+
+- **Inside the folder.** Paths are opened one component at a time with
+  `openat` from the folder's descriptor and `O_NOFOLLOW`. `..` is refused,
+  and symlinks are never followed, even ones that point inside the folder.
+- **On a local drive** (`MNT_LOCAL`). A file server sees every read.
+- **Not an iCloud placeholder** (`SF_DATALESS`). Reading one downloads it.
+- **Owned by you.** Only the owner can set a file's access time, so a trace
+  that could not be undone is never left.
+- **A regular file or folder.** Text that is not UTF-8, or has a NUL byte, is
+  refused as binary.
+- **Outside macOS-protected folders** (Desktop, Documents, Downloads,
+  Library, Pictures, Movies, Music, `/Volumes`), unless you tick **Allow
+  protected folders**. macOS then keeps a lasting record that this app was
+  allowed into that folder. It records the folder, not the files.
+
+File contents are read with `F_NOCACHE` into locked, self-zeroing memory.
+The text handed to the model is on the zeroing heap but not locked, the same
+as the UI's history. In the KV cache it is covered by the wipe.
+
+`read_check` runs the real tool code over a fixture folder and checks all of
+this:
+
+```sh
+cargo run --release -p llmoxide-app --bin read_check [parent-folder]   # exits non-zero on any trace
+```
+
+It ages every access time to before its mtime (so any read would move it),
+watches the folder with a file-level FSEvents stream, then lists, reads and
+searches, and tries each case a rule must refuse. It then checks that every
+atime, mtime and ctime is unchanged and that the stream saw nothing. Two
+positive controls follow: a plain read must move an access time, and an
+append must reach the stream. With the restore disabled, 9 of the 12 paths
+change and it fails. Run it again after macOS updates: if a future version
+starts logging access-time restores, this is what will catch it.
+
+The fixture is named `.noindex`. In a folder Spotlight indexes, its importer
+reads new text files within a second or two of their creation. It moves their
+access times, and the check would blame the tools. Files that already exist
+have been indexed long ago, and a read triggers no reindex, because a read
+emits no FSEvents.
+
+Reading adds these to the list above:
+
+- **Anyone watching live**: root, `fs_usage`, dtrace, or an Endpoint Security
+  client (EDR or MDM agents) sees each `open` as it happens.
+- **APFS copy-on-write.** The access time is written to disk before it is put
+  back. Forensic carving of free space, or a local snapshot taken in that
+  window of a few milliseconds, could still find it.
+- **A race.** If another process reads the same file between our read and
+  the restore, its access-time update is hidden too.
+- **macOS only.** Linux and Windows are unmeasured, so the tools are not
+  offered there.

@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+# `read_check` is a second binary; a bare `cargo run` still means the window.
+default-run = "llmoxide-app"
 
 [dependencies]
 llmoxide = { workspace = true, features = ["gpu", "private"] }
@@ -46,6 +48,8 @@ dioxus-native = { version = "0.7.10", default-features = false, features = ["pre
 # the Dock icon through AppKit; elsewhere it is the window icon, which winit
 # wants as raw RGBA. Both crates are already in the tree through the renderer.
 [target.'cfg(target_os = "macos")'.dependencies]
+# The private file reader (read.rs): openat/fstatat/futimens/fstatfs.
+libc = "0.2"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSImage"] }

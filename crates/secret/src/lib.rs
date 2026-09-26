@@ -237,6 +237,17 @@ impl<T: Copy> SecretVec<T> {
         self.len += s.len();
     }
 
+    /// Grow to `len` elements, filling with `v`, or cut back to `len`. Cutting
+    /// back does not zero the tail; [`wipe`](Self::wipe) and drop do. For
+    /// reading straight into locked memory: size it, fill it, trim it.
+    pub fn resize(&mut self, len: usize, v: T) {
+        self.grow(len);
+        for i in self.len..len {
+            unsafe { self.ptr.add(i).write(v) };
+        }
+        self.len = len;
+    }
+
     /// Wipe whatever is here and take `s` instead.
     pub fn replace(&mut self, s: &[T]) {
         self.wipe();
@@ -271,6 +282,12 @@ impl<T: Copy> std::ops::Deref for SecretVec<T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl<T: Copy> std::ops::DerefMut for SecretVec<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 }
 

@@ -1,6 +1,15 @@
 # Plan: private file reading
 
-Status: planned, not built (2026-09-24).
+Status: milestones 1–5 built (2026-09-26). The user-facing description is in
+[privacy.md](privacy.md#reading-files). Differences from this plan:
+symlinks are never followed, not even ones that stay inside the folder, and
+the model was tested with Gemma 4 E4B, since the 27B is not on the build
+machine. E4B's tool calling works (list → list → read → answer, and the
+follow-up turn keeps the context). Qwen3-0.6B never calls a tool. The Qwen
+chat format renders Qwen 3.5's XML tool syntax for dense Qwen3 too, which may
+be why. The window flow was driven end to end with E4B: grant, list, read,
+search, an expanded tool row, New chat dropping the grant, and a refused
+protected folder.
 
 Let the chat window's model read files in a folder you choose, without
 giving up the app's promise: after New chat or exit, nothing on the machine

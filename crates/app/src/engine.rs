@@ -10,17 +10,41 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use chat::Message;
+use chat::{ApiToolCall, FunctionCall, Message};
 use futures::channel::{mpsc as amp, oneshot};
 use llmoxide::{DevicePref, Flow, LoadOptions, Request, Session, Sink};
+
+use crate::read::{self, Grant};
+
+/// Rounds of tool calls one turn may make before the model is asked to
+/// answer with what it has.
+const MAX_STEPS: usize = 8;
 
 /// Streamed progress for one turn.
 pub enum Reply {
     Token(String),
+    /// A round of tool calls ran. `assistant` carries the calls and
+    /// `results` the `tool` messages answering them; both belong in the
+    /// history, ahead of the final text, so the next turn replays them.
+    /// Tokens streamed before this were the calls being written, not reply.
+    Tools {
+        assistant: Message,
+        results: Vec<Message>,
+        rows: Vec<ToolRow>,
+    },
     /// The finished text, as the chat dialect parsed it — which can differ
     /// from the concatenated tokens (a stripped thinking channel, say).
     Done(String),
     Error(String),
+}
+
+/// One tool call, as the chat window shows it.
+#[derive(Clone, PartialEq)]
+pub struct ToolRow {
+    pub summary: String,
+    pub ok: bool,
+    /// What the model was given, for when the row is opened.
+    pub detail: String,
 }
 
 /// What loaded — a one-line description — or why it did not.
@@ -28,7 +52,7 @@ pub type Loaded = oneshot::Receiver<Result<String, String>>;
 
 enum Cmd {
     Load(String, oneshot::Sender<Result<String, String>>),
-    Gen(Box<Request>, amp::UnboundedSender<Reply>),
+    Gen(Box<Request>, Option<Arc<Grant>>, amp::UnboundedSender<Reply>),
     Wipe(oneshot::Sender<()>),
 }
 
@@ -95,9 +119,14 @@ impl Engine {
         rx
     }
 
-    /// Start a turn over `history`. Dropping the receiver cancels it at the
-    /// next token.
-    pub fn generate(&self, history: Vec<Message>) -> amp::UnboundedReceiver<Reply> {
+    /// Start a turn over `history`, with the read tools if a folder is
+    /// granted. Dropping the receiver cancels it at the next token or tool
+    /// call.
+    pub fn generate(
+        &self,
+        history: Vec<Message>,
+        grant: Option<Arc<Grant>>,
+    ) -> amp::UnboundedReceiver<Reply> {
         let (tx, rx) = amp::unbounded();
         let req = Request {
             messages: history,
@@ -107,7 +136,11 @@ impl Engine {
             enable_thinking: false,
             stop: Vec::new(),
         };
-        if self.tx.send(Cmd::Gen(Box::new(req), tx.clone())).is_err() {
+        if self
+            .tx
+            .send(Cmd::Gen(Box::new(req), grant, tx.clone()))
+            .is_err()
+        {
             let _ = tx.unbounded_send(Reply::Error("engine thread gone".into()));
         }
         rx
@@ -154,7 +187,7 @@ fn run(s: Settings, rx: mpsc::Receiver<Cmd>, closing: &AtomicBool, loading: &Ato
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            Cmd::Load(_, _) | Cmd::Gen(_, _) if closing.load(Ordering::SeqCst) => {}
+            Cmd::Load(_, _) | Cmd::Gen(_, _, _) if closing.load(Ordering::SeqCst) => {}
             Cmd::Load(path, done) => {
                 if let Some(mut old) = session.take() {
                     old.wipe();
@@ -182,16 +215,10 @@ fn run(s: Settings, rx: mpsc::Receiver<Cmd>, closing: &AtomicBool, loading: &Ato
                     Err(e) => Err(format!("{path}: {e}")),
                 });
             }
-            Cmd::Gen(req, tx) => {
+            Cmd::Gen(req, grant, tx) => {
                 let reply = match session.as_mut() {
                     None => Reply::Error("no model loaded".into()),
-                    Some(session) => {
-                        let mut sink = ChannelSink(&tx, closing);
-                        match session.generate_with(*req, &mut sink) {
-                            Ok(o) => Reply::Done(o.completion.content),
-                            Err(e) => Reply::Error(e.to_string()),
-                        }
-                    }
+                    Some(session) => turn(session, *req, grant.as_deref(), &tx, closing),
                 };
                 let _ = tx.unbounded_send(reply);
             }
@@ -207,6 +234,92 @@ fn run(s: Settings, rx: mpsc::Receiver<Cmd>, closing: &AtomicBool, loading: &Ato
     if let Some(mut session) = session {
         session.wipe();
     }
+}
+
+/// Generate, run any tool calls, feed the results back, and generate again,
+/// until the model answers without calling anything. The tools are quick,
+/// bounded reads, so they run here on the engine thread, behind the same
+/// `closing` flag as generation.
+fn turn(
+    session: &mut Session,
+    mut req: Request,
+    grant: Option<&Grant>,
+    tx: &amp::UnboundedSender<Reply>,
+    closing: &AtomicBool,
+) -> Reply {
+    if let Some(g) = grant {
+        req.tools = read::tools();
+        if req.messages.first().is_none_or(|m| m.role != "system") {
+            req.messages.insert(0, Message::system(read::system_prompt(g)));
+        }
+    }
+    let mut budget = read::Budget::new();
+    for step in 0..=MAX_STEPS {
+        // Out of steps: take the tools away, so the model has to answer.
+        if step == MAX_STEPS {
+            req.tools.clear();
+        }
+        let mut sink = ChannelSink(tx, closing);
+        let o = match session.generate_with(req.clone(), &mut sink) {
+            Ok(o) => o,
+            Err(e) => return Reply::Error(e.to_string()),
+        };
+        let c = o.completion;
+        let Some(g) = grant.filter(|_| !c.tool_calls.is_empty()) else {
+            return Reply::Done(c.content);
+        };
+        // Stop was pressed, or the window is closing: read nothing more.
+        if tx.is_closed() || closing.load(Ordering::SeqCst) {
+            return Reply::Done(c.content);
+        }
+        let calls: Vec<ApiToolCall> = c
+            .tool_calls
+            .iter()
+            .enumerate()
+            .map(|(i, call)| ApiToolCall {
+                id: format!("call_{step}_{i}"),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: call.name.clone(),
+                    arguments: call.arguments.to_string(),
+                },
+            })
+            .collect();
+        let mut results = Vec::new();
+        let mut rows = Vec::new();
+        for (call, api) in c.tool_calls.iter().zip(&calls) {
+            let out = read::call(g, &call.name, &call.arguments, &mut budget);
+            rows.push(ToolRow {
+                summary: out.summary,
+                ok: out.ok,
+                detail: out.text.clone(),
+            });
+            results.push(Message {
+                role: "tool".into(),
+                content: Some(serde_json::Value::String(out.text)),
+                tool_call_id: Some(api.id.clone()),
+                name: Some(call.name.clone()),
+                ..Default::default()
+            });
+        }
+        let assistant = Message {
+            role: "assistant".into(),
+            content: Some(serde_json::Value::String(c.content)),
+            tool_calls: calls,
+            ..Default::default()
+        };
+        req.messages.push(assistant.clone());
+        req.messages.extend(results.iter().cloned());
+        let sent = tx.unbounded_send(Reply::Tools {
+            assistant,
+            results,
+            rows,
+        });
+        if sent.is_err() {
+            return Reply::Done(String::new());
+        }
+    }
+    unreachable!("the last step has no tools, so it returns")
 }
 
 /// One line for the header: file, device, context.
@@ -238,5 +351,76 @@ impl Sink for ChannelSink<'_> {
             // conversation was wiped out from under this turn.
             Err(_) => Flow::Stop,
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use futures::StreamExt;
+
+    use super::*;
+
+    /// The tool loop against a real model: grant a folder, ask about a file
+    /// in it, and check the answer came from reading it — then ask again, so
+    /// the history with its tool messages is replayed.
+    ///
+    ///   LLMOXIDE_TEST_MODEL=models/gemma-4-E4B-it-Q4_K_M.gguf \
+    ///     cargo test -p llmoxide-app --release -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs LLMOXIDE_TEST_MODEL"]
+    fn answers_from_a_granted_folder() {
+        let model = std::env::var("LLMOXIDE_TEST_MODEL").expect("LLMOXIDE_TEST_MODEL");
+        let dir = std::env::temp_dir().join(format!("llmoxide-tool-loop-{}.noindex", std::process::id()));
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs/notes.txt"), "Meeting notes.\nThe launch code is PERIWINKLE-42.\n").unwrap();
+        std::fs::write(dir.join("README.md"), "# Demo\nSee docs/ for notes.\n").unwrap();
+
+        let engine = Engine::spawn(
+            Settings { n_ctx: 8192, batch: 256, cpu: false },
+            Some(model),
+        );
+        let loaded = futures::executor::block_on(engine.take_initial().unwrap()).unwrap();
+        println!("loaded: {loaded:?}");
+        let grant = Arc::new(Grant::open(dir.to_str().unwrap(), false).unwrap());
+
+        let ask = |history: Vec<Message>| {
+            let rx = engine.generate(history, Some(grant.clone()));
+            let mut context = Vec::new();
+            let mut rows = Vec::new();
+            let mut done = None;
+            for r in futures::executor::block_on(rx.collect::<Vec<_>>()) {
+                match r {
+                    Reply::Token(_) => {}
+                    Reply::Tools { assistant, results, rows: r } => {
+                        context.push(assistant);
+                        context.extend(results);
+                        rows.extend(r);
+                    }
+                    Reply::Done(t) => done = Some(t),
+                    Reply::Error(e) => panic!("error: {e}"),
+                }
+            }
+            for r in &rows {
+                println!("  tool: {} (ok={})", r.summary, r.ok);
+            }
+            let text = done.expect("a final reply");
+            println!("  reply: {text}");
+            (context, rows, text)
+        };
+
+        let q1 = Message::user("What is the launch code? It is written somewhere in the shared folder.");
+        let (context, rows, a1) = ask(vec![q1.clone()]);
+        assert!(rows.iter().any(|r| r.ok), "no tool call succeeded");
+        assert!(a1.contains("PERIWINKLE-42"), "answer did not use the file: {a1}");
+
+        let mut history = vec![q1];
+        history.extend(context);
+        history.push(Message::assistant(a1));
+        history.push(Message::user("Which file was it in? Answer with just the path."));
+        let (_, _, a2) = ask(history);
+        assert!(a2.contains("notes.txt"), "follow-up lost the tool context: {a2}");
+
+        engine.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

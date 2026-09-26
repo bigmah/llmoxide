@@ -29,6 +29,10 @@ in one process, and nothing in it talks to the network.
 - The model name in the header opens the system file dialog to switch checkpoints. The current
   model is wiped and dropped before the next one loads. The conversation
   carries over and is replayed into the new model.
+- **Folder…** lets the model read files in one folder you type in, read-only:
+  list, read and search. Every read puts back the access time it moved, so
+  nothing on disk shows what was read. `read_check` verifies that. See
+  [privacy](docs/privacy.md#reading-files).
 - With no argument, it opens `models/gemma-4-E4B-it-Q4_K_M.gguf`. If that file
   isn't there, it opens on the picker. You can pass any other checkpoint:
 
