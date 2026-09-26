@@ -19,7 +19,9 @@
 //! Only then does the `.part` file take its real name, so an interrupted fetch
 //! can never be mistaken for a complete one.
 
+pub mod check;
 pub mod progress;
+pub mod repo;
 
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -34,17 +36,34 @@ use progress::Progress;
 /// moves several times a second on a fast link.
 const CHUNK: usize = 8 << 20;
 
-/// The checkpoints this repo is built around, so neither has to be a URL.
-pub const ALIASES: &[(&str, &str)] = &[
-    (
+/// A named checkpoint, so it does not have to be a URL.
+pub struct Alias {
+    pub name: &'static str,
+    pub url: &'static str,
+    /// Fetched by a bare `llmoxide-fetch`: the checkpoints this repo is built
+    /// and validated around. The rest are the same architectures at other
+    /// sizes, fetched by name.
+    pub core: bool,
+}
+
+const fn core(name: &'static str, url: &'static str) -> Alias {
+    Alias { name, url, core: true }
+}
+
+const fn extra(name: &'static str, url: &'static str) -> Alias {
+    Alias { name, url, core: false }
+}
+
+pub const ALIASES: &[Alias] = &[
+    core(
         "gemma4",
         "https://huggingface.co/yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF/resolve/main/gemma4-v2-Q4_K_M.gguf",
     ),
-    (
+    core(
         "gemma4-e4b",
         "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf",
     ),
-    (
+    core(
         "qwen35",
         "https://huggingface.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED/resolve/main/Qwen3.8-27B-OBLITERATED-Q6_K.gguf",
     ),
@@ -52,7 +71,7 @@ pub const ALIASES: &[(&str, &str)] = &[
     // (8.0 GB) and Q4_0 — the first is more GPU memory than a tab should ask
     // for and the second is a quantization this repo has no decoder for. This
     // build is Q4_K/Q6_K throughout, which is exactly what the kernels handle.
-    (
+    core(
         "gemma4-e4b-q4",
         "https://huggingface.co/lmstudio-community/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf",
     ),
@@ -60,53 +79,133 @@ pub const ALIASES: &[(&str, &str)] = &[
     // Q8_0 beside it: it is a fifth of the text model's size, it runs once per
     // image instead of once per token, and the encoder is the one place where
     // quantization error lands on every downstream token at once.
-    (
+    core(
         "gemma4-e4b-mmproj",
         "https://huggingface.co/lmstudio-community/gemma-4-E4B-it-GGUF/resolve/main/mmproj-gemma-4-E4B-it-BF16.gguf",
     ),
     // Small enough to serve from a website. Q8_0 rather than Q4_K_M because at
     // 0.6B the quantization error is what you notice first, and 0.64 GB is
     // already well inside any sane budget.
-    (
+    core(
         "qwen3-0.6b",
         "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
     ),
     // The one to bake into a page: 0.40 GB, and its `token_embd` is Q6_K, so
     // the embedding gather kernel can read it. Q5_K_M is the same size class
     // but quantizes the body to Q5_K, which there is no decoder for.
-    (
+    core(
         "qwen3-0.6b-q4",
         "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf",
     ),
+    // ---- the same architectures at other sizes; fetched by name only ----
+    //
+    // Each was chosen by `llmoxide-fetch --check` (2026-09-26): the header
+    // passes the real loaders, and no tensor needs a kernel the GPU lacks.
+    // Where the obvious Q4_K_M is not here, that is why: unsloth's Qwen3.5 and
+    // Gemma E-series Q4_K_M mix in Q5_K, and from Qwen3-8B up their Q4_K_M
+    // carries a Q4_K `token_embd`, which only the CPU path can gather.
+    extra(
+        "qwen3-1.7b",
+        "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf",
+    ),
+    extra(
+        "qwen3-4b",
+        "https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
+    ),
+    extra(
+        "qwen3-8b",
+        "https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q6_K.gguf",
+    ),
+    extra(
+        "qwen3-14b",
+        "https://huggingface.co/unsloth/Qwen3-14B-GGUF/resolve/main/Qwen3-14B-Q6_K.gguf",
+    ),
+    extra(
+        "qwen3-32b",
+        "https://huggingface.co/unsloth/Qwen3-32B-GGUF/resolve/main/Qwen3-32B-Q6_K.gguf",
+    ),
+    // The small Qwen3.5s are the hybrid delta-net stack, like the 27B. The
+    // 0.8B was run end to end: greedy output identical on GPU, CPU and
+    // llama.cpp. Their mmproj files are Qwen's vision tower, not gemma4v.
+    extra(
+        "qwen3.5-0.8b",
+        "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q6_K.gguf",
+    ),
+    extra(
+        "qwen3.5-2b",
+        "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q8_0.gguf",
+    ),
+    extra(
+        "qwen3.5-4b",
+        "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q6_K.gguf",
+    ),
+    extra(
+        "qwen3.5-9b",
+        "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q6_K.gguf",
+    ),
+    // The stock 27B, as opposed to the abliterated merge `qwen35` points at.
+    extra(
+        "qwen3.5-27b",
+        "https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q6_K.gguf",
+    ),
+    // lmstudio's rather than unsloth's Q4_K_M: same size, but its token_embd
+    // is Q6_K, so it runs on the GPU. Its mmproj is gemma4v and loads too.
+    // Gemma 4 E2B is not listed: its `feed_forward_length` is per-layer, which
+    // the gemma4 config does not read yet.
+    extra(
+        "gemma4-31b",
+        "https://huggingface.co/lmstudio-community/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-Q4_K_M.gguf",
+    ),
 ];
 
-/// Turn an alias, a `hf:owner/repo/file` shorthand, or any Hugging Face file URL
-/// into something that serves bytes.
+/// What a command-line spec names: one file, or a repo to pick a file from.
+#[derive(Debug, PartialEq)]
+pub enum Target {
+    /// A URL that serves bytes.
+    File(String),
+    /// `owner/name`, optionally narrowed to one quantization.
+    Repo { repo: String, quant: Option<String> },
+}
+
+/// Parse an alias, `hf:owner/repo[:QUANT]`, `hf:owner/repo/file`, or a Hugging
+/// Face URL to a repo or a file.
 ///
 /// The URL you get from the website's "copy link" is a `/blob/` (or `/blame/`)
 /// page, which returns HTML — downloading one yields a few kilobytes that look
 /// like a corrupt model. Rewriting to `/resolve/` is the whole difference.
-pub fn resolve_url(spec: &str) -> anyhow::Result<String> {
-    if let Some((_, url)) = ALIASES.iter().find(|(name, _)| *name == spec) {
-        return Ok((*url).to_string());
+pub fn parse_spec(spec: &str) -> anyhow::Result<Target> {
+    if let Some(a) = ALIASES.iter().find(|a| a.name == spec) {
+        return Ok(Target::File(a.url.to_string()));
     }
-    if let Some(rest) = spec.strip_prefix("hf:") {
-        let parts: Vec<&str> = rest.splitn(3, '/').collect();
-        if parts.len() != 3 {
-            bail!("expected hf:<owner>/<repo>/<file>, got hf:{rest}");
+    let rest = if let Some(rest) = spec.strip_prefix("hf:") {
+        rest
+    } else if let Some(rest) = spec.strip_prefix("https://huggingface.co/") {
+        if rest.contains("/blob/") || rest.contains("/blame/") || rest.contains("/resolve/") {
+            return Ok(Target::File(
+                spec.replace("/blob/", "/resolve/").replace("/blame/", "/resolve/"),
+            ));
         }
-        return Ok(format!(
-            "https://huggingface.co/{}/{}/resolve/main/{}",
-            parts[0], parts[1], parts[2]
-        ));
-    }
-    if !spec.starts_with("https://") {
+        rest.trim_end_matches('/')
+    } else if spec.starts_with("https://") {
+        return Ok(Target::File(spec.to_string()));
+    } else {
         bail!(
             "not a known alias, hf: spec, or https URL: {spec}\naliases: {}",
-            ALIASES.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+            ALIASES.iter().map(|a| a.name).collect::<Vec<_>>().join(", ")
         );
+    };
+    let parts: Vec<&str> = rest.splitn(3, '/').collect();
+    match parts.as_slice() {
+        [owner, name, file] => Ok(Target::File(repo::resolve_url(&format!("{owner}/{name}"), file))),
+        [owner, name] => {
+            let (name, quant) = match name.split_once(':') {
+                Some((n, q)) => (n, Some(q.to_string())),
+                None => (*name, None),
+            };
+            Ok(Target::Repo { repo: format!("{owner}/{name}"), quant })
+        }
+        _ => bail!("expected hf:<owner>/<repo>[:QUANT] or hf:<owner>/<repo>/<file>, got {spec}"),
     }
-    Ok(spec.replace("/blob/", "/resolve/").replace("/blame/", "/resolve/"))
 }
 
 pub struct Remote {
@@ -117,7 +216,7 @@ pub struct Remote {
     pub filename: String,
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     // No global timeout: the deadline for a 21 GB body is not knowable up
     // front, and a transfer that is still moving must not be killed. Stalls are
     // caught by the read timeout instead, and shown by the meter.

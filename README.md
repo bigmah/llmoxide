@@ -119,7 +119,8 @@ The window is the workspace's only default member, so a bare `cargo build` or
 
 ```sh
 cargo build --release --workspace
-./target/release/llmoxide-fetch                  # all models, into models/
+./target/release/llmoxide-fetch                  # the core models, into models/
+./target/release/llmoxide-fetch hf:owner/repo    # best runnable file from any HF repo
 ./target/release/llmoxide-private <model.gguf>   # the same private session, in a terminal
 ./target/release/wipe_check <model.gguf>         # prove a wipe leaves no residue
 ./target/release/llmoxide-serve <model.gguf>     # OpenAI-compatible API — not private

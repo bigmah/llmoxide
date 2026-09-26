@@ -2754,6 +2754,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "llmoxide-gguf",
+ "llmoxide-model",
+ "llmoxide-tokenizer",
+ "serde_json",
  "sha2",
  "ureq",
 ]

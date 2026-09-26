@@ -76,11 +76,70 @@ where the 12B writes a 48-entry array. Config reads all of this out of the GGUF;
 see [`crates/model/src/config.rs`](../crates/model/src/config.rs).
 
 ```sh
-./target/release/llmoxide-fetch            # all three, into models/
-./target/release/llmoxide-fetch gemma4     # or one
+./target/release/llmoxide-fetch                     # the table above, into models/
+./target/release/llmoxide-fetch gemma4              # or one alias (--aliases lists all)
+./target/release/llmoxide-fetch hf:owner/repo       # the best file in a repo that will run
+./target/release/llmoxide-fetch hf:owner/repo:Q8_0  # ... at one quantization
 ./target/release/llmoxide-fetch hf:owner/repo/file.gguf
 ./target/release/llmoxide-fetch https://huggingface.co/owner/repo/blob/main/f.gguf
+./target/release/llmoxide-fetch --check hf:owner/repo   # judge every file, download nothing
 ```
+
+### Anything else on the Hub
+
+The table is what this repo is validated around, not the limit of what it runs.
+Every `qwen3`, `qwen35` and `gemma4` GGUF whose tensors are all F32, F16, BF16,
+Q8_0, Q4_K or Q6_K loads, and most repos have one. The hard part is knowing
+which file before downloading 20 GB of it, so the fetcher answers that first.
+
+A GGUF's metadata and tensor table are at the front of the file. Before any
+transfer, `llmoxide-fetch` range-reads that header (4 MB, doubling until it
+parses) and puts it through the **real loaders**: `Arch::detect`, the config
+parser for that architecture, and `Tokenizer::from_gguf`, over a
+`Gguf::sparse` with no tensor bytes resident. There is no second list of what
+is supported to drift from the first. A `qwen3moe`, a Q5_K tensor or an unknown
+pre-tokenizer is refused up front with the reason (`--no-check` overrides it).
+
+Given a repo, not a file, it lists the repo, drops split shards (the loader
+opens one file) and mmproj files, and tries quantizations in the order Q4_K_M,
+Q6_K, Q8_0, Q4_K_S, BF16, F16. It takes the first file that passes **and that
+the GPU can run**. Two things make a file CPU-only: a `token_embd` that is not
+Q6_K, Q8_0 or F32 (there is no gather kernel for other types), and F16 weights
+(no F16 matvec). A CPU-only file is taken only if nothing in the repo does
+better, and the fetcher says so when it does.
+
+What a scan of the obvious repos found on 2026-09-26, which the extra aliases
+below encode:
+
+- **unsloth Q4_K_M is often not Q4_K_M.** The Qwen3.5 and Gemma 4 E-series
+  builds mix in Q5_K tensors and are refused. From Qwen3-8B up, the Q4_K_M
+  files load but carry a Q4_K `token_embd`, so they are CPU-only. lmstudio's
+  Gemma 4 31B Q4_K_M uses a Q6_K embedding and runs on the GPU.
+- **The small Qwen3.5s (0.8B to 9B) are the hybrid `qwen35` stack**, like the
+  27B. The 0.8B was fetched this way and run: greedy output identical on the
+  GPU, the CPU and llama.cpp. The others pass the loaders but have not been run.
+- **Gemma 4 E2B does not load.** Its `feed_forward_length` is a per-layer
+  array, which the gemma4 config reads as a scalar. That needs a port, not a
+  download fix.
+- **Nothing MoE runs**: `qwen3moe`, `qwen35moe`, Gemma 4 26B-A4B. Qwen3.5's
+  mmproj files are Qwen's vision tower, not gemma4v, and are refused.
+
+Aliases for those sizes. They are fetched by name only; a bare `llmoxide-fetch`
+still takes just the table at the top:
+
+| alias | file | size |
+|---|---|---|
+| `qwen3-1.7b` | unsloth `Qwen3-1.7B-Q4_K_M.gguf` | 1.11 GB |
+| `qwen3-4b` | unsloth `Qwen3-4B-Q4_K_M.gguf` | 2.50 GB |
+| `qwen3-8b` | unsloth `Qwen3-8B-Q6_K.gguf` | 6.73 GB |
+| `qwen3-14b` | unsloth `Qwen3-14B-Q6_K.gguf` | 12.12 GB |
+| `qwen3-32b` | unsloth `Qwen3-32B-Q6_K.gguf` | 26.88 GB |
+| `qwen3.5-0.8b` | unsloth `Qwen3.5-0.8B-Q6_K.gguf` | 0.64 GB |
+| `qwen3.5-2b` | unsloth `Qwen3.5-2B-Q8_0.gguf` | 2.01 GB |
+| `qwen3.5-4b` | unsloth `Qwen3.5-4B-Q6_K.gguf` | 3.53 GB |
+| `qwen3.5-9b` | unsloth `Qwen3.5-9B-Q6_K.gguf` | 7.46 GB |
+| `qwen3.5-27b` | unsloth `Qwen3.5-27B-Q6_K.gguf` (stock, not the abliterated `qwen35`) | 22.45 GB |
+| `gemma4-31b` | lmstudio-community `gemma-4-31B-it-Q4_K_M.gguf` | 18.69 GB |
 
 Transfers **resume** — interrupt one, run the same command again, and it picks
 up from the byte it stopped at. Everything reports progress, the SHA-256 passes
