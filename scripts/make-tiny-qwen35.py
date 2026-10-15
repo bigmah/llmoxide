@@ -6,9 +6,9 @@ authentic) but overrides every shape key downward, then emits random F32
 weights: 8 main layers (full attention at 3 and 7) plus one NextN/MTP block.
 Deterministic under seed 42.
 """
-import struct, sys, math, random
+import os, struct, sys, math, random
 
-SRC = "/Users/tonyradtke/dev/llmoxide/models/Qwen3.8-27B-Q6_K.gguf"
+SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "Qwen3.8-27B-Q6_K.gguf")
 DST = sys.argv[1] if len(sys.argv) > 1 else "tiny-qwen35.gguf"
 
 # --- tiny shape --------------------------------------------------------------

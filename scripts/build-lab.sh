@@ -10,6 +10,9 @@
 #
 # SIMD is switched on: every browser that runs module workers runs wasm
 # SIMD128, and the engine's dot product is written so the compiler can use it.
+#
+# Panic messages carry source paths into the .wasm; the remaps keep the
+# builder's home directory out of a file that gets published.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -18,7 +21,9 @@ mkdir -p "$out"
 
 echo "==> cargo build (wasm32, simd128)"
 ( cd crates/lab
-  RUSTFLAGS="-C target-feature=+simd128" cargo build --release --lib --target wasm32-unknown-unknown )
+  RUSTFLAGS="-C target-feature=+simd128 --remap-path-prefix=$HOME=~ \
+    --remap-path-prefix=$(rustc --print sysroot)=/rustc" \
+    cargo build --release --lib --target wasm32-unknown-unknown )
 
 echo "==> wasm-bindgen"
 wasm-bindgen --target web --no-typescript --out-name lab --out-dir "$out" \
