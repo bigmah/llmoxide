@@ -36,10 +36,9 @@ pub enum Style {
     /// SentencePiece-surface BPE: spaces to `▁`, `<0xNN>` byte fallback.
     MetaSpace,
     /// GPT-2 byte-level BPE. The payload is which pre-tokenizer split the
-    /// checkpoint wants — the two differ only over combining marks, and
-    /// picking the wrong one does not fail, it just tokenizes subtly
-    /// differently everywhere.
-    ByteLevel(pre::Marks),
+    /// checkpoint wants. Picking the wrong one does not fail, it just
+    /// tokenizes subtly differently everywhere.
+    ByteLevel(pre::Split),
 }
 
 /// GPT-2's byte-to-character bijection. Printable Latin-1 bytes stand for
@@ -118,15 +117,16 @@ impl Tokenizer {
         let style = match g.str("tokenizer.ggml.model").unwrap_or("llama") {
             "gpt2" => {
                 let pre = g.str("tokenizer.ggml.pre").unwrap_or("");
-                let marks = match pre {
-                    "qwen35" => pre::Marks::WithLetters,
-                    "qwen2" => pre::Marks::Standalone,
+                let split = match pre {
+                    "qwen35" => pre::Split::Qwen(pre::Marks::WithLetters),
+                    "qwen2" => pre::Split::Qwen(pre::Marks::Standalone),
+                    "smollm" => pre::Split::SmolLm,
                     other => anyhow::bail!(
                         "byte-level vocab with unsupported pre-tokenizer {other:?} \
-                         (only \"qwen35\" and \"qwen2\" are implemented)"
+                         (only \"qwen35\", \"qwen2\" and \"smollm\" are implemented)"
                     ),
                 };
-                Style::ByteLevel(marks)
+                Style::ByteLevel(split)
             }
             _ => Style::MetaSpace,
         };
@@ -239,8 +239,8 @@ impl Tokenizer {
             Style::MetaSpace => self.encode_metaspace(text, out),
             // Merges never cross pre-tokenizer pieces, so each piece is an
             // independent BPE problem.
-            Style::ByteLevel(marks) => {
-                for piece in pre::split(text, marks) {
+            Style::ByteLevel(split) => {
+                for piece in pre::pieces(text, split) {
                     let syms = piece.bytes().map(|b| self.seed_sym(byte_to_char(b)));
                     self.merge_and_emit(syms.collect(), out);
                 }

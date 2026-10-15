@@ -1,4 +1,4 @@
-//! The `qwen35` and `qwen2` pre-tokenizers.
+//! The `qwen35`, `qwen2` and `smollm` pre-tokenizers.
 //!
 //! Byte-level BPE only merges within pre-tokenizer pieces, so this split *is*
 //! the tokenizer's word model — and it is also what guarantees a control
@@ -39,6 +39,24 @@
 //! could drift. Both are validated id-for-id against `llama-tokenize`.
 
 use crate::unicode;
+
+/// Which pre-tokenizer a byte-level vocabulary wants, from `tokenizer.ggml.pre`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Split {
+    /// `qwen35` or `qwen2`, which differ only over combining marks.
+    Qwen(Marks),
+    /// `smollm`: every numeral on its own, then GPT-2's classic split. See
+    /// [`split_smollm`].
+    SmolLm,
+}
+
+/// Split `text` the way `split` says.
+pub fn pieces(text: &str, split: Split) -> Vec<&str> {
+    match split {
+        Split::Qwen(marks) => self::split(text, marks),
+        Split::SmolLm => split_smollm(text),
+    }
+}
 
 /// Whether combining marks group with the letters they follow.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -209,6 +227,143 @@ pub fn split(text: &str, marks: Marks) -> Vec<&str> {
         .collect()
 }
 
+/// SmolLM's pre-tokenizer: llama.cpp's `LLAMA_VOCAB_PRE_TYPE_SMOLLM`.
+///
+/// Two regexes in sequence. `\p{N}` first, which cuts every numeral out as a
+/// piece of its own, then GPT-2's original split over each piece that is left:
+///
+/// ```text
+/// 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)
+/// ```
+///
+/// The second stage is a port of llama.cpp's `unicode_regex_split_custom_gpt2`.
+/// It differs from the qwen split in three ways that matter: contractions are
+/// case-sensitive, only a *space* may prefix a word (so `(hello` is two
+/// pieces), and newlines get no special treatment. Note that both stages look
+/// no further than their own piece: `\s+(?!\S)` cannot see a digit that the
+/// first stage has already cut away, so `"a 1"` is `["a", " ", "1"]`.
+pub fn split_smollm(text: &str) -> Vec<&str> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let n = chars.len();
+    let byte_at = |i: usize| chars.get(i).map_or(text.len(), |&(b, _)| b);
+
+    let mut out = Vec::new();
+    let mut start = 0;
+    for i in 0..n {
+        if unicode::is_number(chars[i].1) {
+            gpt2(&chars[start..i], &mut |a, b| out.push(&text[byte_at(start + a)..byte_at(start + b)]));
+            out.push(&text[byte_at(i)..byte_at(i + 1)]);
+            start = i + 1;
+        }
+    }
+    gpt2(&chars[start..], &mut |a, b| out.push(&text[byte_at(start + a)..byte_at(start + b)]));
+    out
+}
+
+/// GPT-2's split over one piece, reporting each span as char indices into it.
+fn gpt2(chars: &[(usize, char)], emit: &mut dyn FnMut(usize, usize)) {
+    let n = chars.len();
+    let cpt = |pos: usize| chars.get(pos).map(|&(_, c)| c);
+    let flags = |pos: usize| -> Flags {
+        match chars.get(pos) {
+            None => Flags::default(),
+            Some(&(_, c)) => Flags {
+                in_text: true,
+                letter: unicode::is_letter(c),
+                mark: false,
+                number: unicode::is_number(c),
+                whitespace: unicode::is_whitespace(c),
+            },
+        }
+    };
+
+    let mut prev_end = 0usize;
+    let mut push = |end: usize| {
+        if end > prev_end {
+            emit(prev_end, end);
+        }
+        prev_end = end;
+    };
+
+    let mut pos = 0usize;
+    while pos < n {
+        let c = cpt(pos).unwrap();
+
+        // 's|'t|'re|'ve|'m|'ll|'d — lowercase only, unlike the qwen split
+        if c == '\'' && pos + 1 < n {
+            let c1 = cpt(pos + 1).unwrap();
+            if matches!(c1, 's' | 't' | 'm' | 'd') {
+                pos += 2;
+                push(pos);
+                continue;
+            }
+            if pos + 2 < n {
+                let c2 = cpt(pos + 2).unwrap();
+                if matches!((c1, c2), ('r', 'e') | ('v', 'e') | ('l', 'l')) {
+                    pos += 3;
+                    push(pos);
+                    continue;
+                }
+            }
+        }
+
+        let space = (c == ' ') as usize;
+        let f2 = flags(pos + space);
+
+        // <space>?\p{L}+
+        if f2.letter {
+            pos += space;
+            while flags(pos).letter {
+                pos += 1;
+            }
+            push(pos);
+            continue;
+        }
+        // <space>?\p{N}+
+        if f2.number {
+            pos += space;
+            while flags(pos).number {
+                pos += 1;
+            }
+            push(pos);
+            continue;
+        }
+        // <space>?[^\s\p{L}\p{N}]+
+        if !(f2.whitespace || f2.letter || f2.number) && f2.in_text {
+            pos += space;
+            loop {
+                let g = flags(pos);
+                if g.whitespace || g.letter || g.number || !g.in_text {
+                    break;
+                }
+                pos += 1;
+            }
+            push(pos);
+            continue;
+        }
+
+        let mut num_ws = 0usize;
+        while flags(pos + num_ws).whitespace {
+            num_ws += 1;
+        }
+        // \s+(?!\S) — all but the final space, which prefixes the next word
+        if num_ws > 1 && cpt(pos + num_ws).is_some() {
+            pos += num_ws - 1;
+            push(pos);
+            continue;
+        }
+        // \s+
+        if num_ws > 0 {
+            pos += num_ws;
+            push(pos);
+            continue;
+        }
+
+        pos += 1;
+        push(pos);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +436,16 @@ mod tests {
         let pieces = split("<|im_end|>");
         assert!(pieces.len() > 1, "{pieces:?}");
         assert!(!pieces.contains(&"<|im_end|>"));
+    }
+
+    /// Pinned against `llama-tokenize` on SmolLM2's vocabulary.
+    #[test]
+    fn smollm_cuts_digits_first_then_splits_like_gpt2() {
+        assert_eq!(split_smollm("abc123 def"), ["abc", "1", "2", "3", " def"]);
+        // The digit is gone before GPT-2's lookahead runs, so the space stays alone.
+        assert_eq!(split_smollm("a 1"), ["a", " ", "1"]);
+        // Only a space may prefix a word, and contractions are lowercase-only.
+        assert_eq!(split_smollm("(hello) it's WE'LL"), ["(", "hello", ")", " it", "'s", " WE", "'", "LL"]);
     }
 
     #[test]
